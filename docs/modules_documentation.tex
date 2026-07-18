@@ -1,0 +1,1234 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{float}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{longtable}
+\usepackage{xcolor}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue
+}
+
+\title{Physics Embedded Transformers: Module Documentation}
+\author{Project Documentation}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\tableofcontents
+\listoffigures
+\newpage
+
+\section{Overview}
+
+This document describes the project modules created so far for the
+\texttt{physics\_embedded\_transformers} repository. The current implementation
+builds a deterministic physical preprocessing stack for a microfluidic
+asymmetric-loop device:
+
+\begin{enumerate}[label=\arabic*.]
+  \item Configuration loading.
+  \item Centerline geometry construction.
+  \item Device-level physical region labeling.
+  \item Droplet fractional occupancy.
+  \item Baseline branch hydraulics.
+  \item Droplet branch-velocity validation.
+\end{enumerate}
+
+The modules are intentionally scoped to deterministic preprocessing and
+baseline physics. They do not implement training, transformer features,
+hydraulic parameter fitting, droplet--droplet interaction corrections, or
+junction resistance models.
+
+\section{Repository Layout}
+
+\begin{longtable}{@{}ll@{}}
+\toprule
+Path & Purpose \\
+\midrule
+\texttt{configs/devices/asymmetric\_loop\_h100.yml} & Device geometry, calibration, region, and hydraulics settings. \\
+\texttt{configs/experiments/video\_2.yml} & Experiment metadata, phase flow rates, and input paths. \\
+\texttt{src/config/loader.py} & Experiment-to-device YAML loader. \\
+\texttt{src/geometry/centerlines.py} & Centerline schema inspection, ordering, orientation, geometry quantities. \\
+\texttt{src/geometry/types.py} & Dataclasses for typed centerline and device geometry containers. \\
+\texttt{src/geometry/regions.py} & Device-level integer region label map construction and validation. \\
+\texttt{src/occupancy/ellipse.py} & Local axis-aligned ellipse rasterization. \\
+\texttt{src/occupancy/calculator.py} & Droplet fractional occupancy calculation and summary statistics. \\
+\texttt{src/hydraulics/baseline.py} & Baseline branch-hydraulics equations. \\
+\texttt{scripts/build\_geometry.py} & CLI for centerline geometry artifacts. \\
+\texttt{scripts/build\_device\_regions.py} & CLI for device region labels and overlay. \\
+\texttt{scripts/compute\_droplet\_occupancy.py} & CLI for droplet occupancy outputs. \\
+\texttt{scripts/compute\_baseline\_hydraulics.py} & CLI for frame-level baseline hydraulics. \\
+\texttt{scripts/validate\_droplet\_branch\_velocity.py} & Standalone normalized branch-velocity validation analysis. \\
+\texttt{tests/} & Focused unit tests for geometry, regions, occupancy, hydraulics, and validation. \\
+\bottomrule
+\end{longtable}
+
+\section{Configuration Layer}
+
+\subsection{Files}
+
+\begin{itemize}
+  \item \texttt{src/config/loader.py}
+  \item \texttt{src/config/\_\_init\_\_.py}
+\end{itemize}
+
+\subsection{Main Function}
+
+\begin{verbatim}
+load_experiment_config(
+    experiment_path: str | Path,
+    configs_root: str | Path = "configs",
+) -> dict
+\end{verbatim}
+
+\subsection{Behavior}
+
+The loader reads an experiment YAML file, extracts
+\texttt{experiment.device\_id}, resolves the linked device file as:
+
+\begin{verbatim}
+configs/devices/<device_id>.yml
+\end{verbatim}
+
+It then loads the device YAML and verifies that:
+
+\begin{verbatim}
+device.id == experiment.device_id
+\end{verbatim}
+
+The returned structure is:
+
+\begin{verbatim}
+{
+  "experiment": <full experiment YAML mapping>,
+  "device": <full device YAML mapping>
+}
+\end{verbatim}
+
+\subsection{Validation}
+
+The loader raises clear exceptions for:
+
+\begin{itemize}
+  \item missing experiment files;
+  \item empty YAML files;
+  \item malformed YAML files;
+  \item missing \texttt{experiment.device\_id};
+  \item missing linked device files;
+  \item mismatched experiment and device IDs.
+\end{itemize}
+
+\section{Device and Experiment Configuration}
+
+\subsection{Device: \texttt{asymmetric\_loop\_h100}}
+
+The device YAML stores fixed physical geometry and calibration:
+
+\begin{itemize}
+  \item calibration: \(\mu\mathrm{m/px} = 4.0\);
+  \item channel width: \(100~\mu\mathrm{m}\);
+  \item channel height: \(100~\mu\mathrm{m}\);
+  \item left branch length: \(1791~\mu\mathrm{m}\);
+  \item right branch length: \(1491~\mu\mathrm{m}\);
+  \item junction definitions: \(100~\mu\mathrm{m} \times 100~\mu\mathrm{m}\);
+  \item region artifact paths;
+  \item isolated-droplet hydraulic resistance ratio.
+\end{itemize}
+
+The hydraulics section stores the dissertation provenance:
+
+\begin{verbatim}
+hydraulics:
+  isolated_droplet_resistance:
+    representation: equivalent_length
+    ratio_to_short_branch: 0.15
+\end{verbatim}
+
+\subsection{Experiment: \texttt{video\_2}}
+
+The experiment YAML stores:
+
+\begin{itemize}
+  \item device link: \texttt{device\_id: asymmetric\_loop\_h100};
+  \item raw video location;
+  \item processed data paths;
+  \item continuous-phase flow rate;
+  \item dispersed-phase flow rate;
+  \item droplet nominal diameter and confinement regime.
+\end{itemize}
+
+For the current experiment:
+
+\[
+Q_{\mathrm{continuous}} = 1950~\mu\mathrm{L/hr},
+\qquad
+Q_{\mathrm{dispersed}} = 10~\mu\mathrm{L/hr}.
+\]
+
+The total mixture throughput used by baseline hydraulics is:
+
+\[
+Q_{\mathrm{mixture}} =
+Q_{\mathrm{continuous}} + Q_{\mathrm{dispersed}}
+= 1960~\mu\mathrm{L/hr}.
+\]
+
+\section{Centerline Geometry Module}
+
+\subsection{Files}
+
+\begin{itemize}
+  \item \texttt{src/geometry/centerlines.py}
+  \item \texttt{src/geometry/types.py}
+  \item \texttt{scripts/build\_geometry.py}
+  \item \texttt{tests/test\_centerline\_geometry.py}
+\end{itemize}
+
+\subsection{Input}
+
+The geometry builder uses:
+
+\begin{verbatim}
+data/processed/2/centerlines.csv
+\end{verbatim}
+
+The discovered schema is:
+
+\begin{center}
+\begin{tabular}{@{}ll@{}}
+\toprule
+Column & Meaning \\
+\midrule
+\texttt{x} & centerline x coordinate in pixels \\
+\texttt{y} & centerline y coordinate in pixels \\
+\texttt{channel} & branch label \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The expected branch labels are:
+
+\begin{verbatim}
+inlet, outlet, left, right
+\end{verbatim}
+
+\subsection{Ordering and Orientation}
+
+Each branch is represented as an ordered polyline. If explicit ordering columns
+exist, they are preferred. Otherwise, the module attempts path reconstruction
+from point adjacency. If adjacency reconstruction is unsuitable for the real
+CSV, row order is preserved as the implicit sequence and this choice is reported.
+
+Branches are oriented according to the physical flow direction:
+
+\begin{itemize}
+  \item inlet: upstream boundary to upper junction;
+  \item left branch: upper junction to lower junction;
+  \item right branch: upper junction to lower junction;
+  \item outlet: lower junction to downstream boundary.
+\end{itemize}
+
+\subsection{Arc Length}
+
+Segment length is Euclidean in pixel coordinates:
+
+\[
+\Delta s_k =
+\sqrt{
+(x_{k+1} - x_k)^2 +
+(y_{k+1} - y_k)^2
+}.
+\]
+
+Cumulative arc length is:
+
+\[
+s_0 = 0,
+\qquad
+s_k = \sum_{i=0}^{k-1}\Delta s_i.
+\]
+
+Physical arc length uses the device calibration:
+
+\[
+s_{\mu m} = s_{\mathrm{px}} \cdot 4.0.
+\]
+
+\subsection{Tangents and Normals}
+
+Interior tangents use centered finite differences. Endpoints use one-sided
+finite differences. Tangents are normalized to unit length.
+
+The normal convention is:
+
+\[
+n_x = -t_y,
+\qquad
+n_y = t_x.
+\]
+
+This normal is a consistent mathematical convention only; it is not labeled as
+inward or outward.
+
+\subsection{Typed Containers}
+
+\texttt{BranchCenterline} stores:
+
+\begin{itemize}
+  \item branch name;
+  \item ordered \(x,y\) coordinates;
+  \item cumulative arc length in pixels and micrometres;
+  \item tangent vectors;
+  \item normal vectors;
+  \item total length in pixels and micrometres.
+\end{itemize}
+
+\texttt{DeviceGeometry} stores:
+
+\begin{itemize}
+  \item device ID;
+  \item calibration;
+  \item branch centerline dictionary;
+  \item upper and lower junction coordinates;
+  \item endpoint mismatch diagnostics.
+\end{itemize}
+
+\subsection{Outputs}
+
+\begin{verbatim}
+outputs/geometry/asymmetric_loop_h100/centerline_geometry.csv
+outputs/geometry/asymmetric_loop_h100/geometry_summary.json
+outputs/geometry/asymmetric_loop_h100/device_geometry.npz
+outputs/geometry/asymmetric_loop_h100/centerline_geometry.png
+\end{verbatim}
+
+\subsection{Execution}
+
+\begin{verbatim}
+.\.venv\Scripts\python.exe -m scripts.build_geometry \
+  --experiment configs\experiments\video_2.yml \
+  --overwrite
+\end{verbatim}
+
+\section{Device Region Labeling Module}
+
+\subsection{Files}
+
+\begin{itemize}
+  \item \texttt{src/geometry/regions.py}
+  \item \texttt{scripts/build\_device\_regions.py}
+  \item \texttt{tests/test\_device\_regions.py}
+\end{itemize}
+
+\subsection{Purpose}
+
+The region-labeling module creates a device-level integer label map for physical
+regions. It is independent of a particular droplet frame and is intended as the
+spatial support for downstream fractional occupancy calculations.
+
+\subsection{Label IDs}
+
+\begin{center}
+\begin{tabular}{@{}cl@{}}
+\toprule
+ID & Region \\
+\midrule
+0 & unassigned/background \\
+1 & inlet \\
+2 & outlet \\
+3 & left branch \\
+4 & right branch \\
+5 & upper junction \\
+6 & lower junction \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Construction}
+
+The label map is constructed from:
+
+\begin{itemize}
+  \item the binary channel mask;
+  \item original labeled centerlines;
+  \item junction definitions from the device YAML.
+\end{itemize}
+
+Junction boxes are converted from micrometres to pixels using:
+
+\[
+\mathrm{size}_{px} =
+\frac{\mathrm{size}_{\mu m}}{\mu m/px}.
+\]
+
+For the current device:
+
+\[
+100~\mu\mathrm{m} / 4~\mu\mathrm{m/px} = 25~\mathrm{px}.
+\]
+
+Pixels outside the junction boxes are assigned to the nearest compatible
+centerline while remaining clipped to the channel mask.
+
+\subsection{Validation}
+
+The module validates:
+
+\begin{itemize}
+  \item label-map shape equals channel-mask shape;
+  \item valid label IDs only;
+  \item no nonzero labels outside the channel mask;
+  \item nonempty physical regions;
+  \item branch and inlet/outlet connectivity to the appropriate junctions.
+\end{itemize}
+
+\subsection{Outputs}
+
+\begin{verbatim}
+data/geometry/asymmetric_loop_h100/region_labels.npy
+data/geometry/asymmetric_loop_h100/region_metadata.json
+data/geometry/asymmetric_loop_h100/region_overlay.png
+\end{verbatim}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth,height=0.75\textheight,keepaspectratio]{../data/geometry/asymmetric_loop_h100/region_overlay.png}
+  \caption{Device-level region overlay produced by \texttt{scripts/build\_device\_regions.py}. The overlay is generated from the precomputed integer region labels, not from visualization-time region inference.}
+  \label{fig:region-overlay}
+\end{figure}
+
+\subsection{Execution}
+
+\begin{verbatim}
+.\.venv\Scripts\python.exe -m scripts.build_device_regions \
+  --experiment configs\experiments\video_2.yml \
+  --frame-index 0 \
+  --overwrite
+\end{verbatim}
+
+\section{Droplet Fractional Occupancy Module}
+
+\subsection{Files}
+
+\begin{itemize}
+  \item \texttt{src/occupancy/ellipse.py}
+  \item \texttt{src/occupancy/calculator.py}
+  \item \texttt{src/occupancy/\_\_init\_\_.py}
+  \item \texttt{scripts/compute\_droplet\_occupancy.py}
+  \item \texttt{tests/test\_droplet\_occupancy.py}
+\end{itemize}
+
+\subsection{Inputs}
+
+The occupancy pipeline reads:
+
+\begin{itemize}
+  \item \texttt{outputs/physics/video\_2/droplet\_occupancy.csv} for downstream use after generation;
+  \item \texttt{data/processed/2/tracked\_features.csv} as the raw tracking input;
+  \item \texttt{data/geometry/asymmetric\_loop\_h100/region\_labels.npy};
+  \item \texttt{data/geometry/asymmetric\_loop\_h100/region\_metadata.json};
+  \item device calibration from the YAML.
+\end{itemize}
+
+The tracked-feature columns used are:
+
+\begin{verbatim}
+frame, track_id, centroid_x, centroid_y, bbox_w, bbox_h
+\end{verbatim}
+
+\subsection{Ellipse Footprint}
+
+Each droplet footprint is approximated as an axis-aligned ellipse fitted to its
+tracked bounding box:
+
+\[
+\left(\frac{x - x_c}{w/2}\right)^2
++
+\left(\frac{y - y_c}{h/2}\right)^2
+\leq 1.
+\]
+
+Rasterization uses pixel-center coordinates in the same image convention as the
+region label map:
+
+\begin{itemize}
+  \item \(x\) increases with image columns;
+  \item \(y\) increases with image rows.
+\end{itemize}
+
+Only the local clipped bounding window around each ellipse is rasterized.
+
+\subsection{Raw Occupancy}
+
+For physical region \(k\), raw occupancy is:
+
+\[
+W_{k,\mathrm{raw}} =
+\frac{\#\{\mathrm{ellipse~pixels~with~label~}k\}}
+{\#\{\mathrm{all~rasterized~ellipse~pixels~inside~the~image}\}}.
+\]
+
+The denominator is the complete rasterized ellipse area after image-boundary
+clipping, not only the channel-overlapping part.
+
+The raw physical coverage is:
+
+\[
+C_{\mathrm{phys}} =
+\sum_{k=1}^{6} W_{k,\mathrm{raw}}.
+\]
+
+\subsection{Normalized Occupancy}
+
+For every sample with:
+
+\[
+C_{\mathrm{phys}} > \epsilon,
+\]
+
+the normalized six-region occupancy vector is:
+
+\[
+W_k =
+\frac{W_{k,\mathrm{raw}}}{C_{\mathrm{phys}}}.
+\]
+
+The normalized occupancy vector is the canonical representation for downstream
+ML and physics modules:
+
+\[
+W =
+\begin{bmatrix}
+W_{\mathrm{inlet}} &
+W_{\mathrm{outlet}} &
+W_{\mathrm{left}} &
+W_{\mathrm{right}} &
+W_{\mathrm{upper~junction}} &
+W_{\mathrm{lower~junction}}
+\end{bmatrix}.
+\]
+
+For computable samples:
+
+\[
+\sum_k W_k = 1.
+\]
+
+\subsection{Diagnostic Low Coverage}
+
+The threshold \(0.95\) is retained as a diagnostic flag:
+
+\[
+\mathrm{low\_physical\_coverage} =
+C_{\mathrm{phys}} < 0.95.
+\]
+
+Low-coverage samples are still normalized when \(C_{\mathrm{phys}} > \epsilon\).
+They are not called invalid merely because they fall below the diagnostic
+threshold.
+
+\subsection{CSV Columns}
+
+Important output columns include:
+
+\begin{itemize}
+  \item diagnostic raw quantities:
+  \texttt{w\_inlet\_raw},
+  \texttt{w\_outlet\_raw},
+  \texttt{w\_left\_raw},
+  \texttt{w\_right\_raw},
+  \texttt{w\_upper\_junction\_raw},
+  \texttt{w\_lower\_junction\_raw},
+  \texttt{physical\_coverage\_raw},
+  \texttt{low\_physical\_coverage};
+  \item pipeline quantities:
+  \texttt{occupancy\_computable},
+  \texttt{w\_inlet},
+  \texttt{w\_outlet},
+  \texttt{w\_left},
+  \texttt{w\_right},
+  \texttt{w\_upper\_junction},
+  \texttt{w\_lower\_junction},
+  \texttt{normalized\_occupancy\_sum};
+  \item diagnostics:
+  \texttt{image\_boundary\_clipped},
+  \texttt{dominant\_region},
+  \texttt{number\_active\_regions}.
+\end{itemize}
+
+No \texttt{w\_unassigned} component is created.
+
+\subsection{Outputs}
+
+\begin{verbatim}
+outputs/physics/video_2/droplet_occupancy.csv
+outputs/physics/video_2/droplet_occupancy_summary.json
+outputs/physics/video_2/occupancy_diagnostics.png
+outputs/physics/video_2/occupancy_spot_checks.png
+\end{verbatim}
+
+\subsection{Execution}
+
+\begin{verbatim}
+.\.venv\Scripts\python.exe -m scripts.compute_droplet_occupancy \
+  --experiment configs\experiments\video_2.yml \
+  --overwrite
+\end{verbatim}
+
+\section{Baseline Branch Hydraulics Module}
+
+\subsection{Files}
+
+\begin{itemize}
+  \item \texttt{src/hydraulics/baseline.py}
+  \item \texttt{src/hydraulics/\_\_init\_\_.py}
+  \item \texttt{scripts/compute\_baseline\_hydraulics.py}
+  \item \texttt{tests/test\_baseline\_hydraulics.py}
+\end{itemize}
+
+\subsection{Purpose}
+
+The baseline hydraulics module computes a deterministic frame-level hydraulic
+state using normalized branch occupancies and a simple equivalent-resistance
+model. It deliberately excludes inlet, outlet, and junction occupancies from the
+baseline resistance calculation.
+
+\subsection{Effective Branch Occupancy}
+
+For frame \(t\):
+
+\[
+N_{\mathrm{left,eff}}(t)
+=
+\sum_{d \in t} W_{\mathrm{left}}(d),
+\]
+
+\[
+N_{\mathrm{right,eff}}(t)
+=
+\sum_{d \in t} W_{\mathrm{right}}(d).
+\]
+
+These are continuous effective occupancies, not integer droplet counts.
+
+\subsection{Isolated-Droplet Equivalent Length}
+
+The dissertation-derived isolated-droplet resistance length is:
+
+\[
+\ell_d = r_d L_{\mathrm{short}},
+\]
+
+where:
+
+\[
+r_d = 0.15.
+\]
+
+For the current device:
+
+\[
+L_{\mathrm{short}} = L_{\mathrm{right}} = 1491~\mu\mathrm{m},
+\]
+
+so:
+
+\[
+\ell_d = 0.15 \times 1491
+= 223.65~\mu\mathrm{m}.
+\]
+
+\subsection{Effective Branch Lengths}
+
+\[
+L_{\mathrm{left,eff}}(t)
+=
+L_{\mathrm{left}}
++ \ell_d N_{\mathrm{left,eff}}(t),
+\]
+
+\[
+L_{\mathrm{right,eff}}(t)
+=
+L_{\mathrm{right}}
++ \ell_d N_{\mathrm{right,eff}}(t).
+\]
+
+\subsection{Total Mixture Flow}
+
+The hydraulic throughput is the total mixture flow:
+
+\[
+Q_{\mathrm{mix}}
+=
+Q_{\mathrm{continuous}}
++
+Q_{\mathrm{dispersed}}.
+\]
+
+For \texttt{video\_2}:
+
+\[
+Q_{\mathrm{mix}}
+= 1950 + 10
+= 1960~\mu\mathrm{L/hr}.
+\]
+
+\subsection{Parallel Branch Split}
+
+Because resistance is proportional to equivalent length and both branches have
+the same cross-section, the flow split is:
+
+\[
+Q_{\mathrm{left}}
+=
+Q_{\mathrm{mix}}
+\frac{L_{\mathrm{right,eff}}}
+{L_{\mathrm{left,eff}} + L_{\mathrm{right,eff}}},
+\]
+
+\[
+Q_{\mathrm{right}}
+=
+Q_{\mathrm{mix}}
+\frac{L_{\mathrm{left,eff}}}
+{L_{\mathrm{left,eff}} + L_{\mathrm{right,eff}}}.
+\]
+
+The reconstructed total is:
+
+\[
+Q_{\mathrm{reconstructed}}
+=
+Q_{\mathrm{left}} + Q_{\mathrm{right}}.
+\]
+
+The conservation diagnostic is:
+
+\[
+\Delta Q =
+Q_{\mathrm{reconstructed}} - Q_{\mathrm{mix}}.
+\]
+
+\subsection{Superficial Mixture Velocity}
+
+The branch velocity columns are total superficial mixture velocities:
+
+\[
+U =
+\frac{Q}{W H}.
+\]
+
+The unit conversion is:
+
+\[
+1~\mu\mathrm{L}
+=
+10^9~\mu\mathrm{m}^3,
+\qquad
+1~\mathrm{hr}
+=
+3600~\mathrm{s}.
+\]
+
+Thus:
+
+\[
+U_{\mu m/s}
+=
+\frac{Q_{\mu L/hr} \cdot 10^9 / 3600}
+{W_{\mu m}H_{\mu m}}.
+\]
+
+\subsection{Canonical ML Features}
+
+The canonical hydraulic features intended for the future transformer are only:
+
+\begin{verbatim}
+left_velocity_um_s
+right_velocity_um_s
+\end{verbatim}
+
+These names are kept stable for downstream compatibility, but their documented
+meaning is:
+
+\begin{itemize}
+  \item \texttt{left\_velocity\_um\_s}: total superficial mixture velocity in the left branch;
+  \item \texttt{right\_velocity\_um\_s}: total superficial mixture velocity in the right branch.
+\end{itemize}
+
+Flow-rate columns remain in the CSV for diagnostics and conservation checks, but
+they are not intended as independent ML inputs because they are deterministically
+related to velocity by the fixed channel cross-section.
+
+\subsection{Baseline Assumptions}
+
+\begin{enumerate}[label=\arabic*.]
+  \item The total volumetric throughput is the sum of continuous- and dispersed-phase input flow rates.
+  \item The total mixture flow is split between the two branches according to effective hydraulic resistances.
+  \item Reported branch velocities are superficial mixture velocities based on the full channel cross-sectional area.
+  \item No phase-specific slip or separate phase velocity is modeled.
+  \item Branch resistance is proportional to equivalent branch length.
+  \item Both branches have identical cross-sections.
+  \item Fluid properties are identical between branches.
+  \item Droplet resistance contributions are additive.
+  \item Each isolated droplet contributes \(0.15\) times the short-branch resistance length.
+  \item Fractional branch occupancy scales the droplet contribution linearly.
+  \item Inlet, outlet, upper-junction, and lower-junction occupancies do not contribute to baseline resistance.
+  \item Droplet--droplet interaction corrections are not modeled.
+  \item Junction dynamics are reserved for the future learned model.
+\end{enumerate}
+
+\subsection{Outputs}
+
+\begin{verbatim}
+outputs/physics/video_2/baseline_hydraulic_state.csv
+outputs/physics/video_2/baseline_hydraulic_summary.json
+outputs/physics/video_2/baseline_hydraulic_diagnostics.png
+\end{verbatim}
+
+\subsection{Execution}
+
+\begin{verbatim}
+.\.venv\Scripts\python.exe -m scripts.compute_baseline_hydraulics \
+  --experiment configs\experiments\video_2.yml \
+  --overwrite
+\end{verbatim}
+
+\section{Droplet Branch-Velocity Validation Module}
+
+\subsection{Files}
+
+\begin{itemize}
+  \item \texttt{scripts/validate\_droplet\_branch\_velocity.py}
+  \item \texttt{tests/test\_droplet\_branch\_velocity\_validation.py}
+\end{itemize}
+
+\subsection{Purpose}
+
+This standalone validation analysis compares measured droplet-speed variation
+against the calculated baseline branch superficial-velocity variation. It does
+not modify the tracking, occupancy, or hydraulic preprocessing layers.
+
+The analysis is intentionally restricted to branch-interior samples. It excludes
+inlet, outlet, junction, and branch-transition samples by requiring a normalized
+branch occupancy of at least \(0.95\) in exactly one branch:
+
+\[
+w_{\mathrm{left}} \ge 0.95 \quad \mathrm{xor} \quad
+w_{\mathrm{right}} \ge 0.95.
+\]
+
+\subsection{Measured Velocity Derivation}
+
+For the current \texttt{video\_2} tracking table, the canonical file is:
+
+\begin{verbatim}
+data/processed/2/tracked_features.csv
+\end{verbatim}
+
+The table does not contain existing \texttt{vx} and \texttt{vy} columns, so the
+validator derives velocity from the configured centroid columns:
+
+\begin{verbatim}
+centroid_x, centroid_y
+\end{verbatim}
+
+For each track, rows are sorted by frame. Interior samples receive centered
+finite-difference velocity only when both neighboring observations are exactly
+one frame apart:
+
+\[
+v_x(t) = \frac{x(t+1) - x(t-1)}{2},
+\qquad
+v_y(t) = \frac{y(t+1) - y(t-1)}{2}.
+\]
+
+The measured speed is:
+
+\[
+u_{\mathrm{drop}}(t) =
+\sqrt{v_x(t)^2 + v_y(t)^2}.
+\]
+
+Endpoint samples and samples adjacent to tracking gaps are excluded. Track
+boundaries are never mixed. If future tracking files provide finite
+\texttt{vx}/\texttt{vy} columns, those columns are preferred and the metadata
+records \texttt{tracked\_velocity\_source = existing\_velocity\_columns}.
+
+\subsection{Unit Interpretation}
+
+For the current analysis:
+
+\begin{itemize}
+  \item measured droplet speed units are \texttt{px/frame};
+  \item calculated branch velocity units are \(\mu\mathrm{m}/\mathrm{s}\);
+  \item \texttt{tracked\_velocity\_source} is
+  \texttt{centered\_position\_difference}.
+\end{itemize}
+
+The validation does not compare absolute velocity magnitudes. Each signal is
+standardized independently within each selected \((\texttt{track\_id},
+\texttt{branch})\) segment. Therefore, the plots and correlations compare
+normalized temporal co-variation only. No frame-rate or pixel-scale conversion
+is required for this normalized comparison.
+
+\subsection{Normalization}
+
+For every selected track segment, measured speed and calculated branch velocity
+are normalized separately using sample standard deviation with \(ddof=1\):
+
+\[
+z_{\mathrm{drop}}(t) =
+\frac{u_{\mathrm{drop}}(t) - \bar{u}_{\mathrm{drop}}}
+{\mathrm{std}(u_{\mathrm{drop}})},
+\]
+
+\[
+z_{\mathrm{branch}}(t) =
+\frac{u_{\mathrm{branch}}(t) - \bar{u}_{\mathrm{branch}}}
+{\mathrm{std}(u_{\mathrm{branch}})}.
+\]
+
+Tracks with negligible measured-speed or branch-velocity variance are rejected.
+No smoothing, lag optimization, or physical speed-scale fitting is performed.
+
+\subsection{Selection}
+
+The intended default minimum branch-interior sample count was 100. The current
+\texttt{video\_2} branch-interior segments are shorter than this: left-branch
+segments top out near 85 samples, while right-branch segments top out near 67
+samples. To avoid silently excluding the entire right branch, this analysis uses:
+
+\begin{verbatim}
+minimum_branch_interior_samples: 60
+\end{verbatim}
+
+The cutoff is recorded in the summary JSON. Candidate ranking is deterministic:
+within each branch, candidates are ranked by
+\texttt{std\_branch\_velocity\_um\_s} descending, using \texttt{track\_id} as a
+tie-breaker. Correlation is not used for selection.
+
+For \texttt{video\_2}, eligible candidates were imbalanced:
+
+\begin{center}
+\begin{tabular}{@{}lr@{}}
+\toprule
+Quantity & Count \\
+\midrule
+Total eligible candidates & 3595 \\
+Left-branch candidates & 1148 \\
+Right-branch candidates & 2447 \\
+Selected candidates & 10 \\
+Pooled normalized samples & 742 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Selected Track Statistics}
+
+\begin{center}
+\begin{tabular}{@{}rlrrr@{}}
+\toprule
+Track ID & Branch & Samples & Pearson \(r\) & Spearman \(\rho\) \\
+\midrule
+3463 & left & 83 & 0.603518 & 0.561827 \\
+254 & left & 83 & 0.756515 & 0.846252 \\
+3127 & left & 84 & 0.803099 & 0.831943 \\
+1713 & left & 84 & 0.837714 & 0.859534 \\
+3460 & left & 75 & 0.527768 & 0.493072 \\
+3461 & right & 67 & 0.668621 & 0.660548 \\
+257 & right & 66 & 0.767774 & 0.779150 \\
+3465 & right & 66 & 0.811301 & 0.717638 \\
+3462 & right & 67 & 0.876987 & 0.876327 \\
+1712 & right & 67 & 0.458025 & 0.526406 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The pooled descriptive correlations were:
+
+\[
+r_{\mathrm{Pearson}} = 0.712629,
+\qquad
+\rho_{\mathrm{Spearman}} = 0.718781.
+\]
+
+\subsection{Outputs}
+
+\begin{verbatim}
+outputs/physics/video_2/droplet_branch_velocity_validation/selected_tracks.csv
+outputs/physics/video_2/droplet_branch_velocity_validation/pooled_normalized_samples.csv
+outputs/physics/video_2/droplet_branch_velocity_validation/droplet_branch_velocity_summary.json
+outputs/physics/video_2/droplet_branch_velocity_validation/droplet_branch_velocity_scatter.png
+outputs/physics/video_2/droplet_branch_velocity_validation/track_<track_id>_normalized_velocity.png
+\end{verbatim}
+
+\subsection{Execution}
+
+\begin{verbatim}
+.\.venv\Scripts\python.exe -m scripts.validate_droplet_branch_velocity \
+  --experiment configs\experiments\video_2.yml \
+  --overwrite
+\end{verbatim}
+
+\section{Generated Data Products}
+
+\subsection{Visual Summary}
+
+The figures in this section document the main visual artifacts generated during
+the geometry, occupancy, baseline-hydraulics, and branch-velocity validation
+steps. They are included directly from their generated repository locations so
+the document continues to reference the same files consumed during validation.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.92\linewidth,height=0.75\textheight,keepaspectratio]{../outputs/geometry/asymmetric_loop_h100/centerline_geometry.png}
+  \caption{Centerline geometry diagnostic showing the ordered device centerline representation and derived branch structure.}
+  \label{fig:centerline-geometry}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth,height=0.75\textheight,keepaspectratio]{../outputs/geometry/asymmetric_loop_h100/centerline_regions_frame_0.png}
+  \caption{Legacy centerline-region diagnostic for frame 0. This plot was useful during development, but the current occupancy pipeline uses the device-level region labels shown in Figure~\ref{fig:region-overlay}.}
+  \label{fig:centerline-regions-frame0}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth,height=0.75\textheight,keepaspectratio]{../outputs/physics/video_2/occupancy_diagnostics.png}
+  \caption{Droplet fractional-occupancy diagnostics summarizing coverage, normalized occupancy behavior, and region assignment statistics.}
+  \label{fig:occupancy-diagnostics}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth,height=0.75\textheight,keepaspectratio]{../outputs/physics/video_2/occupancy_spot_checks.png}
+  \caption{Representative occupancy spot checks used to visually verify ellipse rasterization against the precomputed region labels.}
+  \label{fig:occupancy-spot-checks}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth,height=0.75\textheight,keepaspectratio]{../outputs/physics/video_2/invalid_occupancy_random_10.png}
+  \caption{Random sample of ten previously invalid or low-coverage occupancy cases, used for manual inspection of boundary and coverage behavior.}
+  \label{fig:invalid-occupancy-random}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth,height=0.75\textheight,keepaspectratio]{../outputs/physics/video_2/baseline_hydraulic_diagnostics.png}
+  \caption{Baseline branch-hydraulics diagnostics showing branch flow-rate and superficial-velocity behavior after normalized branch occupancy is converted into hydraulic resistance.}
+  \label{fig:baseline-hydraulic-diagnostics}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.9\linewidth,height=0.75\textheight,keepaspectratio]{../outputs/physics/video_2/droplet_branch_velocity_validation/droplet_branch_velocity_scatter.png}
+  \caption{Pooled normalized branch-velocity validation scatter. The x-axis is normalized calculated branch superficial velocity in \(\mu\mathrm{m}/\mathrm{s}\); the y-axis is normalized measured droplet speed derived in \texttt{px/frame}. The plot compares temporal variation after per-track normalization, not absolute velocity magnitudes.}
+  \label{fig:droplet-branch-velocity-scatter}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth,height=0.72\textheight,keepaspectratio]{../outputs/physics/video_2/droplet_branch_velocity_validation/track_3463_normalized_velocity.png}
+  \caption{Selected validation track 3463 in the left branch. The measured droplet-speed signal is derived by centered finite difference from \texttt{centroid\_x}/\texttt{centroid\_y}; both signals are shown as per-track z-scores.}
+  \label{fig:validation-track-3463}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth,height=0.72\textheight,keepaspectratio]{../outputs/physics/video_2/droplet_branch_velocity_validation/track_254_normalized_velocity.png}
+  \caption{Selected validation track 254 in the left branch. The comparison is zero-lag and unsmoothed.}
+  \label{fig:validation-track-254}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth,height=0.72\textheight,keepaspectratio]{../outputs/physics/video_2/droplet_branch_velocity_validation/track_3127_normalized_velocity.png}
+  \caption{Selected validation track 3127 in the left branch.}
+  \label{fig:validation-track-3127}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth,height=0.72\textheight,keepaspectratio]{../outputs/physics/video_2/droplet_branch_velocity_validation/track_1713_normalized_velocity.png}
+  \caption{Selected validation track 1713 in the left branch.}
+  \label{fig:validation-track-1713}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth,height=0.72\textheight,keepaspectratio]{../outputs/physics/video_2/droplet_branch_velocity_validation/track_3460_normalized_velocity.png}
+  \caption{Selected validation track 3460 in the left branch.}
+  \label{fig:validation-track-3460}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth,height=0.72\textheight,keepaspectratio]{../outputs/physics/video_2/droplet_branch_velocity_validation/track_3461_normalized_velocity.png}
+  \caption{Selected validation track 3461 in the right branch.}
+  \label{fig:validation-track-3461}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth,height=0.72\textheight,keepaspectratio]{../outputs/physics/video_2/droplet_branch_velocity_validation/track_257_normalized_velocity.png}
+  \caption{Selected validation track 257 in the right branch.}
+  \label{fig:validation-track-257}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth,height=0.72\textheight,keepaspectratio]{../outputs/physics/video_2/droplet_branch_velocity_validation/track_3465_normalized_velocity.png}
+  \caption{Selected validation track 3465 in the right branch.}
+  \label{fig:validation-track-3465}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth,height=0.72\textheight,keepaspectratio]{../outputs/physics/video_2/droplet_branch_velocity_validation/track_3462_normalized_velocity.png}
+  \caption{Selected validation track 3462 in the right branch.}
+  \label{fig:validation-track-3462}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth,height=0.72\textheight,keepaspectratio]{../outputs/physics/video_2/droplet_branch_velocity_validation/track_1712_normalized_velocity.png}
+  \caption{Selected validation track 1712 in the right branch.}
+  \label{fig:validation-track-1712}
+\end{figure}
+
+\subsection{Geometry Products}
+
+\begin{itemize}
+  \item \texttt{outputs/geometry/asymmetric\_loop\_h100/centerline\_geometry.csv}
+  \item \texttt{outputs/geometry/asymmetric\_loop\_h100/geometry\_summary.json}
+  \item \texttt{outputs/geometry/asymmetric\_loop\_h100/device\_geometry.npz}
+  \item \texttt{outputs/geometry/asymmetric\_loop\_h100/centerline\_geometry.png}
+\end{itemize}
+
+\subsection{Device Region Products}
+
+\begin{itemize}
+  \item \texttt{data/geometry/asymmetric\_loop\_h100/region\_labels.npy}
+  \item \texttt{data/geometry/asymmetric\_loop\_h100/region\_metadata.json}
+  \item \texttt{data/geometry/asymmetric\_loop\_h100/region\_overlay.png}
+\end{itemize}
+
+\subsection{Occupancy Products}
+
+\begin{itemize}
+  \item \texttt{outputs/physics/video\_2/droplet\_occupancy.csv}
+  \item \texttt{outputs/physics/video\_2/droplet\_occupancy\_summary.json}
+  \item \texttt{outputs/physics/video\_2/occupancy\_diagnostics.png}
+  \item \texttt{outputs/physics/video\_2/occupancy\_spot\_checks.png}
+\end{itemize}
+
+\subsection{Hydraulic Products}
+
+\begin{itemize}
+  \item \texttt{outputs/physics/video\_2/baseline\_hydraulic\_state.csv}
+  \item \texttt{outputs/physics/video\_2/baseline\_hydraulic\_summary.json}
+  \item \texttt{outputs/physics/video\_2/baseline\_hydraulic\_diagnostics.png}
+\end{itemize}
+
+\subsection{Branch-Velocity Validation Products}
+
+\begin{itemize}
+  \item \texttt{outputs/physics/video\_2/droplet\_branch\_velocity\_validation/selected\_tracks.csv}
+  \item \texttt{outputs/physics/video\_2/droplet\_branch\_velocity\_validation/pooled\_normalized\_samples.csv}
+  \item \texttt{outputs/physics/video\_2/droplet\_branch\_velocity\_validation/droplet\_branch\_velocity\_summary.json}
+  \item \texttt{outputs/physics/video\_2/droplet\_branch\_velocity\_validation/droplet\_branch\_velocity\_scatter.png}
+  \item \texttt{outputs/physics/video\_2/droplet\_branch\_velocity\_validation/track\_<track\_id>\_normalized\_velocity.png}
+\end{itemize}
+
+\section{Testing}
+
+The test suite currently covers:
+
+\begin{itemize}
+  \item centerline arc length, orientation, tangent, normal, and topology behavior;
+  \item configuration-to-device resolution;
+  \item region label validity and connectivity;
+  \item ellipse rasterization and occupancy normalization;
+  \item low-coverage diagnostics and computability semantics;
+  \item baseline hydraulic equations, unit conversion, flow conservation, and mixture-flow handling;
+  \item centered finite-difference velocity derivation, branch-interior filtering,
+  deterministic candidate selection, correlation calculations, and validation metadata.
+\end{itemize}
+
+Run all tests with:
+
+\begin{verbatim}
+.\.venv\Scripts\python.exe -m pytest tests
+\end{verbatim}
+
+\section{Scope Boundaries}
+
+The current implementation does not:
+
+\begin{itemize}
+  \item modify files under \texttt{data/processed/2};
+  \item train or modify a neural network;
+  \item construct transformer training windows;
+  \item model junction resistance;
+  \item model droplet--droplet interactions;
+  \item fit hydraulic parameters from data;
+  \item use segmented droplet masks;
+  \item calculate phase-specific slip or separate phase velocities;
+  \item prove that branch superficial velocity equals droplet speed;
+  \item optimize temporal lag or smooth the validation signals.
+\end{itemize}
+
+\section{Recommended Pipeline Order}
+
+\begin{enumerate}[label=\arabic*.]
+  \item Build centerline geometry:
+\begin{verbatim}
+.\.venv\Scripts\python.exe -m scripts.build_geometry \
+  --experiment configs\experiments\video_2.yml \
+  --overwrite
+\end{verbatim}
+
+  \item Build device region labels:
+\begin{verbatim}
+.\.venv\Scripts\python.exe -m scripts.build_device_regions \
+  --experiment configs\experiments\video_2.yml \
+  --frame-index 0 \
+  --overwrite
+\end{verbatim}
+
+  \item Compute droplet occupancy:
+\begin{verbatim}
+.\.venv\Scripts\python.exe -m scripts.compute_droplet_occupancy \
+  --experiment configs\experiments\video_2.yml \
+  --overwrite
+\end{verbatim}
+
+  \item Compute baseline hydraulics:
+\begin{verbatim}
+.\.venv\Scripts\python.exe -m scripts.compute_baseline_hydraulics \
+  --experiment configs\experiments\video_2.yml \
+  --overwrite
+\end{verbatim}
+
+  \item Run droplet branch-velocity validation:
+\begin{verbatim}
+.\.venv\Scripts\python.exe -m scripts.validate_droplet_branch_velocity \
+  --experiment configs\experiments\video_2.yml \
+  --overwrite
+\end{verbatim}
+\end{enumerate}
+
+\end{document}

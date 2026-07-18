@@ -47,3 +47,8 @@ device:
         size_um: [100.0, 100.0]
     region_labels_path: data/geometry/asymmetric_loop_h100/region_labels.npy
     region_metadata_path: data/geometry/asymmetric_loop_h100/region_metadata.json
+
+  hydraulics:
+    isolated_droplet_resistance:
+      representation: equivalent_length
+      ratio_to_short_branch: 0.15
