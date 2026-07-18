@@ -36,5 +36,14 @@ device:
   # Geometry assets associated with this device
   geometry:
     channel_mask: data/processed/2/channel_mask.npy
-    centerline: data/processed/2/centerline.csv
+    centerline: data/processed/2/centerlines.csv
     branch_regions: null
+    junctions:
+      upper:
+        center_px: [330.0, 215.0]
+        size_um: [100.0, 100.0]
+      lower:
+        center_px: [330.0, 396.0]
+        size_um: [100.0, 100.0]
+    region_labels_path: data/geometry/asymmetric_loop_h100/region_labels.npy
+    region_metadata_path: data/geometry/asymmetric_loop_h100/region_metadata.json
