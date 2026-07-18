@@ -1,0 +1,38 @@
+experiment:
+  id: exp_0002
+  description: Strongly confined droplet experiment in the asymmetric H100 loop
+
+  # Link this experiment to its physical device
+  device_id: asymmetric_loop_h100
+
+  # Processed data associated with this experiment
+  data:
+    raw_video: D:/Microfluidic loop projct/new loop experiments/confined droplets 2
+    processed_root: data/processed/2
+    detections: data/processed/2/detections.csv
+    tracks: data/processed/2/tracked_features.csv
+    channel_mask: data/processed/2/channel_mask.npy
+
+  # Experimental operating conditions
+  phases:
+    continuous:
+      material: 2% SDS aqueous solution
+      flow_rate_ul_per_hr: 1950.0
+      viscosity_pa_s: null
+      density_kg_per_m3: null
+
+    dispersed:
+      material: Bromohexadecane
+      flow_rate_ul_per_hr: 10.0
+      viscosity_pa_s: null
+      density_kg_per_m3: null
+
+  droplet:
+    confinement_regime: strongly_confined
+    nominal_diameter_um: 100.0
+
+  derived:
+    total_flow_rate_ul_per_hr: 1960.0
+    continuous_to_dispersed_flow_rate_ratio: 195.0
+
+  interfacial_tension_n_per_m: null
