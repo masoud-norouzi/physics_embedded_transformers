@@ -1,0 +1,40 @@
+device:
+  id: asymmetric_loop_h100
+  name: Asymmetric loop, H100
+
+  # Image-to-physical-length calibration
+  calibration:
+    um_per_px: 4.0
+
+  # Fixed channel cross-section
+  channel:
+    width_um: 100.0
+    height_um: 100.0
+    width_px: 25.0
+    height_px: 25.0
+
+  # Measured loop-branch geometry
+  loop:
+    branches:
+      left:
+        role: long
+        length_px: 447.75
+        length_um: 1791.0
+
+      right:
+        role: short
+        length_px: 372.75
+        length_um: 1491.0
+
+    length_difference:
+      px: 75.0
+      um: 300.0
+
+    long_to_short_ratio: 1.201207
+    asymmetry_alpha: 0.201207
+
+  # Geometry assets associated with this device
+  geometry:
+    channel_mask: data/processed/2/channel_mask.npy
+    centerline: data/processed/2/centerline.csv
+    branch_regions: null
