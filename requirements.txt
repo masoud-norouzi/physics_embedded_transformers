@@ -6,3 +6,5 @@ opencv-python
 pytest
 scikit-fem
 meshio
+triangle
+shapely

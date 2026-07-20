@@ -1,0 +1,267 @@
+\section{Physics Enrichment: Tracking Table With Hydraulic and CFD Context}
+
+\subsection{Purpose}
+
+The physics-enrichment layer constructs a downstream feature superset of the
+tracked droplet table. It combines immutable droplet tracking, framewise
+baseline hydraulics, and sampled CFD background velocity from the frozen
+Version 1 interpolation library:
+
+\[
+\mathrm{tracked~droplets}
+  + \mathrm{hydraulic~state}(t)
+  + \mathbf{u}_{\mathrm{CFD}}(x,y;\alpha(t))
+  \rightarrow
+  \mathrm{physics\text{-}enriched~tracking}.
+\]
+
+The enriched tracking table is not itself a canonical ML dataset. Canonical
+dataset builders will later select controlled state-variable subsets from this
+single enriched source.
+
+\subsection{Immutable Inputs}
+
+The module treats the following files as read-only upstream artifacts:
+
+\begin{itemize}
+  \item \texttt{data/processed/2/tracked\_features.csv}
+  \item \texttt{outputs/physics/video\_2/baseline\_hydraulic\_state.csv}
+  \item \texttt{outputs/physics/junction\_cfd/solutions/}
+\end{itemize}
+
+No tracking file, hydraulic file, CFD solution, mesh, or interpolation-library
+artifact is regenerated or modified by this layer.
+
+\subsection{Files}
+
+\begin{itemize}
+  \item \texttt{src/physics/enrichment/tracking\_enricher.py}: orchestrates the
+        join, coordinate mapping, CFD sampling, validation, summaries, and
+        diagnostics.
+  \item \texttt{src/physics/enrichment/coordinate\_mapping.py}: explicit
+        pixel-to-physical-coordinate transform.
+  \item \texttt{src/physics/enrichment/validation.py}: row preservation,
+        hydraulic join, field-sampling, and output-integrity checks.
+  \item \texttt{src/physics/enrichment/types.py}: enrichment configuration and
+        summary dataclasses.
+  \item \texttt{scripts/physics/enrichment/build\_physics\_enriched\_tracking.py}:
+        command-line entry point.
+\end{itemize}
+
+\subsection{Hydraulic-State Join}
+
+The tracked table is joined to the hydraulic state using the frame index:
+
+\[
+  \mathrm{join~key} = \mathrm{frame}.
+\]
+
+The join is validated as many-to-one: every tracked droplet row must map to
+exactly one hydraulic state row, and the hydraulic table must contain no
+duplicate frame entries. The framewise flow fractions are derived from the
+validated baseline hydraulic outputs:
+
+\[
+  \alpha_L(t) =
+  \frac{Q_L(t)}{Q_{\mathrm{mix}}(t)},
+  \qquad
+  \alpha_R(t) =
+  \frac{Q_R(t)}{Q_{\mathrm{mix}}(t)}.
+\]
+
+The output stores these as \texttt{left\_flow\_fraction} and
+\texttt{right\_flow\_fraction}. The branch superficial velocities are converted
+from \(\mu\mathrm{m/s}\) to \(\mathrm{m/s}\). The inlet superficial velocity is
+computed from the total mixture flow rate and the \(100~\mu\mathrm{m}\times
+100~\mu\mathrm{m}\) channel cross-section.
+
+\subsection{Coordinate Mapping}
+
+The tracking centroids are image-pixel coordinates. The enrichment layer now
+stores both device Cartesian coordinates and frozen-CFD native coordinates.
+For the Version 1 CFD mesh, no crop translation or rotation is applied, but the
+y-axis orientation differs between the two physical frames:
+
+\[
+  x_{\mathrm{device},\mu m} = x_{\mathrm{px}}\Delta_{\mu m/\mathrm{px}},
+  \qquad
+  y_{\mathrm{device},\mu m} =
+  (y_{\mathrm{reference,px}} - y_{\mathrm{px}})\Delta_{\mu m/\mathrm{px}},
+\]
+
+\[
+  x_{\mathrm{CFD},\mu m} = x_{\mathrm{device},\mu m},
+  \qquad
+  y_{\mathrm{CFD},\mu m} =
+  y_{\mathrm{reference},\mu m} - y_{\mathrm{device},\mu m}.
+\]
+
+Vectors are transformed separately from points. CFD-native vectors are
+converted to device Cartesian components before storage in the enriched table:
+\[
+  u_{x,\mathrm{device}} = u_{x,\mathrm{cfd}},
+  \qquad
+  u_{y,\mathrm{device}} = -u_{y,\mathrm{cfd}}.
+\]
+
+\subsection{CFD Background Sampling}
+
+For each row, the framewise hydraulic split \(\alpha_L(t)\) selects a continuous
+background velocity field from the interpolation module:
+
+\[
+  \mathbf{u}_{\mathrm{bg}}(x,y,t)
+  =
+  \mathbf{u}_{\mathrm{CFD}}(x_{\mathrm{CFD}},y_{\mathrm{CFD}};\alpha_L(t)).
+\]
+
+The implementation samples the same P2 finite-element fields used by the
+interpolation module. For efficiency, stored CFD cases are evaluated at all
+inside-domain droplet positions and blended row-wise. This is equivalent to
+sampling the interpolated FEM coefficient field because basis evaluation is
+linear:
+
+\[
+  \sum_j\left[(1-w)U_j^a+wU_j^b\right]\phi_j(\mathbf{x})
+  =
+  (1-w)\sum_jU_j^a\phi_j(\mathbf{x})
+  +
+  w\sum_jU_j^b\phi_j(\mathbf{x}).
+\]
+
+\subsection{Output Schema}
+
+The enriched table preserves every original tracking column and appends:
+
+\begin{itemize}
+  \item coordinates:
+        \texttt{x\_device\_um}, \texttt{y\_device\_um},
+        \texttt{x\_cfd\_um}, \texttt{y\_cfd\_um};
+  \item hydraulic state:
+        \texttt{left\_flow\_fraction}, \texttt{right\_flow\_fraction},
+        \texttt{inlet\_superficial\_velocity\_m\_per\_s},
+        \texttt{left\_branch\_superficial\_velocity\_m\_per\_s},
+        \texttt{right\_branch\_superficial\_velocity\_m\_per\_s};
+  \item CFD background:
+        \texttt{background\_u\_x\_device\_m\_per\_s},
+        \texttt{background\_u\_y\_device\_m\_per\_s},
+        \texttt{background\_speed\_m\_per\_s},
+        \texttt{background\_direction\_x},
+        \texttt{background\_direction\_y},
+        \texttt{inside\_cfd\_domain};
+  \item interpolation provenance:
+        \texttt{cfd\_left\_fraction}, \texttt{cfd\_right\_fraction},
+        \texttt{cfd\_alpha\_low}, \texttt{cfd\_alpha\_high},
+        \texttt{cfd\_interpolation\_weight}, \texttt{cfd\_exact\_match};
+  \item reproducibility/version columns:
+        \texttt{physics\_enrichment\_version} and
+        \texttt{coordinate\_transform\_version}.
+\end{itemize}
+
+If available, \texttt{dominant\_region} from the occupancy table is retained as
+a diagnostic aid. Centered finite-difference observed velocity directions are
+also added in the device Cartesian frame for flow-direction alignment
+diagnostics.
+
+\subsection{Missing-Field Semantics}
+
+The CFD field covers only the upper junction patch. Droplets outside that
+patch are marked with
+
+\[
+  \texttt{inside\_cfd\_domain} = \mathrm{false}
+\]
+
+and their background velocity, speed, and direction fields are NaN. These
+values are not replaced by zero because zero denotes a physical stagnant
+velocity, whereas NaN denotes unavailable CFD coverage.
+
+\subsection{Validation Results}
+
+The most recent full \texttt{video\_2} enrichment artifact contains 432,460 rows
+and 44 columns.  That full table was not regenerated during the coordinate
+convention audit; the audit standardizes the code-level schema used by the next
+full enrichment build.  All 15 original tracking columns are preserved at the
+front of the table.
+
+\begin{center}
+\begin{tabular}{lr}
+\toprule
+Quantity & Value \\
+\midrule
+Rows inside CFD domain & 88,995 \\
+Inside-domain fraction & 20.58\% \\
+Unique tracks entering CFD domain & 3,609 \\
+Rows outside CFD domain with NaN background fields & 343,465 \\
+Hydraulic join coverage & 100\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Inside-domain rows by device region:
+
+\begin{center}
+\begin{tabular}{lr}
+\toprule
+Region & Rows \\
+\midrule
+inlet & 19,777 \\
+left branch & 14,140 \\
+right branch & 28,525 \\
+upper junction & 26,553 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Flow-direction alignment compares centered finite-difference droplet direction
+against sampled background-fluid direction. This diagnostic is used to check
+coordinate orientation and gross physical consistency; imperfect alignment is
+not automatically a bug because droplets are finite, confined, interacting
+objects.
+
+\begin{center}
+\begin{tabular}{lr}
+\toprule
+Metric & Value \\
+\midrule
+Valid comparisons & 88,983 \\
+Mean cosine similarity & 0.944611 \\
+Median cosine similarity & 0.999846 \\
+Mean angular difference & \(9.651^\circ\) \\
+Median angular difference & \(1.005^\circ\) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth,height=0.75\textheight,keepaspectratio]{../outputs/physics/video_2/enrichment/diagnostics/sampled_field_overlay.png}
+  \caption{Representative tracked-droplet overlay on the CFD junction mesh. Inside-domain droplets are distinguished from outside-domain droplets, and sampled background velocity vectors are shown for covered droplets.}
+  \label{fig:enrichment-sampled-overlay}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth,height=0.55\textheight,keepaspectratio]{../outputs/physics/video_2/enrichment/diagnostics/inside_domain_by_frame.png}
+  \caption{Number of tracked droplets inside the CFD junction patch as a function of frame.}
+  \label{fig:enrichment-inside-by-frame}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth,height=0.55\textheight,keepaspectratio]{../outputs/physics/video_2/enrichment/diagnostics/flow_direction_alignment.png}
+  \caption{Angular difference between observed droplet motion direction and sampled background-flow direction for droplets inside the CFD patch.}
+  \label{fig:enrichment-direction-alignment}
+\end{figure}
+
+\subsection{Execution}
+
+\begin{verbatim}
+.\.venv\Scripts\python.exe -m scripts.physics.enrichment.build_physics_enriched_tracking --experiment video_2 --overwrite
+\end{verbatim}
+
+Outputs are written to:
+
+\begin{verbatim}
+outputs/physics/video_2/enrichment/
+\end{verbatim}

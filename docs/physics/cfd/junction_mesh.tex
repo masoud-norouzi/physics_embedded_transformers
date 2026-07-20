@@ -1,217 +1,489 @@
-\section{Physics CFD: Junction Domain and Mesh}
+\section{Physics CFD: Version 1 Junction Stokes Library}
+
+\subsection{Purpose and Scientific Scope}
+
+The CFD module provides a spatially resolved, local flow model for the
+validated upper junction of the asymmetric loop device. It converts a prescribed
+branch-flow split into a continuous velocity and pressure field on the junction
+patch. In Version 1, the branch split is an input, not a prediction:
+
+\[
+  f_L = \frac{Q_L}{Q_{\mathrm{in}}},
+  \qquad
+  f_R = 1 - f_L.
+\]
+
+The CFD solver computes \(\mathbf{u}(\mathbf{x})\) and \(p(\mathbf{x})\) for a
+given pair \((f_L, f_R)\). The future hydraulics module is expected to provide
+the split used by the CFD module. The transformer should consume CFD-derived
+fields or features only after the physics pipeline has selected the split.
+
+Version 1 intentionally does not implement:
+
+\begin{itemize}
+  \item prediction of branch split from pressure or droplet state,
+  \item interpolation between CFD split cases,
+  \item transient CFD,
+  \item droplet-resolved multiphase CFD,
+  \item transformer integration.
+\end{itemize}
 
 \subsection{Files}
 
 \begin{itemize}
-  \item \texttt{src/physics/cfd/domain.py}
-  \item \texttt{src/physics/cfd/mesh.py}
-  \item \texttt{src/physics/cfd/solver.py}
-  \item \texttt{src/physics/cfd/streamlines.py}
-  \item \texttt{src/physics/cfd/velocity\_field.py}
-  \item \texttt{scripts/physics/build\_junction\_mesh.py}
-  \item \texttt{configs/physics/junction\_cfd.yml}
+  \item \texttt{src/physics/cfd/domain.py}: CFD-domain construction from the
+        validated centerline and channel width.
+  \item \texttt{src/physics/cfd/mesh.py}: production triangular mesh generation,
+        mesh-quality reporting, topology diagnostics, and mesh figures.
+  \item \texttt{src/physics/cfd/solver.py}: steady Stokes P2/P1 finite-element
+        solve, boundary conditions, metadata, and field/streamline outputs.
+  \item \texttt{src/physics/cfd/inlet\_profile\_diagnostic.py}: raw-FEM inlet
+        Poiseuille validation.
+  \item \texttt{src/physics/cfd/mesh\_convergence.py}: focused default-vs-fine
+        mesh comparison.
+  \item \texttt{src/physics/cfd/pilot\_splits.py}: three pilot prescribed-split
+        cases used before the full library.
+  \item \texttt{src/physics/cfd/velocity\_library.py}: full Version 1 prescribed
+        split library generation and indexing.
+  \item \texttt{scripts/physics/build\_junction\_mesh.py}: production mesh
+        generation command.
+  \item \texttt{scripts/physics/solve\_junction\_cfd.py}: single prescribed
+        split solve command.
+  \item \texttt{scripts/physics/compare\_default\_fine\_mesh.py}: focused mesh
+        convergence command.
+  \item \texttt{scripts/physics/run\_pilot\_splits.py}: pilot split runner.
+  \item \texttt{scripts/physics/generate\_velocity\_library.py}: full library
+        batch runner.
+  \item \texttt{configs/physics/junction\_cfd.yml}: production CFD
+        configuration.
 \end{itemize}
 
-\subsection{Physical Significance}
+\subsection{Physical Geometry and Units}
 
-The CFD module begins the transition from lumped branch resistance to
-spatially resolved flow. Phase 1 constructs a computational domain and mesh for
-the upper junction. No CFD solve is implemented yet.
-
-The future physical problem will be low-Reynolds-number flow in a confined
-microchannel. For an incompressible Newtonian fluid, the eventual Stokes
-equations would be:
+The CFD domain is the reduced upper-junction window of the asymmetric-loop
+device. The geometry is constructed from the validated centerline and the known
+channel width, not from pixelated segmentation masks. The physical channel
+width is
 
 \[
--\nabla p + \mu \nabla^2 \mathbf{u} = \mathbf{0},
-\qquad
-\nabla \cdot \mathbf{u} = 0.
+  W = 100~\mu\mathrm{m},
 \]
 
-Those equations are not solved in the current phase. The current CFD package
-only prepares the domain and mesh required for such a solver.
-
-\subsection{Domain Construction}
-
-The domain is extracted from the upper junction topology:
+and the calibration is
 
 \[
-\mathrm{inlet}
-\rightarrow
-\{\mathrm{left~branch}, \mathrm{right~branch}\}.
+  1~\mathrm{px} = 4~\mu\mathrm{m}.
 \]
 
-The computational patch extends \(400~\mu\mathrm{m}\) along the inlet and
-\(400~\mu\mathrm{m}\) downstream along each branch. Coordinates are stored in
-micrometers throughout:
+All geometry coordinates are stored in micrometers. The finite-element solve is
+assembled in SI-compatible units by converting coordinates to meters:
 
 \[
-\mathbf{x}_{\mu\mathrm{m}} = \Delta x \mathbf{x}_{\mathrm{px}},
-\qquad
-\Delta x = 4~\mu\mathrm{m}/\mathrm{px}.
+  \mathbf{x}_{m} = 10^{-6}\mathbf{x}_{\mu m}.
 \]
 
-The idealized channel domain is the set of points within half a channel width
-of the extracted branch centerlines:
-
-\[
-\Omega_{\mathrm{CFD}}
-=
-\left\{
-\mathbf{x} :
-\min_{\mathbf{c}\in \Gamma}
-\|\mathbf{x}-\mathbf{c}\|_2
-\le
-\frac{W}{2}
-\right\},
-\qquad
-W=100~\mu\mathrm{m}.
-\]
-
-Here \(\Gamma\) is the union of the inlet, left, and right branch centerline
-segments in the junction patch.
-
-\subsection{Mesh Generation}
-
-The mesh is triangular and generated from a triangular lattice point cloud
-filtered against the idealized channel domain. This avoids pixelated boundaries
-and avoids adding external meshing dependencies at this stage. Mesh sizing is
-driven entirely by:
-
-\begin{verbatim}
-configs/physics/junction_cfd.yml
-\end{verbatim}
-
-Current settings:
+The reported field units are:
 
 \begin{center}
-\begin{tabular}{@{}lr@{}}
+\begin{tabular}{@{}ll@{}}
 \toprule
-Parameter & Value \\
+Quantity & Unit \\
 \midrule
-\texttt{channel\_width\_um} & \(100.0\) \\
-\texttt{channel\_width\_px} & \(25.0\) \\
-\texttt{junction\_padding\_um} & \(400.0\) \\
-\texttt{target\_element\_size\_um} & \(20.0\) \\
-\texttt{boundary\_refinement\_factor} & \(0.5\) \\
+Geometry coordinates & \(\mu\mathrm{m}\) \\
+Solver coordinates & \(\mathrm{m}\) \\
+Velocity & \(\mathrm{m/s}\) \\
+Pressure & \(\mathrm{Pa}\) \\
+Dynamic viscosity & \(\mathrm{Pa\,s}\) \\
+Two-dimensional flux & \(\mathrm{m^2/s}\) \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-\subsection{Mesh Quality}
+\subsection{Governing Equations}
 
-For each triangular element, side lengths are \(a,b,c\). Angles are computed by
-the law of cosines:
-
-\[
-\theta_a
-=
-\cos^{-1}
-\left(
-\frac{b^2+c^2-a^2}{2bc}
-\right).
-\]
-
-Element area is:
+Version 1 solves the steady incompressible Stokes equations for a Newtonian
+single-phase flow:
 
 \[
-A_e
-=
-\frac{1}{2}
-\left|
-(\mathbf{x}_2-\mathbf{x}_1)
-\times
-(\mathbf{x}_3-\mathbf{x}_1)
-\right|.
+  -\nabla p + \mu \nabla^2 \mathbf{u} = \mathbf{0},
+  \qquad
+  \nabla \cdot \mathbf{u} = 0.
 \]
 
-The aspect ratio is reported as:
+Here \(\mathbf{u} = (u_x,u_y)\) is the in-plane velocity, \(p\) is pressure, and
+\(\mu\) is dynamic viscosity. In weak form, the viscous and incompressibility
+terms are assembled as
 
 \[
-\mathrm{AR}_e =
-\frac{\max(a,b,c)}{\min(a,b,c)}.
+  a(\mathbf{u},\mathbf{v})
+  =
+  \int_\Omega \mu \nabla \mathbf{u} : \nabla \mathbf{v}\,d\Omega,
 \]
 
-Current mesh statistics are:
+\[
+  b(\mathbf{u},q)
+  =
+  -\int_\Omega q\,\nabla\cdot\mathbf{u}\,d\Omega.
+\]
+
+The resulting mixed saddle-point system has the block form
+
+\[
+  \begin{bmatrix}
+  A & B^T \\
+  B & 0
+  \end{bmatrix}
+  \begin{bmatrix}
+  \mathbf{U} \\
+  \mathbf{P}
+  \end{bmatrix}
+  =
+  \begin{bmatrix}
+  \mathbf{f} \\
+  \mathbf{0}
+  \end{bmatrix},
+\]
+
+with essential velocity boundary conditions imposed by condensation.
+
+\subsection{Boundary Conditions}
+
+The inlet velocity is prescribed as a planar Poiseuille profile:
+
+\[
+  u_{\parallel}(s)
+  =
+  \frac{3}{2}U_{\mathrm{mean}}
+  \left[
+  1 - \left(\frac{2s}{W}\right)^2
+  \right],
+  \qquad
+  -\frac{W}{2}\le s \le \frac{W}{2}.
+\]
+
+The mean inlet velocity is obtained from the experimental total flow rate by
+converting the three-dimensional volumetric flow rate to a two-dimensional flux
+per unit depth:
+
+\[
+  q_{\mathrm{2D}} = \frac{Q_{\mathrm{3D}}}{H},
+  \qquad
+  U_{\mathrm{mean}} = \frac{q_{\mathrm{2D}}}{W}.
+\]
+
+For the configured case,
+
+\[
+  Q_{\mathrm{total}}=1960~\mu\mathrm{L/hr},
+  \qquad
+  H=100~\mu\mathrm{m},
+  \qquad
+  q_{\mathrm{2D}} = 5.444444\times10^{-6}~\mathrm{m^2/s}.
+\]
+
+The outlet velocities are also prescribed as parabolic profiles. For a requested
+left fraction \(f_L\),
+
+\[
+  q_L = f_L q_{\mathrm{2D}},
+  \qquad
+  q_R = (1-f_L)q_{\mathrm{2D}}.
+\]
+
+The wall boundary condition is no slip:
+
+\[
+  \mathbf{u}=\mathbf{0}
+  \qquad
+  \mathrm{on~solid~walls}.
+\]
+
+No physical pressure Dirichlet condition is applied at the inlet or outlets.
+Exactly one P1 pressure degree of freedom is fixed as a gauge to remove the
+constant pressure null mode. A sparse direct solve is required. Singular systems
+fail loudly; no least-squares fallback is accepted.
+
+\subsection{Finite Elements and Degree-of-Freedom Handling}
+
+The solver uses the Taylor--Hood element pair:
+
+\[
+  \mathbf{u}\in [P_2]^2,
+  \qquad
+  p\in P_1.
+\]
+
+Velocity degrees of freedom are vector-valued P2 DOFs, including edge-midpoint
+DOFs. Pressure degrees of freedom are scalar P1 nodal DOFs. The solution vector
+stores all velocity coefficients first, followed by pressure coefficients.
+Velocity boundary conditions are applied only on actual boundary-facet trace
+DOFs: edge endpoints and P2 edge midpoints. This was an important Version 1
+stability fix. Earlier tolerance-band boundary selection accidentally
+constrained near-boundary interior velocity DOFs and produced singular mixed
+systems. The current formulation reports full structural rank for the condensed
+system.
+
+\subsection{Production Mesh}
+
+The production mesh is a triangular mesh generated from centerline-derived
+boundary samples and a filtered interior point cloud. Boundary samples are
+protected first; later candidate points closer than \(6~\mu\mathrm{m}\) are
+rejected. This removes near-duplicate samples that previously caused sliver
+triangles without changing the physical domain.
 
 \begin{center}
 \begin{tabular}{@{}lr@{}}
 \toprule
-Metric & Value \\
+Production mesh metric & Value \\
 \midrule
-Nodes & 382 \\
-Elements & 651 \\
-Minimum angle & \(10.893^\circ\) \\
-Maximum angle & \(150.000^\circ\) \\
-Mean aspect ratio & 1.049 \\
-Maximum aspect ratio & 4.434 \\
-Estimated hydraulic area & \(112756.508~\mu\mathrm{m}^2\) \\
-Estimated smooth boundary length & \(2871.239~\mu\mathrm{m}\) \\
-Near-junction median edge length & \(20.000~\mu\mathrm{m}\) \\
+Nodes & 425 \\
+Elements & 656 \\
+Minimum angle & \(20.299^\circ\) \\
+Mean aspect ratio & 1.400 \\
+Maximum aspect ratio & 2.883 \\
+Connected fluid components & 1 \\
+Domain holes & 0 \\
+Invalid/inverted elements & 0 \\
+Interior boundary facets & 0 \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-\subsection{Implementation Details}
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.9\linewidth,height=0.70\textheight,keepaspectratio]{../outputs/physics/junction_cfd/figures/junction_mesh.png}
+  \caption{Production triangular CFD mesh for the reduced upper-junction domain.}
+  \label{fig:cfd-production-mesh}
+\end{figure}
 
-\texttt{domain.py} owns CFD-specific junction geometry extraction. Generic
-device centerline utilities remain under \texttt{src/physics/geometry}. This
-keeps reusable geometry separate from CFD-specific domain construction.
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.9\linewidth,height=0.70\textheight,keepaspectratio]{../outputs/physics/junction_cfd/figures/junction_mesh_zoom.png}
+  \caption{Zoomed production mesh near the bifurcation. The sharp junction geometry is preserved.}
+  \label{fig:cfd-production-mesh-zoom}
+\end{figure}
 
-\texttt{mesh.py} provides:
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.9\linewidth,height=0.70\textheight,keepaspectratio]{../outputs/physics/junction_cfd/figures/mesh_quality_aspect_ratio.png}
+  \caption{Production mesh quality visualization colored by triangle aspect ratio.}
+  \label{fig:cfd-production-mesh-quality}
+\end{figure}
+
+\subsection{Fine-Mesh Evidence}
+
+A focused convergence check compared the production mesh against one finer mesh.
+The finer mesh uses the same geometry, boundary labels, solver formulation, and
+boundary conditions. It is retained as convergence evidence only and is not the
+default.
+
+\begin{center}
+\begin{tabular}{@{}lrr@{}}
+\toprule
+Metric & Production & Fine evidence mesh \\
+\midrule
+Nodes & 425 & 971 \\
+Elements & 656 & 1619 \\
+Minimum angle & \(20.299^\circ\) & \(19.081^\circ\) \\
+Mean aspect ratio & 1.400 & 1.245 \\
+Maximum aspect ratio & 2.883 & 2.824 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+On common physical sample points in the junction region, the mean
+velocity-magnitude difference was \(6.062292\times 10^{-4}~\mathrm{m/s}\), and
+the mean flow-direction difference was \(0.909839^\circ\). The seeded streamline
+topology remained \(15\) left, \(15\) right, and one center separatrix/other for
+the 50/50 case. The production mesh was therefore retained as the default.
+
+\subsection{Validated 50/50 Case}
+
+The validated reference case uses
+
+\[
+  f_L = f_R = 0.5.
+\]
+
+\begin{center}
+\begin{tabular}{@{}lr@{}}
+\toprule
+Quantity & Value \\
+\midrule
+Solver backend & \texttt{scikit-fem/direct} \\
+Measured left/right split & 0.5000 / 0.5000 \\
+Inlet flux & \(-5.444444\times10^{-6}~\mathrm{m^2/s}\) \\
+Left outlet flux & \(2.722222\times10^{-6}~\mathrm{m^2/s}\) \\
+Right outlet flux & \(2.722222\times10^{-6}~\mathrm{m^2/s}\) \\
+Net mass residual & \(-1.730446\times10^{-17}~\mathrm{m^2/s}\) \\
+Maximum velocity & \(8.166667\times10^{-2}~\mathrm{m/s}\) \\
+Pressure range & \(-2.409284\) to \(26.29512~\mathrm{Pa}\) \\
+Seeded streamlines & 15 left, 15 right, 1 separatrix/other \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.9\linewidth,height=0.70\textheight,keepaspectratio]{../outputs/physics/junction_cfd/solutions/split_0p50/figures/velocity_magnitude.png}
+  \caption{Velocity magnitude for the validated 50/50 prescribed-split Stokes solution.}
+  \label{fig:cfd-50-velocity}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.9\linewidth,height=0.70\textheight,keepaspectratio]{../outputs/physics/junction_cfd/solutions/split_0p50/figures/pressure_field.png}
+  \caption{Pressure field for the validated 50/50 solution. Pressure is defined up to the one-DOF gauge.}
+  \label{fig:cfd-50-pressure}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.9\linewidth,height=0.70\textheight,keepaspectratio]{../outputs/physics/junction_cfd/solutions/split_0p50/figures/velocity_streamlines_inlet_seeded.png}
+  \caption{Inlet-seeded streamlines for the 50/50 case. Streamlines are post-processing traces of the solved velocity field.}
+  \label{fig:cfd-50-seeded-streamlines}
+\end{figure}
+
+\subsection{Inlet Poiseuille Validation}
+
+The raw FEM field is sampled directly at three inlet cross-sections:
+
+\begin{enumerate}
+  \item slightly downstream of the inlet,
+  \item at the midpoint of the straight inlet,
+  \item approximately one channel width upstream of the junction.
+\end{enumerate}
+
+For each section, the axial velocity \(u_\parallel\) is compared with
+
+\[
+  u_{\mathrm{Pois}}(s)
+  =
+  \frac{3}{2}U_{\mathrm{mean}}
+  \left[
+  1-\left(\frac{2s}{W}\right)^2
+  \right].
+\]
+
+For the production 50/50 case, the flux errors were approximately
+\(-2.778\times10^{-4}\), \(-2.771\times10^{-4}\), and
+\(-2.818\times10^{-4}\). The maximum transverse-to-mean inlet velocity ratio
+was about \(9.98\times10^{-4}\). These values show that the straight inlet
+remains close to the imposed Poiseuille profile and that the previous flux
+collapse failure has been eliminated.
+
+\subsection{Version 1 Prescribed-Split Library}
+
+The full Version 1 library consists of 19 prescribed split cases:
+
+\[
+  f_L \in
+  \{0.05, 0.10, 0.15,\ldots,0.95\}.
+\]
+
+The endpoints \(0.00\) and \(1.00\) are intentionally excluded because
+zero-flow outlet treatment may require a separate boundary-condition analysis.
+
+Each case is stored under:
 
 \begin{verbatim}
-geometry = build_junction_geometry(config)
-mesh = generate_mesh(geometry)
-report = evaluate_mesh(mesh)
+outputs/physics/junction_cfd/solutions/split_0pXX/
 \end{verbatim}
 
-\texttt{solver.py}, \texttt{streamlines.py}, and \texttt{velocity\_field.py}
-are placeholders only. They intentionally contain no Stokes solver, pressure
-field, streamline extraction, or velocity lookup logic.
+Each case contains solution fields, metadata, flux report, pressure field,
+velocity magnitude, velocity vectors, dense streamlines, inlet-seeded
+streamlines, and inlet Poiseuille diagnostics.
 
-\subsection{Outputs and Figures}
+\begin{center}
+\small
+\begin{longtable}{@{}lrrrrr@{}}
+\toprule
+Case & Requested \(f_L\) & Measured \(f_L\) & Residual & Pressure range & Seeds L/R/O \\
+\midrule
+\endhead
+\texttt{split\_0p05} & 0.05 & 0.0500 & \(9.096{\times}10^{-17}\) & 37.00166 & 0/31/0 \\
+\texttt{split\_0p10} & 0.10 & 0.1000 & \(7.893{\times}10^{-17}\) & 36.00268 & 0/31/0 \\
+\texttt{split\_0p15} & 0.15 & 0.1500 & \(6.690{\times}10^{-17}\) & 35.00370 & 0/31/0 \\
+\texttt{split\_0p20} & 0.20 & 0.2000 & \(5.487{\times}10^{-17}\) & 34.00472 & 1/28/2 \\
+\texttt{split\_0p25} & 0.25 & 0.2500 & \(4.284{\times}10^{-17}\) & 33.00574 & 4/26/1 \\
+\texttt{split\_0p30} & 0.30 & 0.3000 & \(3.081{\times}10^{-17}\) & 32.00676 & 6/23/2 \\
+\texttt{split\_0p35} & 0.35 & 0.3500 & \(1.878{\times}10^{-17}\) & 31.00778 & 8/21/2 \\
+\texttt{split\_0p40} & 0.40 & 0.4000 & \(6.754{\times}10^{-18}\) & 30.00879 & 11/19/1 \\
+\texttt{split\_0p45} & 0.45 & 0.4500 & \(-5.276{\times}10^{-18}\) & 29.00981 & 13/17/1 \\
+\texttt{split\_0p50} & 0.50 & 0.5000 & \(-1.730{\times}10^{-17}\) & 28.70440 & 15/15/1 \\
+\texttt{split\_0p55} & 0.55 & 0.5500 & \(-2.933{\times}10^{-17}\) & 30.05921 & 17/13/1 \\
+\texttt{split\_0p60} & 0.60 & 0.6000 & \(-4.136{\times}10^{-17}\) & 31.41402 & 19/10/2 \\
+\texttt{split\_0p65} & 0.65 & 0.6500 & \(-5.339{\times}10^{-17}\) & 32.76883 & 21/8/2 \\
+\texttt{split\_0p70} & 0.70 & 0.7000 & \(-6.542{\times}10^{-17}\) & 34.12364 & 23/6/2 \\
+\texttt{split\_0p75} & 0.75 & 0.7500 & \(-7.745{\times}10^{-17}\) & 35.47845 & 26/4/1 \\
+\texttt{split\_0p80} & 0.80 & 0.8000 & \(-8.948{\times}10^{-17}\) & 36.83327 & 28/1/2 \\
+\texttt{split\_0p85} & 0.85 & 0.8500 & \(-1.015{\times}10^{-16}\) & 38.18808 & 30/0/1 \\
+\texttt{split\_0p90} & 0.90 & 0.9000 & \(-1.135{\times}10^{-16}\) & 39.54289 & 31/0/0 \\
+\texttt{split\_0p95} & 0.95 & 0.9500 & \(-1.256{\times}10^{-16}\) & 40.89770 & 31/0/0 \\
+\bottomrule
+\end{longtable}
+\end{center}
 
-\begin{verbatim}
-outputs/physics/junction_cfd/geometry/junction_geometry.json
-outputs/physics/junction_cfd/meshes/junction_mesh.npz
-outputs/physics/junction_cfd/reports/mesh_quality_report.json
-outputs/physics/junction_cfd/reports/mesh_quality_report.md
-outputs/physics/junction_cfd/figures/
-\end{verbatim}
+All 19 cases passed validation. The maximum absolute mass residual was
+\(1.256\times10^{-16}~\mathrm{m^2/s}\). The maximum requested-versus-measured
+left-fraction error was \(1.735\times10^{-11}\). Cross-case checks confirmed
+that left outlet flux increases monotonically with \(f_L\), right outlet flux
+decreases monotonically, and the measured split tracks the requested split.
 
 \begin{figure}[H]
   \centering
-  \includegraphics[width=0.9\linewidth,height=0.72\textheight,keepaspectratio]{../outputs/physics/junction_cfd/figures/idealized_geometry.png}
-  \caption{Idealized CFD channel domain for the upper junction. The domain is reconstructed from centerlines and channel width, not from segmentation masks.}
-  \label{fig:cfd-idealized-geometry}
+  \includegraphics[width=0.95\linewidth,height=0.80\textheight,keepaspectratio]{../outputs/physics/junction_cfd/solutions/library_figures/library_summary_metrics.png}
+  \caption{Summary metrics across the 19 prescribed split cases. Fluxes provide the quantitative split validation; streamline counts are qualitative diagnostics.}
+  \label{fig:cfd-library-summary}
 \end{figure}
 
 \begin{figure}[H]
   \centering
-  \includegraphics[width=0.9\linewidth,height=0.72\textheight,keepaspectratio]{../outputs/physics/junction_cfd/figures/centerline_overlay_geometry.png}
-  \caption{Centerline overlay on the reconstructed CFD domain. Coordinates are stored and displayed in micrometers.}
-  \label{fig:cfd-centerline-overlay}
-\end{figure}
-
-\begin{figure}[H]
-  \centering
-  \includegraphics[width=0.9\linewidth,height=0.72\textheight,keepaspectratio]{../outputs/physics/junction_cfd/figures/junction_mesh.png}
-  \caption{Generated triangular mesh for the upper junction patch.}
-  \label{fig:cfd-junction-mesh}
-\end{figure}
-
-\begin{figure}[H]
-  \centering
-  \includegraphics[width=0.9\linewidth,height=0.72\textheight,keepaspectratio]{../outputs/physics/junction_cfd/figures/mesh_quality_aspect_ratio.png}
-  \caption{Mesh quality visualization colored by triangle aspect ratio.}
-  \label{fig:cfd-mesh-quality}
+  \includegraphics[width=0.95\linewidth,height=0.80\textheight,keepaspectratio]{../outputs/physics/junction_cfd/solutions/library_figures/library_representative_montage.png}
+  \caption{Representative velocity magnitude and inlet-seeded streamlines for selected prescribed split cases \(f_L=0.05,0.25,0.50,0.75,0.95\).}
+  \label{fig:cfd-library-montage}
 \end{figure}
 
 \subsection{Execution}
 
+Build the production mesh:
+
 \begin{verbatim}
-.\.venv\Scripts\python.exe -m scripts.physics.build_junction_mesh \
-  --config configs\physics\junction_cfd.yml \
-  --overwrite
+.\.venv\Scripts\python.exe -m scripts.physics.build_junction_mesh --overwrite
 \end{verbatim}
+
+Run the default validated 50/50 case:
+
+\begin{verbatim}
+.\.venv\Scripts\python.exe -m scripts.physics.solve_junction_cfd --overwrite
+\end{verbatim}
+
+Run one explicit prescribed split:
+
+\begin{verbatim}
+.\.venv\Scripts\python.exe -m scripts.physics.solve_junction_cfd ^
+  --left-fraction 0.30 --overwrite
+\end{verbatim}
+
+Generate the full Version 1 library:
+
+\begin{verbatim}
+.\.venv\Scripts\python.exe -m scripts.physics.generate_velocity_library --overwrite
+\end{verbatim}
+
+\subsection{Frozen Version 1 Artifacts}
+
+The frozen baseline lives under:
+
+\begin{verbatim}
+outputs/physics/junction_cfd/version_1/
+\end{verbatim}
+
+The concise Version 1 manifest is:
+
+\begin{verbatim}
+outputs/physics/junction_cfd/version_1/CFD_VERSION_1.md
+\end{verbatim}
+
+These artifacts record the validated scientific formulation and should not be
+overwritten by future library generation or transformer-facing experiments.

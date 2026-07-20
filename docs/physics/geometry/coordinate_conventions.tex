@@ -1,0 +1,149 @@
+\section{Physics Geometry: Coordinate and Vector Conventions}
+
+\subsection{Project-Wide Rule}
+
+No array or column may be named only \texttt{x}, \texttt{y}, \texttt{vx}, or
+\texttt{vy} at a boundary between physics modules unless its coordinate frame
+and units are defined by the enclosing typed object. Points and vectors must be
+transformed separately.
+
+\subsection{Coordinate Frames}
+
+\paragraph{Image frame.}
+The image frame uses \texttt{x\_px} and \texttt{y\_px}. The origin is the
+top-left video pixel, \(+x\) points right, \(+y\) points downward, and units are
+pixels.
+
+\paragraph{Device Cartesian frame.}
+The device frame uses \texttt{x\_device\_um} and \texttt{y\_device\_um}. The
+origin is fixed by the lower-left image reference line, \(+x\) points right,
+\(+y\) points upward, and units are micrometers. For \texttt{video\_2}, the
+fixed reference is taken from the device region metadata image height:
+\[
+  y_{\mathrm{reference,px}} = 596.
+\]
+
+\paragraph{Frozen CFD native frame.}
+The frozen CFD Version 1 mesh uses \texttt{x\_cfd\_um} and
+\texttt{y\_cfd\_um}. This frame inherits the calibrated full-image centerline:
+\(+x\) points right, \(+y\) points downward, and units are micrometers. This is
+the native frame of the stored CFD coefficients; it is not the preferred
+cross-module Cartesian vector frame.
+
+\subsection{Point Transforms}
+
+For pixel scale \(s\) in micrometers per pixel,
+\[
+  x_{\mathrm{device}} = s x_{\mathrm{px}},
+  \qquad
+  y_{\mathrm{device}} = s(y_{\mathrm{reference,px}} - y_{\mathrm{px}}).
+\]
+
+The frozen CFD mesh uses the calibrated image-oriented coordinate system, so
+\[
+  x_{\mathrm{cfd}} = x_{\mathrm{device}},
+  \qquad
+  y_{\mathrm{cfd}} =
+  y_{\mathrm{reference,um}} - y_{\mathrm{device}}.
+\]
+
+\subsection{Vector Transforms}
+
+Vectors use only the linear part of the affine transform. Translation is never
+applied to a vector:
+\[
+  v_{x,\mathrm{device}} = s v_{x,\mathrm{image}},
+  \qquad
+  v_{y,\mathrm{device}} = -s v_{y,\mathrm{image}}.
+\]
+
+Between device Cartesian and CFD native frames:
+\[
+  u_{x,\mathrm{cfd}} = u_{x,\mathrm{device}},
+  \qquad
+  u_{y,\mathrm{cfd}} = -u_{y,\mathrm{device}}.
+\]
+
+The inverse vector transform has the same y reflection:
+\[
+  u_{x,\mathrm{device}} = u_{x,\mathrm{cfd}},
+  \qquad
+  u_{y,\mathrm{device}} = -u_{y,\mathrm{cfd}}.
+\]
+
+\subsection{Observed Droplet Velocities}
+
+The current tracked-feature file contains framewise centroid positions and no
+canonical physical velocity columns. Centered finite differences of
+\texttt{centroid\_x} and \texttt{centroid\_y} produce image-frame velocities in
+pixels per frame. The device-frame conversion is:
+\[
+  v_{x,\mathrm{device}} = s v_{x,\mathrm{image}},
+  \qquad
+  v_{y,\mathrm{device}} = -s v_{y,\mathrm{image}}.
+\]
+
+No frame-rate conversion is currently applied in the enrichment direction audit,
+so observed droplet speeds remain in micrometers per frame. Direction
+comparisons are still valid because both observed and CFD vectors are converted
+to the same device Cartesian frame before computing angles.
+
+\subsection{CFD Direction Audit}
+
+The coordinate audit evaluates the frozen CFD Version 1 field directly at
+representative inlet and outlet points. For a point \(\mathbf{x}\), junction
+point \(\mathbf{x}_j\), and velocity \(\mathbf{u}\), the geometric tests are:
+\[
+  \mathbf{u}\cdot(\mathbf{x}_j-\mathbf{x}) > 0
+  \quad\mathrm{in~the~inlet},
+\]
+\[
+  \mathbf{u}\cdot(\mathbf{x}-\mathbf{x}_j) > 0
+  \quad\mathrm{in~each~outlet}.
+\]
+
+\begin{center}
+\begin{tabular}{lrrrrr}
+\toprule
+Region & \(x_{\mathrm{cfd}}\) & \(y_{\mathrm{cfd}}\) & \(u_x\) & \(u_y\) & Pass \\
+\midrule
+inlet & 1320.000 & 590.000 & \(-3.115{\times}10^{-9}\) & \(8.167{\times}10^{-2}\) & true \\
+left outlet & 1046.000 & 860.000 & \(-4.021{\times}10^{-2}\) & \(-8.003{\times}10^{-5}\) & true \\
+right outlet & 1593.934 & 861.612 & \(4.050{\times}10^{-2}\) & \(1.281{\times}10^{-3}\) & true \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The signed boundary fluxes are:
+\[
+  Q_{\mathrm{inlet}}=-5.444444{\times}10^{-6}~\mathrm{m^2/s},
+  \qquad
+  Q_{\mathrm{left}}=Q_{\mathrm{right}}=2.722222{\times}10^{-6}~\mathrm{m^2/s}.
+\]
+
+The negative inlet sign follows the outward-normal convention: flow enters the
+domain at the inlet and leaves through the outlets. The frozen CFD field is
+therefore physically oriented correctly. The misleading inlet arrow was a
+downstream convention problem: diagnostics and enrichment columns previously
+used ambiguous y-down quantities without naming the frame explicitly.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.90\linewidth,height=0.65\textheight,keepaspectratio]{../outputs/physics/coordinate_audit/figures/cfd_native_direction_check.png}
+  \caption{Direction check in the frozen CFD native frame. This frame has \(+y\) downward.}
+  \label{fig:coordinate-audit-cfd}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.90\linewidth,height=0.65\textheight,keepaspectratio]{../outputs/physics/coordinate_audit/figures/device_cartesian_direction_check.png}
+  \caption{Direction check in the device Cartesian frame. This frame has \(+y\) upward and uses no axis inversion.}
+  \label{fig:coordinate-audit-device}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.90\linewidth,height=0.65\textheight,keepaspectratio]{../outputs/physics/coordinate_audit/figures/image_coordinate_direction_check.png}
+  \caption{Direction check in image coordinates. The inlet arrow points visually from the upper stem toward the junction.}
+  \label{fig:coordinate-audit-image}
+\end{figure}

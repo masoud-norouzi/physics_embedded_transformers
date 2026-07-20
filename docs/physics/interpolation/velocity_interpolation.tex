@@ -1,0 +1,183 @@
+\section{Physics Interpolation: Continuous Split Velocity Fields}
+
+\subsection{Architectural Role}
+
+The interpolation module is a downstream consumer of the frozen CFD Version 1
+library. It does not generate geometry, regenerate meshes, solve Stokes systems,
+or alter CFD outputs. The scientific workflow is:
+
+\[
+\mathrm{Hydraulics}\rightarrow \alpha(t),
+\qquad
+\mathrm{CFD~Version~1}\rightarrow \mathbf{u}(x,y;\alpha_i),
+\qquad
+\mathrm{Interpolation}\rightarrow \mathbf{u}(x,y;\alpha).
+\]
+
+Here \(\alpha\) is the left-branch flow fraction,
+
+\[
+  \alpha = \frac{Q_L}{Q_{\mathrm{in}}},
+  \qquad
+  Q_R = (1-\alpha)Q_{\mathrm{in}}.
+\]
+
+The present implementation interprets the two-dimensional CFD field as a
+height-averaged background-flow approximation for the junction patch. Future ML
+modules can sample this continuous background field, but no transformer
+integration is implemented in this module.
+
+\subsection{Files}
+
+\begin{itemize}
+  \item \texttt{src/physics/interpolation/library.py}: discovers and validates
+        the frozen CFD split library.
+  \item \texttt{src/physics/interpolation/split\_interpolator.py}: chooses
+        neighboring split cases and linearly interpolates P2 velocity
+        coefficients.
+  \item \texttt{src/physics/interpolation/field\_sampler.py}: evaluates an
+        interpolated finite-element velocity field at arbitrary physical
+        coordinates.
+  \item \texttt{src/physics/interpolation/types.py}: typed data structures for
+        loaded cases, interpolated fields, and sampled values.
+  \item \texttt{src/physics/interpolation/validation.py}: withheld-case
+        validation and scientific consistency checks.
+  \item \texttt{scripts/physics/interpolation/validate\_velocity\_interpolation.py}:
+        command-line validation entry point.
+\end{itemize}
+
+\subsection{Interpolation Model}
+
+The frozen CFD library contains discrete solutions at
+
+\[
+  \alpha_i \in \{0.05,0.10,\ldots,0.95\}.
+\]
+
+For a requested \(\alpha\), the module finds neighboring stored fields
+\(\alpha_{\mathrm{low}}\leq\alpha\leq\alpha_{\mathrm{high}}\) and computes
+
+\[
+  w =
+  \frac{\alpha-\alpha_{\mathrm{low}}}
+       {\alpha_{\mathrm{high}}-\alpha_{\mathrm{low}}}.
+\]
+
+Because all Version 1 CFD cases use the same production mesh, the same P2
+velocity basis, and the same DOF ordering, interpolation is performed directly
+on the finite-element velocity coefficients:
+
+\[
+  \mathbf{U}(\alpha)
+  =
+  (1-w)\mathbf{U}(\alpha_{\mathrm{low}})
+  +
+  w\mathbf{U}(\alpha_{\mathrm{high}}).
+\]
+
+This is coefficient interpolation, not interpolation of rendered figures,
+streamlines, pressure plots, or regular-grid visualizations. If \(\alpha\)
+matches a stored library fraction to the documented tolerance, the stored field
+is returned exactly and no blend is performed.
+
+\subsection{Sampling}
+
+The public sampling operations name the coordinate frame explicitly:
+
+\begin{verbatim}
+library = VelocityFieldLibrary.from_directory(
+    "outputs/physics/junction_cfd/solutions"
+)
+field = library.interpolate(left_fraction=0.33)
+samples_cfd = field.sample_cfd(points_cfd_um)
+samples_device = field.sample_device(points_device_um, coordinate_convention)
+\end{verbatim}
+
+\texttt{sample\_cfd} is the low-level native operation. It expects points in
+the frozen CFD frame \((x_{\mathrm{cfd}},y_{\mathrm{cfd}})\), where \(+y\)
+points downward, and returns velocity components in the same frame.
+\texttt{sample\_device} expects points in the device Cartesian frame, where
+\(+y\) points upward, and returns device-frame velocity components. The older
+\texttt{sample(points\_um)} method is retained only as a backward-compatible
+alias for \texttt{sample\_cfd}.
+
+The sampler reconstructs the scikit-fem P2 vector basis on the shared
+production mesh and evaluates the FEM field directly:
+
+\[
+  \mathbf{u}(\mathbf{x};\alpha)
+  =
+  \sum_j U_j(\alpha)\boldsymbol{\phi}_j(\mathbf{x}).
+\]
+
+The output velocity units are meters per second in the requested output frame.
+Points outside the CFD domain are flagged with \texttt{inside\_domain = false};
+their velocity, speed, and direction values are returned as NaN. For
+near-zero-speed points inside the domain, the velocity components are retained
+while the unit direction is NaN.
+
+\subsection{Validation}
+
+The validation routine withholds stored CFD cases at
+\(\alpha=0.20,0.40,0.60,0.80\). Each withheld field is reconstructed from its
+two neighboring cases, then compared against the direct CFD result at the
+shared velocity DOFs and at a common set of physical sample points inside the
+junction domain.
+
+\begin{center}
+\begin{tabular}{rrrrrrr}
+\toprule
+\(\alpha\) & neighbors & \(w\) & DOF RMSE & sample speed RMSE & mean rel. error & mass residual \\
+\midrule
+0.20 & 0.15/0.25 & 0.500 & \(2.491{\times}10^{-15}\) & \(1.853{\times}10^{-15}\) & \(5.998{\times}10^{-14}\) & \(5.487{\times}10^{-17}\) \\
+0.40 & 0.35/0.45 & 0.500 & \(1.951{\times}10^{-15}\) & \(1.955{\times}10^{-15}\) & \(4.282{\times}10^{-14}\) & \(6.754{\times}10^{-18}\) \\
+0.60 & 0.55/0.65 & 0.500 & \(2.042{\times}10^{-15}\) & \(2.017{\times}10^{-15}\) & \(3.656{\times}10^{-14}\) & \(-4.136{\times}10^{-17}\) \\
+0.80 & 0.75/0.85 & 0.500 & \(1.936{\times}10^{-15}\) & \(1.878{\times}10^{-15}\) & \(6.156{\times}10^{-14}\) & \(-8.948{\times}10^{-17}\) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+These near-machine-precision errors are expected because the current prescribed
+split Stokes formulation is linear in the imposed outlet flux split on a fixed
+mesh. The validation nevertheless remains important because it protects the
+library contract: mesh identity, DOF ordering, field units, exact-match
+behavior, and output immutability.
+
+Scientific consistency checks confirmed:
+
+\begin{itemize}
+  \item no NaN values inside the valid sampled domain;
+  \item maximum mass-balance residual
+        \(1.135{\times}10^{-16}~\mathrm{m^2/s}\);
+  \item inlet profile unchanged across tested \(\alpha\);
+  \item maximum velocity on labeled no-slip wall facets equal to
+        \(0.0~\mathrm{m/s}\);
+  \item linear interpolation preserves the discrete incompressibility diagnostic
+        to the same scale as the stored CFD solutions.
+\end{itemize}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth,height=0.75\textheight,keepaspectratio]{../outputs/physics/interpolation/validation/figures/withheld_error_summary.png}
+  \caption{Withheld-case interpolation errors versus left-flow fraction. The errors are computed from FEM velocity coefficients and direct physical-domain samples, not from plotted images.}
+  \label{fig:interpolation-withheld-summary}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth,height=0.75\textheight,keepaspectratio]{../outputs/physics/interpolation/validation/figures/withheld_0p40_velocity_errors.png}
+  \caption{Representative withheld-case validation for \(\alpha=0.40\): interpolated speed, speed error, and angular error away from low-speed regions.}
+  \label{fig:interpolation-withheld-040}
+\end{figure}
+
+\subsection{Execution}
+
+\begin{verbatim}
+.\.venv\Scripts\python.exe -m scripts.physics.interpolation.validate_velocity_interpolation --overwrite
+\end{verbatim}
+
+The validation outputs are written outside the frozen CFD library:
+
+\begin{verbatim}
+outputs/physics/interpolation/validation/
+\end{verbatim}

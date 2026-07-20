@@ -1,5 +1,10 @@
-"""Placeholder for future velocity-library generation CLI.
+from pathlib import Path
+import sys
 
-No velocity lookup or interpolation functionality is implemented during the
-architecture cleanup.
-"""
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from src.physics.cfd.velocity_library import main
+
+
+if __name__ == "__main__":
+    main()
