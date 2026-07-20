@@ -25,6 +25,7 @@ from .solver import (
     _paired_vector_dof_values,
     _pressure_reference_dof,
     _scale_open_profiles_to_flux,
+    _split_config,
     _solution_config,
     _solve_condensed_system,
     _unit,
@@ -110,6 +111,7 @@ def _solve_raw_velocity_coefficients(
     mesh: TriangularMesh,
 ) -> tuple[Basis, np.ndarray, float, float]:
     solution_cfg = _solution_config(cfg)
+    split_cfg = _split_config(solution_cfg)
     viscosity = float(solution_cfg["viscosity_pa_s"])
     flow = _load_flow_inputs(cfg)
     inlet_flux = _volume_flow_to_2d_flux(flow["total_flow_rate_ul_per_hr"], flow["channel_height_um"])
@@ -137,9 +139,17 @@ def _solve_raw_velocity_coefficients(
         mesh,
         mean_velocity,
         inlet_flux,
+        split_cfg["left_fraction"],
         inlet_profile=str(solution_cfg["inlet_profile"]),
     )
-    velocity_values = _scale_open_profiles_to_flux(basis_u, mesh, velocity_dofs, velocity_values, inlet_flux)
+    velocity_values = _scale_open_profiles_to_flux(
+        basis_u,
+        mesh,
+        velocity_dofs,
+        velocity_values,
+        inlet_flux,
+        split_cfg["left_fraction"],
+    )
     values[velocity_dofs] = velocity_values
     pressure_dofs = np.asarray([_pressure_reference_dof(basis_p, mesh.geometry) + basis_u.N], dtype=np.int64)
     values[pressure_dofs] = float(solution_cfg["outlet_pressure_pa"])

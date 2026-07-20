@@ -70,10 +70,14 @@ def generate_mesh(geometry: JunctionGeometry) -> TriangularMesh:
     if near <= 0:
         raise ValueError("Refined element size must be positive")
 
-    points = [_sample_grid_points(geometry, spacing_um=target)]
-    points.append(_sample_offset_boundary_points(geometry, spacing_um=near))
-    points.append(geometry.junction_center_um[None, :])
+    points = [
+        _sample_offset_boundary_points(geometry, spacing_um=near),
+        geometry.junction_center_um[None, :],
+        _sample_grid_points(geometry, spacing_um=target),
+    ]
     nodes = _unique_rows(np.vstack(points), decimals=8)
+    if geometry.mesh_point_min_distance_um > 0:
+        nodes = _thin_candidate_points(nodes, geometry.mesh_point_min_distance_um)
     inside = inside_junction_domain(nodes, geometry, tolerance_um=near * 0.25)
     nodes = nodes[inside]
 
@@ -183,6 +187,7 @@ def save_mesh_outputs(mesh: TriangularMesh, report: MeshQualityReport, output_ro
         figures_dir / "idealized_geometry.png",
         figures_dir / "centerline_overlay_geometry.png",
         figures_dir / "junction_mesh.png",
+        figures_dir / "junction_mesh_zoom.png",
         figures_dir / "mesh_quality_aspect_ratio.png",
     ]
     if not overwrite:
@@ -217,6 +222,7 @@ def save_mesh_outputs(mesh: TriangularMesh, report: MeshQualityReport, output_ro
     _save_geometry_figure(mesh.geometry, figures_dir / "idealized_geometry.png", overlay_centerline=False)
     _save_geometry_figure(mesh.geometry, figures_dir / "centerline_overlay_geometry.png", overlay_centerline=True)
     _save_mesh_figure(mesh, figures_dir / "junction_mesh.png")
+    _save_mesh_figure(mesh, figures_dir / "junction_mesh_zoom.png", zoom_to_junction=True)
     _save_quality_figure(mesh, figures_dir / "mesh_quality_aspect_ratio.png")
     _save_boundary_label_figure(mesh, figures_dir / "boundary_labels.png")
 
@@ -286,6 +292,18 @@ def _sample_grid_points(geometry: JunctionGeometry, spacing_um: float) -> np.nda
         spacing_um,
     )
     return grid[inside_junction_domain(grid, geometry, tolerance_um=spacing_um * 0.2)]
+
+
+def _thin_candidate_points(points: np.ndarray, min_distance_um: float) -> np.ndarray:
+    kept: list[np.ndarray] = []
+    for point in points:
+        if not kept:
+            kept.append(point)
+            continue
+        distances = np.linalg.norm(np.asarray(kept) - point, axis=1)
+        if float(np.min(distances)) >= min_distance_um:
+            kept.append(point)
+    return np.asarray(kept, dtype=float)
 
 
 def _sample_near_junction_grid_points(geometry: JunctionGeometry, spacing_um: float) -> np.ndarray:
@@ -578,7 +596,7 @@ def _save_geometry_figure(geometry: JunctionGeometry, path: Path, overlay_center
     plt.close(fig)
 
 
-def _save_mesh_figure(mesh: TriangularMesh, path: Path) -> None:
+def _save_mesh_figure(mesh: TriangularMesh, path: Path, zoom_to_junction: bool = False) -> None:
     tri = mtri.Triangulation(mesh.nodes_um[:, 0], mesh.nodes_um[:, 1], mesh.elements)
     fig, ax = plt.subplots(figsize=(7, 7))
     ax.triplot(tri, linewidth=0.35, color="#1f2937")
@@ -588,7 +606,14 @@ def _save_mesh_figure(mesh: TriangularMesh, path: Path) -> None:
     ax.invert_yaxis()
     ax.set_xlabel("x (um)")
     ax.set_ylabel("y (um)")
-    ax.set_title("Generated triangular junction mesh")
+    if zoom_to_junction:
+        radius = mesh.geometry.channel_width_um * 1.4
+        center = mesh.geometry.junction_center_um
+        ax.set_xlim(center[0] - radius, center[0] + radius)
+        ax.set_ylim(center[1] + radius, center[1] - radius)
+        ax.set_title("Zoomed bifurcation mesh")
+    else:
+        ax.set_title("Generated triangular junction mesh")
     ax.legend(loc="best")
     fig.tight_layout()
     fig.savefig(path, dpi=180)

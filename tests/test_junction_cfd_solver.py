@@ -6,6 +6,7 @@ import numpy as np
 from src.physics.cfd.solver import (
     UL_PER_HR_TO_M3_PER_S,
     UM_TO_M,
+    configure_solution_split,
     evaluate_solution,
     save_solution_outputs,
     solve_junction_stokes,
@@ -47,6 +48,41 @@ def test_stokes_split_is_reported_for_both_outlets() -> None:
     assert 0.0 < solution.split_fraction["left"] < 1.0
     assert 0.0 < solution.split_fraction["right"] < 1.0
     assert np.isclose(solution.split_fraction["left"] + solution.split_fraction["right"], 1.0)
+
+
+def test_default_stokes_split_is_validated_50_50() -> None:
+    solution = solve_junction_stokes(CONFIG)
+
+    assert solution.requested_left_fraction == 0.5
+    assert solution.requested_right_fraction == 0.5
+    assert np.isclose(solution.split_fraction["left"], 0.5)
+    assert np.isclose(solution.split_fraction["right"], 0.5)
+
+
+def test_configure_solution_split_computes_right_fraction_and_separate_output() -> None:
+    from src.physics.cfd.domain import load_junction_cfd_config
+
+    base = load_junction_cfd_config(CONFIG)
+    for left in (0.10, 0.30, 0.90):
+        cfg = configure_solution_split(base, left)
+        assert cfg["solution"]["left_fraction"] == left
+        assert np.isclose(cfg["solution"]["right_fraction"], 1.0 - left)
+        assert cfg["solution"]["case_id"] == f"split_0p{int(round(left * 100)):02d}"
+        assert cfg["solution"]["output_root"].endswith(cfg["solution"]["case_id"])
+        assert cfg["solution"]["output_root"] != base["solution"]["output_root"]
+
+
+def test_invalid_solution_split_fractions_are_rejected() -> None:
+    from src.physics.cfd.domain import load_junction_cfd_config
+
+    base = load_junction_cfd_config(CONFIG)
+    for left in (0.0, 1.0, -0.1, 1.1):
+        try:
+            configure_solution_split(base, left)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"Invalid left fraction was accepted: {left}")
 
 
 def test_stokes_solution_outputs_are_written(tmp_path: Path) -> None:

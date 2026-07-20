@@ -3,7 +3,7 @@ from pathlib import Path
 import numpy as np
 
 from src.physics.cfd.domain import build_junction_geometry
-from src.physics.cfd.mesh import evaluate_mesh, generate_mesh
+from src.physics.cfd.mesh import evaluate_mesh, evaluate_mesh_topology, generate_mesh
 
 
 CONFIG = Path("configs/physics/junction_cfd.yml")
@@ -35,3 +35,22 @@ def test_generate_mesh_and_quality_report_are_positive() -> None:
     assert report.number_of_elements > 0
     assert report.minimum_angle_deg > 0
     assert report.estimated_hydraulic_domain_area_um2 > 0
+
+
+def test_refined_junction_mesh_quality_and_topology_regression() -> None:
+    geometry = build_junction_geometry(CONFIG)
+    mesh = generate_mesh(geometry)
+    report = evaluate_mesh(mesh)
+    topology = evaluate_mesh_topology(mesh)
+
+    assert report.minimum_angle_deg > 15.0
+    assert report.maximum_aspect_ratio < 5.0
+    assert topology.connected_fluid_components == 1
+    assert topology.domain_holes == 0
+    assert topology.invalid_or_inverted_elements == 0
+    assert topology.zero_area_elements == 0
+    assert topology.interior_boundary_facets == 0
+    assert topology.boundary_facet_counts["inlet"] > 0
+    assert topology.boundary_facet_counts["left_outlet"] > 0
+    assert topology.boundary_facet_counts["right_outlet"] > 0
+    assert topology.boundary_facet_counts["wall"] > 0

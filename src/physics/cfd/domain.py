@@ -26,6 +26,7 @@ class JunctionGeometry:
     junction_padding_um: float
     target_element_size_um: float
     boundary_refinement_factor: float
+    mesh_point_min_distance_um: float
     junction_center_um: np.ndarray
     branch_centerlines_um: dict[str, np.ndarray]
     branch_arc_lengths_um: dict[str, np.ndarray]
@@ -78,7 +79,8 @@ def build_junction_geometry(config: str | Path | dict[str, Any]) -> JunctionGeom
     padding_um = float(_required(cfg, "junction_padding_um"))
     target_size_um = float(_required(cfg, "target_element_size_um"))
     refinement = float(_required(cfg, "boundary_refinement_factor"))
-    if min(channel_width_um, channel_width_px, padding_um, target_size_um, refinement) <= 0:
+    min_distance_um = float(cfg.get("mesh_point_min_distance_um", 0.0))
+    if min(channel_width_um, channel_width_px, padding_um, target_size_um, refinement) <= 0 or min_distance_um < 0:
         raise ValueError("Geometry and mesh sizing config values must be positive")
 
     junction_um = geometry.upper_junction_xy * um_per_px
@@ -119,6 +121,7 @@ def build_junction_geometry(config: str | Path | dict[str, Any]) -> JunctionGeom
         junction_padding_um=padding_um,
         target_element_size_um=target_size_um,
         boundary_refinement_factor=refinement,
+        mesh_point_min_distance_um=min_distance_um,
         junction_center_um=junction_um,
         branch_centerlines_um=patch,
         branch_arc_lengths_um=arc_lengths,

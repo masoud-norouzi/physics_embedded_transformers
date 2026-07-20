@@ -7,6 +7,7 @@ channel_width_px: 25.0
 junction_padding_um: 300.0
 target_element_size_um: 20.0
 boundary_refinement_factor: 0.5
+mesh_point_min_distance_um: 6.0
 
 postprocessing:
   interpolation_grid_resolution_um: 4.0

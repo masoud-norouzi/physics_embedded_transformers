@@ -40,6 +40,8 @@ class StokesSolution:
     viscosity_pa_s: float
     total_flow_rate_ul_per_hr: float
     inlet_flux_m2_per_s: float
+    requested_left_fraction: float
+    requested_right_fraction: float
     channel_height_um: float
     inlet_mean_velocity_m_per_s: float
     velocity_node_m_per_s: np.ndarray
@@ -55,6 +57,7 @@ class StokesSolution:
     boundary_condition_summary: dict[str, Any]
     linear_system_diagnostics: dict[str, Any]
     boundary_dof_diagnostics: dict[str, Any]
+    divergence_diagnostics: dict[str, float]
     assumptions: list[str]
     postprocessing_config: dict[str, Any]
 
@@ -70,6 +73,8 @@ class StokesReport:
     total_flow_rate_ul_per_hr: float
     channel_height_um: float
     inlet_flux_m2_per_s: float
+    requested_left_fraction: float
+    requested_right_fraction: float
     inlet_mean_velocity_m_per_s: float
     maximum_velocity_m_per_s: float
     mean_velocity_m_per_s: float
@@ -111,6 +116,7 @@ def solve_junction_stokes(
     cfg = load_junction_cfd_config(config)
     solution_cfg = _solution_config(cfg)
     case_id = str(solution_cfg["case_id"])
+    split_cfg = _split_config(solution_cfg)
     viscosity = float(solution_cfg["viscosity_pa_s"])
     outlet_pressure = float(solution_cfg["outlet_pressure_pa"])
     if viscosity <= 0:
@@ -148,9 +154,17 @@ def solve_junction_stokes(
         mesh,
         mean_velocity,
         inlet_flux,
+        split_cfg["left_fraction"],
         inlet_profile=str(solution_cfg["inlet_profile"]),
     )
-    velocity_values = _scale_open_profiles_to_flux(basis_u, mesh, velocity_dofs, velocity_values, inlet_flux)
+    velocity_values = _scale_open_profiles_to_flux(
+        basis_u,
+        mesh,
+        velocity_dofs,
+        velocity_values,
+        inlet_flux,
+        split_cfg["left_fraction"],
+    )
     values[velocity_dofs] = velocity_values
     pressure_dofs = np.asarray([_pressure_reference_dof(basis_p, mesh.geometry) + basis_u.N], dtype=np.int64)
     values[pressure_dofs] = outlet_pressure
@@ -161,6 +175,7 @@ def solve_junction_stokes(
     solution_vector, linear_solver = _solve_condensed_system(system, rhs, values, constrained)
     velocity_solution = solution_vector[: basis_u.N]
     pressure_solution = solution_vector[basis_u.N :]
+    divergence_diagnostics = _divergence_diagnostics(basis_u, velocity_solution)
 
     velocity_nodes = _velocity_at_mesh_nodes(mesh, basis_u, velocity_solution)
     pressure_nodes = _pressure_at_mesh_nodes(mesh, basis_p, pressure_solution)
@@ -177,6 +192,8 @@ def solve_junction_stokes(
         viscosity_pa_s=viscosity,
         total_flow_rate_ul_per_hr=total_flow_ul_hr,
         inlet_flux_m2_per_s=inlet_flux,
+        requested_left_fraction=split_cfg["left_fraction"],
+        requested_right_fraction=split_cfg["right_fraction"],
         channel_height_um=channel_height_um,
         inlet_mean_velocity_m_per_s=mean_velocity,
         velocity_node_m_per_s=velocity_nodes,
@@ -192,12 +209,16 @@ def solve_junction_stokes(
         boundary_condition_summary={
             "walls": "no-slip velocity Dirichlet condition",
             "inlet": f"{solution_cfg['inlet_profile']} velocity Dirichlet profile matching total experiment flow",
-            "outlets": f"prescribed parabolic 50/50 outlet velocity profiles with a single pressure gauge of {outlet_pressure} Pa",
+            "outlets": (
+                f"prescribed parabolic outlet velocity profiles with requested left/right split "
+                f"{split_cfg['left_fraction']:.4f}/{split_cfg['right_fraction']:.4f} and a single pressure gauge of {outlet_pressure} Pa"
+            ),
             "pressure": "no physical pressure Dirichlet condition is applied at inlet or outlets; one pressure DOF is fixed only as a gauge.",
             "flow_conversion": "3D volumetric flow rate Q is converted to 2D flux per unit depth as q_2D = Q / channel_height.",
         },
         linear_system_diagnostics=linear_system_diagnostics,
         boundary_dof_diagnostics=boundary_dof_diagnostics,
+        divergence_diagnostics=divergence_diagnostics,
         assumptions=[
             "The solve is steady, incompressible, Newtonian, and single phase.",
             "The two-dimensional domain represents a depth-averaged cross-section with finite channel height used only to convert Q to area flux.",
@@ -223,6 +244,8 @@ def evaluate_solution(solution: StokesSolution) -> StokesReport:
         total_flow_rate_ul_per_hr=solution.total_flow_rate_ul_per_hr,
         channel_height_um=solution.channel_height_um,
         inlet_flux_m2_per_s=solution.inlet_flux_m2_per_s,
+        requested_left_fraction=solution.requested_left_fraction,
+        requested_right_fraction=solution.requested_right_fraction,
         inlet_mean_velocity_m_per_s=solution.inlet_mean_velocity_m_per_s,
         maximum_velocity_m_per_s=float(np.max(speed)),
         mean_velocity_m_per_s=float(np.mean(speed)),
@@ -288,6 +311,12 @@ def save_solution_outputs(solution: StokesSolution, output_root: str | Path, ove
         "boundary_conditions": solution.boundary_condition_summary,
         "boundary_dof_diagnostics": solution.boundary_dof_diagnostics,
         "linear_system_diagnostics": solution.linear_system_diagnostics,
+        "divergence_diagnostics": solution.divergence_diagnostics,
+        "cfd_version": "1.0",
+        "mesh_version": "production_v1",
+        "requested_left_fraction": solution.requested_left_fraction,
+        "requested_right_fraction": solution.requested_right_fraction,
+        "total_inlet_flow_ul_per_hr": solution.total_flow_rate_ul_per_hr,
         "assumptions": solution.assumptions,
         "units": {
             "geometry_coordinates": "um",
@@ -375,6 +404,23 @@ def _condensed_system_diagnostics(
     }
 
 
+def _divergence_diagnostics(basis_u: Basis, velocity_solution: np.ndarray) -> dict[str, float]:
+    field = basis_u.interpolate(velocity_solution)
+    divergence = np.asarray(field.grad[0, 0] + field.grad[1, 1])
+    weights = np.asarray(basis_u.dx)
+    element_integrals = np.sum(divergence * weights, axis=1)
+    element_areas = np.sum(weights, axis=1)
+    element_means = element_integrals / element_areas
+    return {
+        "l2_divergence_s_inv": float(np.sqrt(np.sum((divergence**2) * weights))),
+        "max_abs_divergence_s_inv": float(np.max(np.abs(divergence))),
+        "integrated_divergence_m2_per_s": float(np.sum(element_integrals)),
+        "elementwise_mean_divergence_min_s_inv": float(np.min(element_means)),
+        "elementwise_mean_divergence_max_s_inv": float(np.max(element_means)),
+        "elementwise_mean_divergence_mean_s_inv": float(np.mean(element_means)),
+    }
+
+
 def _solution_config(cfg: dict[str, Any]) -> dict[str, Any]:
     raw = cfg.get("solution")
     if not isinstance(raw, dict):
@@ -386,6 +432,32 @@ def _solution_config(cfg: dict[str, Any]) -> dict[str, Any]:
     if raw["inlet_profile"] != "parabolic":
         raise ValueError("Only solution.inlet_profile: parabolic is supported in this first solve")
     return dict(raw)
+
+
+def _split_config(solution_cfg: dict[str, Any]) -> dict[str, float]:
+    left = float(solution_cfg.get("left_fraction", 0.5))
+    if not 0.0 < left < 1.0:
+        raise ValueError("solution.left_fraction must satisfy 0 < left_fraction < 1")
+    return {"left_fraction": left, "right_fraction": 1.0 - left}
+
+
+def _case_id_from_left_fraction(left_fraction: float) -> str:
+    if not 0.0 < left_fraction < 1.0:
+        raise ValueError("left_fraction must satisfy 0 < left_fraction < 1")
+    return f"split_0p{int(round(left_fraction * 100)):02d}"
+
+
+def configure_solution_split(cfg: dict[str, Any], left_fraction: float) -> dict[str, Any]:
+    """Return a shallow config copy with an explicit prescribed left outlet fraction."""
+    case_id = _case_id_from_left_fraction(left_fraction)
+    updated = dict(cfg)
+    solution = dict(_solution_config(updated))
+    solution["left_fraction"] = float(left_fraction)
+    solution["right_fraction"] = 1.0 - float(left_fraction)
+    solution["case_id"] = case_id
+    solution["output_root"] = str(Path("outputs/physics/junction_cfd/solutions") / case_id)
+    updated["solution"] = solution
+    return updated
 
 
 def _postprocessing_config(geometry: JunctionGeometry, cfg: dict[str, Any] | None) -> dict[str, Any]:
@@ -444,6 +516,7 @@ def _velocity_dirichlet_values(
     mesh: TriangularMesh,
     inlet_mean_velocity_m_per_s: float,
     inlet_flux_m2_per_s: float,
+    left_fraction: float,
     inlet_profile: str,
 ) -> tuple[np.ndarray, np.ndarray]:
     if inlet_profile != "parabolic":
@@ -467,13 +540,13 @@ def _velocity_dirichlet_values(
             geometry.boundary_endpoints_um["left_outlet"],
             _unit(geometry.branch_tangents["left"][-1]),
             _unit(geometry.branch_normals["left"][-1]),
-            0.5 * inlet_flux_m2_per_s / (geometry.channel_width_um * UM_TO_M),
+            left_fraction * inlet_flux_m2_per_s / (geometry.channel_width_um * UM_TO_M),
         ),
         "right_outlet": (
             geometry.boundary_endpoints_um["right_outlet"],
             _unit(geometry.branch_tangents["right"][-1]),
             _unit(geometry.branch_normals["right"][-1]),
-            0.5 * inlet_flux_m2_per_s / (geometry.channel_width_um * UM_TO_M),
+            (1.0 - left_fraction) * inlet_flux_m2_per_s / (geometry.channel_width_um * UM_TO_M),
         ),
     }
     prescribed: dict[int, list[float]] = {}
@@ -512,14 +585,15 @@ def _scale_open_profiles_to_flux(
     velocity_dofs: np.ndarray,
     velocity_values: np.ndarray,
     inlet_flux_m2_per_s: float,
+    left_fraction: float,
 ) -> np.ndarray:
     coords_um = basis_u.doflocs.T / UM_TO_M
     labels = classify_boundary_points(coords_um[velocity_dofs], mesh.geometry)
     scaled = velocity_values.copy()
     targets = {
         "inlet": -inlet_flux_m2_per_s,
-        "left_outlet": 0.5 * inlet_flux_m2_per_s,
-        "right_outlet": 0.5 * inlet_flux_m2_per_s,
+        "left_outlet": left_fraction * inlet_flux_m2_per_s,
+        "right_outlet": (1.0 - left_fraction) * inlet_flux_m2_per_s,
     }
     for name, target in targets.items():
         trial = np.zeros(basis_u.N, dtype=float)
@@ -725,6 +799,7 @@ def _markdown_report(report: StokesReport, solution: StokesSolution) -> str:
             f"- Total configured flow: {report.total_flow_rate_ul_per_hr:.3f} uL/hr",
             f"- Channel height used for 3D-to-2D conversion: {report.channel_height_um:.3f} um",
             f"- Inlet 2D flux: {report.inlet_flux_m2_per_s:.6e} m^2/s",
+            f"- Requested left/right split: {report.requested_left_fraction:.4f} / {report.requested_right_fraction:.4f}",
             f"- Inlet mean velocity: {report.inlet_mean_velocity_m_per_s:.6e} m/s",
             f"- Maximum nodal velocity magnitude: {report.maximum_velocity_m_per_s:.6e} m/s",
             f"- Pressure range: {report.minimum_pressure_pa:.6e} to {report.maximum_pressure_pa:.6e} Pa",
@@ -764,6 +839,12 @@ def _markdown_report(report: StokesReport, solution: StokesSolution) -> str:
             f"- Detected nullity from singular-value estimates: {matrix['detected_nullity_from_estimates']}",
             f"- Pressure constant-mode residual before gauge: {matrix['pressure_constant_mode_residual_norm_unconstrained']:.6e}",
             f"- Singular-value estimate note: {matrix['singular_value_estimation_error']}",
+            "",
+            "## Divergence Diagnostics",
+            "",
+            f"- L2 divergence: {solution.divergence_diagnostics['l2_divergence_s_inv']:.6e} s^-1",
+            f"- Max absolute divergence: {solution.divergence_diagnostics['max_abs_divergence_s_inv']:.6e} s^-1",
+            f"- Integrated divergence: {solution.divergence_diagnostics['integrated_divergence_m2_per_s']:.6e} m^2/s",
             "",
             "## Assumptions",
             "",
@@ -1191,6 +1272,7 @@ def _distance_to_segment(point_um: np.ndarray, segment_um: np.ndarray) -> float:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Solve the first single-phase junction Stokes case.")
     parser.add_argument("--config", type=Path, default=Path("configs/physics/junction_cfd.yml"))
+    parser.add_argument("--left-fraction", type=float, default=None)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -1198,6 +1280,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     cfg = load_junction_cfd_config(args.config)
+    if args.left_fraction is not None:
+        cfg = configure_solution_split(cfg, args.left_fraction)
     solution = solve_junction_stokes(cfg)
     output_root = _solution_config(cfg)["output_root"]
     save_solution_outputs(solution, output_root, overwrite=args.overwrite)
