@@ -1,0 +1,72 @@
+\section{Configuration Module}
+
+\subsection{Files}
+
+\begin{itemize}
+  \item \texttt{src/config/loader.py}
+  \item \texttt{src/config/\_\_init\_\_.py}
+  \item \texttt{configs/devices/asymmetric\_loop\_h100.yml}
+  \item \texttt{configs/experiments/video\_2.yml}
+  \item \texttt{configs/physics/junction\_cfd.yml}
+\end{itemize}
+
+\subsection{Scientific Role}
+
+The configuration layer separates physical device properties from experiment
+conditions. This is important because device geometry, calibration, and channel
+dimensions are fixed properties of the microfluidic chip, whereas flow rates,
+tracked data, and validation outputs are experiment-specific.
+
+\subsection{Main Interface}
+
+\begin{verbatim}
+load_experiment_config(
+    experiment_path: str | Path,
+    configs_root: str | Path = "configs",
+) -> dict
+\end{verbatim}
+
+The loader reads an experiment YAML file, extracts
+\texttt{experiment.device\_id}, resolves the linked device file as:
+
+\begin{verbatim}
+configs/devices/<device_id>.yml
+\end{verbatim}
+
+It verifies:
+
+\[
+\texttt{device.id} = \texttt{experiment.device\_id}.
+\]
+
+The returned structure is:
+
+\begin{verbatim}
+{
+  "experiment": <full experiment YAML mapping>,
+  "device": <full device YAML mapping>
+}
+\end{verbatim}
+
+\subsection{Validation Behavior}
+
+The loader raises clear exceptions for missing experiment files, malformed or
+empty YAML, missing \texttt{experiment.device\_id}, missing linked device
+files, and mismatched device IDs.
+
+\subsection{Physical Parameters in Current Configs}
+
+\begin{longtable}{@{}ll@{}}
+\toprule
+Quantity & Value \\
+\midrule
+Device ID & \texttt{asymmetric\_loop\_h100} \\
+Experiment ID & \texttt{exp\_0002} \\
+Pixel scale & \(4.0~\mu\mathrm{m}/\mathrm{px}\) \\
+Channel width & \(100~\mu\mathrm{m}\) \\
+Channel height & \(100~\mu\mathrm{m}\) \\
+Continuous flow rate & \(1950~\mu\mathrm{L}/\mathrm{hr}\) \\
+Dispersed flow rate & \(10~\mu\mathrm{L}/\mathrm{hr}\) \\
+Total mixture flow rate & \(1960~\mu\mathrm{L}/\mathrm{hr}\) \\
+\bottomrule
+\end{longtable}

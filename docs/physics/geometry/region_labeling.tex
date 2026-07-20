@@ -1,0 +1,106 @@
+\section{Physics Geometry: Device Region Labeling}
+
+\subsection{Files}
+
+\begin{itemize}
+  \item \texttt{src/physics/geometry/regions.py}
+  \item \texttt{scripts/geometry/build\_device\_regions.py}
+  \item \texttt{tests/test\_device\_regions.py}
+\end{itemize}
+
+\subsection{Physical Significance}
+
+Device region labeling converts the calibrated geometry into a discrete physical
+partition of the channel. The label map is device-level: it is defined once for
+the chip geometry and then reused for every droplet frame. This prevents the
+occupancy module from re-inventing spatial regions on the fly.
+
+The labels are:
+
+\begin{center}
+\begin{tabular}{@{}cl@{}}
+\toprule
+ID & Physical region \\
+\midrule
+0 & background/unassigned \\
+1 & inlet \\
+2 & outlet \\
+3 & left branch \\
+4 & right branch \\
+5 & upper junction \\
+6 & lower junction \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Governing Geometry}
+
+The physical width of the channel is:
+
+\[
+W = 100~\mu\mathrm{m} = 25~\mathrm{px}.
+\]
+
+The region label map is constructed by assigning pixels to the closest
+centerline branch or configured junction region while respecting the fixed
+channel geometry. The region labels serve as the spatial basis functions for
+occupancy:
+
+\[
+\Omega =
+\Omega_{\mathrm{inlet}}
+\cup
+\Omega_{\mathrm{outlet}}
+\cup
+\Omega_{\mathrm{left}}
+\cup
+\Omega_{\mathrm{right}}
+\cup
+\Omega_{\mathrm{upper~junction}}
+\cup
+\Omega_{\mathrm{lower~junction}}.
+\]
+
+\subsection{Implementation Details}
+
+The label builder:
+
+\begin{itemize}
+  \item reads the device geometry and calibration;
+  \item uses preconfigured junction centers and physical junction sizes;
+  \item builds integer labels with no nonzero labels outside the channel;
+  \item validates that all physical regions are nonempty;
+  \item validates connectivity between branches and junctions;
+  \item creates a region overlay for manual inspection.
+\end{itemize}
+
+\subsection{Outputs}
+
+\begin{verbatim}
+data/geometry/asymmetric_loop_h100/region_labels.npy
+data/geometry/asymmetric_loop_h100/region_metadata.json
+data/geometry/asymmetric_loop_h100/region_overlay.png
+\end{verbatim}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth,height=0.75\textheight,keepaspectratio]{../data/geometry/asymmetric_loop_h100/region_overlay.png}
+  \caption{Device-level physical region overlay. This image shows the precomputed region labels used by droplet occupancy. Regions are not recomputed by the occupancy or validation visualizers.}
+  \label{fig:region-overlay}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth,height=0.75\textheight,keepaspectratio]{../outputs/geometry/asymmetric_loop_h100/centerline_regions_frame_0.png}
+  \caption{Historical centerline-region diagnostic for frame 0. It is retained as a development figure; the production occupancy path uses the device-level labels in Figure~\ref{fig:region-overlay}.}
+  \label{fig:centerline-regions-frame0}
+\end{figure}
+
+\subsection{Execution}
+
+\begin{verbatim}
+.\.venv\Scripts\python.exe -m scripts.geometry.build_device_regions \
+  --experiment configs\experiments\video_2.yml \
+  --frame-index 0 \
+  --overwrite
+\end{verbatim}

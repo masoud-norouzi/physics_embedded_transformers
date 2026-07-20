@@ -1,0 +1,137 @@
+\section{Physics Occupancy: Droplet Fractional Occupancy}
+
+\subsection{Files}
+
+\begin{itemize}
+  \item \texttt{src/physics/occupancy/ellipse.py}
+  \item \texttt{src/physics/occupancy/calculator.py}
+  \item \texttt{scripts/occupancy/compute\_droplet\_occupancy.py}
+  \item \texttt{tests/test\_droplet\_occupancy.py}
+\end{itemize}
+
+\subsection{Physical Significance}
+
+Droplet occupancy converts each tracked droplet into a fractional physical
+state over the device regions. This is the bridge from image-space droplet
+tracking to physics-aware branch loading. A droplet that is fully inside the
+left branch should contribute approximately one unit of left-branch occupancy,
+whereas a droplet spanning a junction or transition contributes fractionally
+across regions.
+
+\subsection{Droplet Footprint Model}
+
+Each detected droplet is approximated by an axis-aligned ellipse fitted to its
+tracking bounding box. If the tracked centroid is \((x_c,y_c)\), with bounding
+box width \(b_x\) and height \(b_y\), the ellipse is:
+
+\[
+\left(\frac{x-x_c}{b_x/2}\right)^2
++
+\left(\frac{y-y_c}{b_y/2}\right)^2
+\le 1.
+\]
+
+The physical footprint area reported from the bounding box is:
+
+\[
+A_{\mathrm{ellipse}}
+=
+\pi
+\left(\frac{b_x\Delta x}{2}\right)
+\left(\frac{b_y\Delta x}{2}\right),
+\]
+
+where \(\Delta x=4~\mu\mathrm{m}/\mathrm{px}\).
+
+\subsection{Raw and Normalized Occupancy}
+
+For droplet footprint \(D\) and physical region \(\Omega_k\), raw occupancy is
+the fraction of rasterized droplet pixels lying in that region:
+
+\[
+w_{k,\mathrm{raw}}
+=
+\frac{|D \cap \Omega_k|}{|D|}.
+\]
+
+The physical coverage is:
+
+\[
+c = \sum_{k} w_{k,\mathrm{raw}}.
+\]
+
+When \(c>0\), the normalized occupancy is:
+
+\[
+w_k = \frac{w_{k,\mathrm{raw}}}{c}.
+\]
+
+The six-region normalized vector order is:
+
+\[
+\mathbf{w}
+=
+\left[
+w_{\mathrm{inlet}},
+w_{\mathrm{outlet}},
+w_{\mathrm{left}},
+w_{\mathrm{right}},
+w_{\mathrm{upper~junction}},
+w_{\mathrm{lower~junction}}
+\right].
+\]
+
+\subsection{Implementation Details}
+
+The module:
+
+\begin{itemize}
+  \item validates the integer region-label map;
+  \item rasterizes the local droplet ellipse without scanning the full image;
+  \item computes raw occupancy for all six physical regions;
+  \item normalizes occupancy whenever physical coverage is nonzero;
+  \item preserves raw coverage diagnostics rather than discarding low-coverage samples;
+  \item records boundary clipping and dominant region.
+\end{itemize}
+
+Low physical coverage is diagnostic, not a reason to zero the normalized vector.
+Samples with no physical coverage remain noncomputable.
+
+\subsection{Outputs}
+
+\begin{verbatim}
+outputs/physics/video_2/droplet_occupancy.csv
+outputs/physics/video_2/droplet_occupancy_summary.json
+outputs/physics/video_2/occupancy_diagnostics.png
+outputs/physics/video_2/occupancy_spot_checks.png
+outputs/physics/video_2/invalid_occupancy_random_10.png
+\end{verbatim}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth,height=0.75\textheight,keepaspectratio]{../outputs/physics/video_2/occupancy_diagnostics.png}
+  \caption{Occupancy diagnostics summarizing physical coverage, active regions, boundary clipping, and normalized occupancy behavior.}
+  \label{fig:occupancy-diagnostics}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth,height=0.75\textheight,keepaspectratio]{../outputs/physics/video_2/occupancy_spot_checks.png}
+  \caption{Representative droplet occupancy spot checks. These verify ellipse rasterization against the precomputed device region labels.}
+  \label{fig:occupancy-spot-checks}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth,height=0.75\textheight,keepaspectratio]{../outputs/physics/video_2/invalid_occupancy_random_10.png}
+  \caption{Manual inspection montage for low-coverage or previously invalid occupancy cases.}
+  \label{fig:invalid-occupancy-random}
+\end{figure}
+
+\subsection{Execution}
+
+\begin{verbatim}
+.\.venv\Scripts\python.exe -m scripts.occupancy.compute_droplet_occupancy \
+  --experiment configs\experiments\video_2.yml \
+  --overwrite
+\end{verbatim}

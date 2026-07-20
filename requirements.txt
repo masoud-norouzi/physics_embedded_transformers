@@ -4,3 +4,5 @@ PyYAML
 matplotlib
 opencv-python
 pytest
+scikit-fem
+meshio

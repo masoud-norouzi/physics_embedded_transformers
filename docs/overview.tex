@@ -1,0 +1,78 @@
+\section{Repository Architecture}
+
+The repository is organized around a scientific preprocessing and physics stack
+for a microfluidic asymmetric-loop device. The architecture now follows the
+physical workflow:
+
+\[
+\mathrm{Geometry}
+\rightarrow
+\mathrm{Occupancy}
+\rightarrow
+\mathrm{Hydraulics}
+\rightarrow
+\mathrm{CFD}
+\rightarrow
+\mathrm{Physics~State}.
+\]
+
+The code implementing this workflow lives under:
+
+\begin{verbatim}
+src/physics/
+  geometry/
+  occupancy/
+  hydraulics/
+  cfd/
+  state/
+\end{verbatim}
+
+The current implementation is deterministic and data-preparatory. It does not
+train a transformer, solve Navier--Stokes equations, optimize temporal lag,
+fit hydraulic parameters, or compute velocity interpolation fields for ML use.
+
+\subsection{Top-Level Layout}
+
+\begin{longtable}{@{}ll@{}}
+\toprule
+Path & Scientific responsibility \\
+\midrule
+\texttt{src/config/} & Resolve experiment and device configuration. \\
+\texttt{src/physics/geometry/} & Device centerlines, physical geometry, and region labels. \\
+\texttt{src/physics/occupancy/} & Droplet fractional occupancy over physical regions. \\
+\texttt{src/physics/hydraulics/} & Baseline branch-resistance and superficial-velocity model. \\
+\texttt{src/physics/cfd/} & CFD domain and mesh infrastructure; solver placeholders only. \\
+\texttt{src/physics/state/} & Placeholder for future unified physics state. \\
+\texttt{scripts/geometry/} & Geometry and device-region command-line tools. \\
+\texttt{scripts/occupancy/} & Droplet occupancy command-line tools. \\
+\texttt{scripts/physics/} & Hydraulics and CFD command-line tools. \\
+\texttt{scripts/validation/} & Standalone scientific validation analyses. \\
+\bottomrule
+\end{longtable}
+
+\subsection{Physical Device}
+
+The present device is an asymmetric microfluidic loop with channel width and
+height both set to \(100~\mu\mathrm{m}\). The image calibration is:
+
+\[
+1~\mathrm{px} = 4~\mu\mathrm{m}.
+\]
+
+The loop branch lengths are:
+
+\[
+L_{\mathrm{left}} = 1791~\mu\mathrm{m},
+\qquad
+L_{\mathrm{right}} = 1491~\mu\mathrm{m}.
+\]
+
+Thus the left branch is the long branch and the right branch is the short
+branch:
+
+\[
+\frac{L_{\mathrm{left}}}{L_{\mathrm{right}}} = 1.201207,
+\qquad
+\alpha = \frac{L_{\mathrm{left}} - L_{\mathrm{right}}}{L_{\mathrm{right}}}
+= 0.201207.
+\]

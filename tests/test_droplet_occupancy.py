@@ -2,8 +2,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from scripts.compute_droplet_occupancy import _save_diagnostics
-from src.occupancy.calculator import (
+from scripts.occupancy.compute_droplet_occupancy import _save_diagnostics
+from src.physics.occupancy.calculator import (
     NORM_COLUMNS,
     calculate_dataset_occupancy,
     calculate_ellipse_occupancy,

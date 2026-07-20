@@ -1,0 +1,105 @@
+\section{Physics Geometry: Centerline Module}
+
+\subsection{Files}
+
+\begin{itemize}
+  \item \texttt{src/physics/geometry/centerlines.py}
+  \item \texttt{src/physics/geometry/types.py}
+  \item \texttt{scripts/geometry/build\_geometry.py}
+  \item \texttt{tests/test\_centerline\_geometry.py}
+\end{itemize}
+
+\subsection{Physical Significance}
+
+The centerline is the one-dimensional skeleton of the microfluidic network.
+It defines the topology, branch lengths, local tangent directions, and normal
+directions used by later geometry and occupancy calculations. The centerline is
+not itself a CFD boundary; it is a smooth geometric reference from which channel
+regions and idealized domains can be constructed.
+
+The current device has four labeled branches:
+
+\[
+\{\mathrm{inlet}, \mathrm{left}, \mathrm{right}, \mathrm{outlet}\}.
+\]
+
+The upper junction is the inlet bifurcation into the left and right loop
+branches. The lower junction merges the two loop branches into the outlet.
+
+\subsection{Coordinate and Unit Convention}
+
+Raw centerline coordinates are loaded in pixel units. The module immediately
+stores calibrated arc lengths using:
+
+\[
+s_\mu = s_{\mathrm{px}}\Delta x,
+\qquad
+\Delta x = 4~\mu\mathrm{m}/\mathrm{px}.
+\]
+
+For a branch represented by ordered points \(\mathbf{x}_i=(x_i,y_i)\), cumulative
+arc length is:
+
+\[
+s_0 = 0,
+\qquad
+s_i = \sum_{j=1}^{i}\|\mathbf{x}_j-\mathbf{x}_{j-1}\|_2.
+\]
+
+The local tangent vector is estimated by centered finite difference at interior
+points and one-sided difference at endpoints:
+
+\[
+\mathbf{t}_i =
+\frac{\mathbf{x}_{i+1}-\mathbf{x}_{i-1}}
+{\|\mathbf{x}_{i+1}-\mathbf{x}_{i-1}\|_2}.
+\]
+
+The normal convention is:
+
+\[
+\mathbf{n}_i = (-t_{y,i}, t_{x,i}).
+\]
+
+\subsection{Implementation Details}
+
+The module:
+
+\begin{itemize}
+  \item inspects the centerline CSV schema;
+  \item recognizes branch labels through aliases such as \texttt{channel};
+  \item orders branch points using explicit order columns when available;
+  \item falls back to coordinate-adjacency reconstruction when possible;
+  \item standardizes branch orientation according to physical flow direction;
+  \item validates loop branch lengths against the device YAML;
+  \item saves CSV, JSON, NPZ, and PNG geometry artifacts.
+\end{itemize}
+
+The current centerline file contains labels in the \texttt{channel} column. When
+nearest-neighbor path reconstruction fails for complex branch geometry, the CSV
+row order is retained as the implicit point sequence. This is documented in the
+runtime output and does not modify the source centerline.
+
+\subsection{Outputs}
+
+\begin{verbatim}
+outputs/geometry/asymmetric_loop_h100/centerline_geometry.csv
+outputs/geometry/asymmetric_loop_h100/geometry_summary.json
+outputs/geometry/asymmetric_loop_h100/device_geometry.npz
+outputs/geometry/asymmetric_loop_h100/centerline_geometry.png
+\end{verbatim}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.92\linewidth,height=0.75\textheight,keepaspectratio]{../outputs/geometry/asymmetric_loop_h100/centerline_geometry.png}
+  \caption{Calibrated centerline geometry diagnostic. The plotted branches encode the physical inlet, left branch, right branch, and outlet topology.}
+  \label{fig:centerline-geometry}
+\end{figure}
+
+\subsection{Execution}
+
+\begin{verbatim}
+.\.venv\Scripts\python.exe -m scripts.geometry.build_geometry \
+  --experiment configs\experiments\video_2.yml \
+  --overwrite
+\end{verbatim}

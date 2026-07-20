@@ -1,0 +1,240 @@
+\section{Validation: Droplet Speed versus Branch Velocity}
+
+\subsection{Files}
+
+\begin{itemize}
+  \item \texttt{scripts/validation/validate\_droplet\_branch\_velocity.py}
+  \item \texttt{tests/test\_droplet\_branch\_velocity\_validation.py}
+\end{itemize}
+
+\subsection{Scientific Question}
+
+This validation asks whether temporal variations in measured droplet speed
+co-vary with temporal variations in the calculated baseline branch superficial
+velocity. It is not a proof that droplet speed equals branch velocity.
+
+The measured droplet speed is derived from tracked centroid positions in
+\texttt{px/frame}. The baseline branch velocity is in
+\(\mu\mathrm{m}/\mathrm{s}\). Because the comparison uses per-track
+standardization, it compares temporal variation, not absolute velocity scale.
+
+\subsection{Measured Speed from Centered Difference}
+
+For each track, rows are sorted by frame. For interior frames with adjacent
+observations exactly one frame apart:
+
+\[
+v_x(t)
+=
+\frac{x(t+1)-x(t-1)}{2},
+\qquad
+v_y(t)
+=
+\frac{y(t+1)-y(t-1)}{2}.
+\]
+
+The measured speed is:
+
+\[
+u_{\mathrm{drop}}(t)
+=
+\sqrt{v_x(t)^2+v_y(t)^2}.
+\]
+
+Endpoints and samples adjacent to tracking gaps are excluded. Track boundaries
+are never mixed.
+
+\subsection{Branch-Interior Filtering}
+
+Samples are retained only when a droplet is clearly inside exactly one branch:
+
+\[
+w_{\mathrm{left}} \ge 0.95
+\quad \mathrm{xor} \quad
+w_{\mathrm{right}} \ge 0.95.
+\]
+
+For left-branch samples:
+
+\[
+u_{\mathrm{branch}}(t) = U_{\mathrm{left}}(t).
+\]
+
+For right-branch samples:
+
+\[
+u_{\mathrm{branch}}(t) = U_{\mathrm{right}}(t).
+\]
+
+There is no interpolation between left and right branch velocities.
+
+\subsection{Normalization and Correlation}
+
+For each selected \((\texttt{track\_id}, \texttt{branch})\) segment, both
+signals are standardized independently:
+
+\[
+z_{\mathrm{drop}}(t)
+=
+\frac{u_{\mathrm{drop}}(t)-\bar{u}_{\mathrm{drop}}}
+{\mathrm{std}(u_{\mathrm{drop}})},
+\]
+
+\[
+z_{\mathrm{branch}}(t)
+=
+\frac{u_{\mathrm{branch}}(t)-\bar{u}_{\mathrm{branch}}}
+{\mathrm{std}(u_{\mathrm{branch}})}.
+\]
+
+The standard deviation uses \(ddof=1\). Pearson and Spearman correlations are
+computed at zero lag on the final aligned normalized samples. No smoothing or
+lag optimization is applied.
+
+\subsection{Candidate Selection}
+
+The current data contain shorter right-branch interior segments than left-branch
+segments. The selected cutoff is:
+
+\[
+n_{\min}=60.
+\]
+
+This prevents the entire right branch from being excluded. Candidate ranking is
+deterministic and based on branch-velocity standard deviation, not correlation.
+When both branches have enough candidates, the validator selects five left and
+five right examples.
+
+\subsection{Current Results}
+
+\begin{center}
+\begin{tabular}{@{}lr@{}}
+\toprule
+Metric & Value \\
+\midrule
+Eligible candidates & 3595 \\
+Eligible left candidates & 1148 \\
+Eligible right candidates & 2447 \\
+Selected left candidates & 5 \\
+Selected right candidates & 5 \\
+Pooled samples & 742 \\
+Pooled Pearson \(r\) & 0.712629 \\
+Pooled Spearman \(\rho\) & 0.718781 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{center}
+\begin{tabular}{@{}rlrrr@{}}
+\toprule
+Track ID & Branch & Samples & Pearson \(r\) & Spearman \(\rho\) \\
+\midrule
+3463 & left & 83 & 0.603518 & 0.561827 \\
+254 & left & 83 & 0.756515 & 0.846252 \\
+3127 & left & 84 & 0.803099 & 0.831943 \\
+1713 & left & 84 & 0.837714 & 0.859534 \\
+3460 & left & 75 & 0.527768 & 0.493072 \\
+3461 & right & 67 & 0.668621 & 0.660548 \\
+257 & right & 66 & 0.767774 & 0.779150 \\
+3465 & right & 66 & 0.811301 & 0.717638 \\
+3462 & right & 67 & 0.876987 & 0.876327 \\
+1712 & right & 67 & 0.458025 & 0.526406 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Outputs and Figures}
+
+\begin{verbatim}
+outputs/physics/video_2/droplet_branch_velocity_validation/
+  selected_tracks.csv
+  pooled_normalized_samples.csv
+  droplet_branch_velocity_summary.json
+  droplet_branch_velocity_scatter.png
+  track_<track_id>_normalized_velocity.png
+\end{verbatim}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.9\linewidth,height=0.75\textheight,keepaspectratio]{../outputs/physics/video_2/droplet_branch_velocity_validation/droplet_branch_velocity_scatter.png}
+  \caption{Pooled normalized comparison of calculated branch superficial velocity and measured droplet speed. The pooled correlation is descriptive because repeated frames within a trajectory are temporally correlated.}
+  \label{fig:validation-scatter}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth,height=0.72\textheight,keepaspectratio]{../outputs/physics/video_2/droplet_branch_velocity_validation/track_3463_normalized_velocity.png}
+  \caption{Selected left-branch validation track 3463.}
+  \label{fig:validation-track-3463}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth,height=0.72\textheight,keepaspectratio]{../outputs/physics/video_2/droplet_branch_velocity_validation/track_254_normalized_velocity.png}
+  \caption{Selected left-branch validation track 254.}
+  \label{fig:validation-track-254}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth,height=0.72\textheight,keepaspectratio]{../outputs/physics/video_2/droplet_branch_velocity_validation/track_3127_normalized_velocity.png}
+  \caption{Selected left-branch validation track 3127.}
+  \label{fig:validation-track-3127}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth,height=0.72\textheight,keepaspectratio]{../outputs/physics/video_2/droplet_branch_velocity_validation/track_1713_normalized_velocity.png}
+  \caption{Selected left-branch validation track 1713.}
+  \label{fig:validation-track-1713}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth,height=0.72\textheight,keepaspectratio]{../outputs/physics/video_2/droplet_branch_velocity_validation/track_3460_normalized_velocity.png}
+  \caption{Selected left-branch validation track 3460.}
+  \label{fig:validation-track-3460}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth,height=0.72\textheight,keepaspectratio]{../outputs/physics/video_2/droplet_branch_velocity_validation/track_3461_normalized_velocity.png}
+  \caption{Selected right-branch validation track 3461.}
+  \label{fig:validation-track-3461}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth,height=0.72\textheight,keepaspectratio]{../outputs/physics/video_2/droplet_branch_velocity_validation/track_257_normalized_velocity.png}
+  \caption{Selected right-branch validation track 257.}
+  \label{fig:validation-track-257}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth,height=0.72\textheight,keepaspectratio]{../outputs/physics/video_2/droplet_branch_velocity_validation/track_3465_normalized_velocity.png}
+  \caption{Selected right-branch validation track 3465.}
+  \label{fig:validation-track-3465}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth,height=0.72\textheight,keepaspectratio]{../outputs/physics/video_2/droplet_branch_velocity_validation/track_3462_normalized_velocity.png}
+  \caption{Selected right-branch validation track 3462.}
+  \label{fig:validation-track-3462}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth,height=0.72\textheight,keepaspectratio]{../outputs/physics/video_2/droplet_branch_velocity_validation/track_1712_normalized_velocity.png}
+  \caption{Selected right-branch validation track 1712.}
+  \label{fig:validation-track-1712}
+\end{figure}
+
+\subsection{Execution}
+
+\begin{verbatim}
+.\.venv\Scripts\python.exe -m scripts.validation.validate_droplet_branch_velocity \
+  --experiment configs\experiments\video_2.yml \
+  --overwrite
+\end{verbatim}

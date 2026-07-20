@@ -2,9 +2,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.hydraulics import CANONICAL_ML_FEATURES
-from scripts.compute_baseline_hydraulics import _load_physical_constants
-from src.hydraulics.baseline import (
+from src.physics.hydraulics import CANONICAL_ML_FEATURES
+from scripts.physics.compute_baseline_hydraulics import _load_physical_constants
+from src.physics.hydraulics.baseline import (
     compute_baseline_hydraulic_state,
     compute_branch_flow_rates_ul_hr,
     compute_effective_branch_lengths_um,

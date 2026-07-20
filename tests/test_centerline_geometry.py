@@ -5,7 +5,7 @@ import pytest
 import yaml
 
 from src.config import load_experiment_config
-from src.geometry.centerlines import (
+from src.physics.geometry.centerlines import (
     build_device_geometry,
     cumulative_arc_length,
     order_branch_points,

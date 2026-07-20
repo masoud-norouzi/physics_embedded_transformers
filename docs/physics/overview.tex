@@ -1,0 +1,62 @@
+\section{Physics Package Overview}
+
+The physics package groups all scientific transformations that convert raw
+experimental tracking and device geometry into physically meaningful state
+variables. Its present responsibilities are:
+
+\begin{enumerate}[label=\arabic*.]
+  \item reconstruct a calibrated device geometry from centerlines;
+  \item label physical channel regions at the device level;
+  \item compute droplet occupancy fractions in those regions;
+  \item compute baseline branch hydraulic state from occupancy;
+  \item generate a CFD-ready junction domain and finite-element mesh;
+  \item reserve an interface for future unified physics state.
+\end{enumerate}
+
+\subsection{Package Layout}
+
+\begin{verbatim}
+src/physics/
+  geometry/
+    centerlines.py
+    regions.py
+    types.py
+  occupancy/
+    ellipse.py
+    calculator.py
+  hydraulics/
+    baseline.py
+  cfd/
+    domain.py
+    mesh.py
+    solver.py
+    streamlines.py
+    velocity_field.py
+  state/
+    physics_state.py
+\end{verbatim}
+
+\subsection{Data Flow}
+
+\[
+\begin{aligned}
+\mathrm{centerline~CSV}
+&\rightarrow
+\mathrm{calibrated~centerline~geometry}
+\\
+&\rightarrow
+\mathrm{device~region~label~map}
+\\
+&\rightarrow
+\mathrm{droplet~occupancy~vectors}
+\\
+&\rightarrow
+\mathrm{baseline~branch~hydraulics}
+\\
+&\rightarrow
+\mathrm{CFD~domain/mesh~and~future~velocity~fields}.
+\end{aligned}
+\]
+
+The transformer is intentionally outside this package. It should consume
+outputs from the physics package, not own the physical preprocessing itself.

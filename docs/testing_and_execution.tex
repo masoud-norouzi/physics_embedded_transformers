@@ -1,0 +1,89 @@
+\section{Testing and Execution}
+
+\subsection{Test Suite}
+
+The test suite covers:
+
+\begin{itemize}
+  \item configuration-to-device resolution;
+  \item centerline ordering, orientation, arc length, tangent, and normal behavior;
+  \item device region-label construction and connectivity;
+  \item droplet ellipse rasterization and occupancy normalization;
+  \item baseline branch-hydraulic equations and flow conservation;
+  \item centered finite-difference velocity validation;
+  \item junction CFD geometry and mesh generation.
+\end{itemize}
+
+Run all tests with:
+
+\begin{verbatim}
+.\.venv\Scripts\python.exe -m pytest tests
+\end{verbatim}
+
+The latest validation before this documentation update passed:
+
+\begin{verbatim}
+75 passed
+\end{verbatim}
+
+\subsection{Primary Commands}
+
+\begin{enumerate}[label=\arabic*.]
+  \item Build calibrated device geometry:
+\begin{verbatim}
+.\.venv\Scripts\python.exe -m scripts.geometry.build_geometry \
+  --experiment configs\experiments\video_2.yml \
+  --overwrite
+\end{verbatim}
+
+  \item Build device region labels:
+\begin{verbatim}
+.\.venv\Scripts\python.exe -m scripts.geometry.build_device_regions \
+  --experiment configs\experiments\video_2.yml \
+  --frame-index 0 \
+  --overwrite
+\end{verbatim}
+
+  \item Compute droplet occupancy:
+\begin{verbatim}
+.\.venv\Scripts\python.exe -m scripts.occupancy.compute_droplet_occupancy \
+  --experiment configs\experiments\video_2.yml \
+  --overwrite
+\end{verbatim}
+
+  \item Compute baseline hydraulics:
+\begin{verbatim}
+.\.venv\Scripts\python.exe -m scripts.physics.compute_baseline_hydraulics \
+  --experiment configs\experiments\video_2.yml \
+  --overwrite
+\end{verbatim}
+
+  \item Run branch-velocity validation:
+\begin{verbatim}
+.\.venv\Scripts\python.exe -m scripts.validation.validate_droplet_branch_velocity \
+  --experiment configs\experiments\video_2.yml \
+  --overwrite
+\end{verbatim}
+
+  \item Build junction CFD mesh:
+\begin{verbatim}
+.\.venv\Scripts\python.exe -m scripts.physics.build_junction_mesh \
+  --config configs\physics\junction_cfd.yml \
+  --overwrite
+\end{verbatim}
+\end{enumerate}
+
+\subsection{Current Scope Boundaries}
+
+The project currently does not implement:
+
+\begin{itemize}
+  \item CFD solving;
+  \item pressure fields;
+  \item streamline extraction;
+  \item velocity-field lookup or interpolation;
+  \item transformer training;
+  \item hydraulic parameter fitting;
+  \item droplet slip modeling;
+  \item junction loss modeling.
+\end{itemize}

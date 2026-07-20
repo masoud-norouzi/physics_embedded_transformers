@@ -1,0 +1,217 @@
+\section{Physics CFD: Junction Domain and Mesh}
+
+\subsection{Files}
+
+\begin{itemize}
+  \item \texttt{src/physics/cfd/domain.py}
+  \item \texttt{src/physics/cfd/mesh.py}
+  \item \texttt{src/physics/cfd/solver.py}
+  \item \texttt{src/physics/cfd/streamlines.py}
+  \item \texttt{src/physics/cfd/velocity\_field.py}
+  \item \texttt{scripts/physics/build\_junction\_mesh.py}
+  \item \texttt{configs/physics/junction\_cfd.yml}
+\end{itemize}
+
+\subsection{Physical Significance}
+
+The CFD module begins the transition from lumped branch resistance to
+spatially resolved flow. Phase 1 constructs a computational domain and mesh for
+the upper junction. No CFD solve is implemented yet.
+
+The future physical problem will be low-Reynolds-number flow in a confined
+microchannel. For an incompressible Newtonian fluid, the eventual Stokes
+equations would be:
+
+\[
+-\nabla p + \mu \nabla^2 \mathbf{u} = \mathbf{0},
+\qquad
+\nabla \cdot \mathbf{u} = 0.
+\]
+
+Those equations are not solved in the current phase. The current CFD package
+only prepares the domain and mesh required for such a solver.
+
+\subsection{Domain Construction}
+
+The domain is extracted from the upper junction topology:
+
+\[
+\mathrm{inlet}
+\rightarrow
+\{\mathrm{left~branch}, \mathrm{right~branch}\}.
+\]
+
+The computational patch extends \(400~\mu\mathrm{m}\) along the inlet and
+\(400~\mu\mathrm{m}\) downstream along each branch. Coordinates are stored in
+micrometers throughout:
+
+\[
+\mathbf{x}_{\mu\mathrm{m}} = \Delta x \mathbf{x}_{\mathrm{px}},
+\qquad
+\Delta x = 4~\mu\mathrm{m}/\mathrm{px}.
+\]
+
+The idealized channel domain is the set of points within half a channel width
+of the extracted branch centerlines:
+
+\[
+\Omega_{\mathrm{CFD}}
+=
+\left\{
+\mathbf{x} :
+\min_{\mathbf{c}\in \Gamma}
+\|\mathbf{x}-\mathbf{c}\|_2
+\le
+\frac{W}{2}
+\right\},
+\qquad
+W=100~\mu\mathrm{m}.
+\]
+
+Here \(\Gamma\) is the union of the inlet, left, and right branch centerline
+segments in the junction patch.
+
+\subsection{Mesh Generation}
+
+The mesh is triangular and generated from a triangular lattice point cloud
+filtered against the idealized channel domain. This avoids pixelated boundaries
+and avoids adding external meshing dependencies at this stage. Mesh sizing is
+driven entirely by:
+
+\begin{verbatim}
+configs/physics/junction_cfd.yml
+\end{verbatim}
+
+Current settings:
+
+\begin{center}
+\begin{tabular}{@{}lr@{}}
+\toprule
+Parameter & Value \\
+\midrule
+\texttt{channel\_width\_um} & \(100.0\) \\
+\texttt{channel\_width\_px} & \(25.0\) \\
+\texttt{junction\_padding\_um} & \(400.0\) \\
+\texttt{target\_element\_size\_um} & \(20.0\) \\
+\texttt{boundary\_refinement\_factor} & \(0.5\) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Mesh Quality}
+
+For each triangular element, side lengths are \(a,b,c\). Angles are computed by
+the law of cosines:
+
+\[
+\theta_a
+=
+\cos^{-1}
+\left(
+\frac{b^2+c^2-a^2}{2bc}
+\right).
+\]
+
+Element area is:
+
+\[
+A_e
+=
+\frac{1}{2}
+\left|
+(\mathbf{x}_2-\mathbf{x}_1)
+\times
+(\mathbf{x}_3-\mathbf{x}_1)
+\right|.
+\]
+
+The aspect ratio is reported as:
+
+\[
+\mathrm{AR}_e =
+\frac{\max(a,b,c)}{\min(a,b,c)}.
+\]
+
+Current mesh statistics are:
+
+\begin{center}
+\begin{tabular}{@{}lr@{}}
+\toprule
+Metric & Value \\
+\midrule
+Nodes & 382 \\
+Elements & 651 \\
+Minimum angle & \(10.893^\circ\) \\
+Maximum angle & \(150.000^\circ\) \\
+Mean aspect ratio & 1.049 \\
+Maximum aspect ratio & 4.434 \\
+Estimated hydraulic area & \(112756.508~\mu\mathrm{m}^2\) \\
+Estimated smooth boundary length & \(2871.239~\mu\mathrm{m}\) \\
+Near-junction median edge length & \(20.000~\mu\mathrm{m}\) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Implementation Details}
+
+\texttt{domain.py} owns CFD-specific junction geometry extraction. Generic
+device centerline utilities remain under \texttt{src/physics/geometry}. This
+keeps reusable geometry separate from CFD-specific domain construction.
+
+\texttt{mesh.py} provides:
+
+\begin{verbatim}
+geometry = build_junction_geometry(config)
+mesh = generate_mesh(geometry)
+report = evaluate_mesh(mesh)
+\end{verbatim}
+
+\texttt{solver.py}, \texttt{streamlines.py}, and \texttt{velocity\_field.py}
+are placeholders only. They intentionally contain no Stokes solver, pressure
+field, streamline extraction, or velocity lookup logic.
+
+\subsection{Outputs and Figures}
+
+\begin{verbatim}
+outputs/physics/junction_cfd/geometry/junction_geometry.json
+outputs/physics/junction_cfd/meshes/junction_mesh.npz
+outputs/physics/junction_cfd/reports/mesh_quality_report.json
+outputs/physics/junction_cfd/reports/mesh_quality_report.md
+outputs/physics/junction_cfd/figures/
+\end{verbatim}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.9\linewidth,height=0.72\textheight,keepaspectratio]{../outputs/physics/junction_cfd/figures/idealized_geometry.png}
+  \caption{Idealized CFD channel domain for the upper junction. The domain is reconstructed from centerlines and channel width, not from segmentation masks.}
+  \label{fig:cfd-idealized-geometry}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.9\linewidth,height=0.72\textheight,keepaspectratio]{../outputs/physics/junction_cfd/figures/centerline_overlay_geometry.png}
+  \caption{Centerline overlay on the reconstructed CFD domain. Coordinates are stored and displayed in micrometers.}
+  \label{fig:cfd-centerline-overlay}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.9\linewidth,height=0.72\textheight,keepaspectratio]{../outputs/physics/junction_cfd/figures/junction_mesh.png}
+  \caption{Generated triangular mesh for the upper junction patch.}
+  \label{fig:cfd-junction-mesh}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.9\linewidth,height=0.72\textheight,keepaspectratio]{../outputs/physics/junction_cfd/figures/mesh_quality_aspect_ratio.png}
+  \caption{Mesh quality visualization colored by triangle aspect ratio.}
+  \label{fig:cfd-mesh-quality}
+\end{figure}
+
+\subsection{Execution}
+
+\begin{verbatim}
+.\.venv\Scripts\python.exe -m scripts.physics.build_junction_mesh \
+  --config configs\physics\junction_cfd.yml \
+  --overwrite
+\end{verbatim}

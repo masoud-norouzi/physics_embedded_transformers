@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 
-from src.geometry.regions import RegionLabel, build_region_label_map, validate_region_label_map
+from src.physics.geometry.regions import RegionLabel, build_region_label_map, validate_region_label_map
 
 
 def _synthetic_device() -> dict:

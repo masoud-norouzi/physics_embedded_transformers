@@ -1,0 +1,26 @@
+device_config: configs/devices/asymmetric_loop_h100.yml
+centerline_path: data/processed/2/centerlines.csv
+experiment_config: configs/experiments/video_2.yml
+
+channel_width_um: 100.0
+channel_width_px: 25.0
+junction_padding_um: 300.0
+target_element_size_um: 20.0
+boundary_refinement_factor: 0.5
+
+postprocessing:
+  interpolation_grid_resolution_um: 4.0
+  dense_streamline_density: 2.4
+  inlet_seed_count: 31
+  streamline_seed_offset_um: 8.0
+  streamline_trace_step_um: 2.0
+  streamline_max_steps: 600
+  streamline_low_speed_um_per_s: 1.0e-6
+  outlet_termination_band_um: 20.0
+
+solution:
+  case_id: split_0p50
+  output_root: outputs/physics/junction_cfd/solutions/split_0p50
+  viscosity_pa_s: 0.001
+  inlet_profile: parabolic
+  outlet_pressure_pa: 0.0

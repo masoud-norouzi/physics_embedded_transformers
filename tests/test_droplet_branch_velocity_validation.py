@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from scripts.validate_droplet_branch_velocity import (
+from scripts.validation.validate_droplet_branch_velocity import (
     build_branch_interior_samples,
     build_candidate_table,
     build_pooled_samples,

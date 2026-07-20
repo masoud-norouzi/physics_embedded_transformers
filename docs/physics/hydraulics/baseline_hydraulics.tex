@@ -1,0 +1,171 @@
+\section{Physics Hydraulics: Baseline Branch Model}
+
+\subsection{Files}
+
+\begin{itemize}
+  \item \texttt{src/physics/hydraulics/baseline.py}
+  \item \texttt{scripts/physics/compute\_baseline\_hydraulics.py}
+  \item \texttt{tests/test\_baseline\_hydraulics.py}
+\end{itemize}
+
+\subsection{Physical Significance}
+
+This module translates droplet occupancy into a frame-level hydraulic state for
+the two loop branches. It is a baseline lumped-resistance model, not a full
+fluid solver. The purpose is to compute physically interpretable branch flow
+rates and superficial mixture velocities that can later be used as physics
+features.
+
+The model treats each branch as a hydraulic resistor with resistance
+proportional to effective branch length:
+
+\[
+R_i \propto L_{i,\mathrm{eff}}.
+\]
+
+The baseline does not model junction losses, phase-specific slip, local
+pressure fields, or droplet--droplet interactions beyond additive resistance.
+
+\subsection{Effective Droplet Resistance}
+
+An isolated droplet is represented as an equivalent length added to the branch.
+For the current device:
+
+\[
+\ell_d = 0.15 L_{\mathrm{short}}
+= 0.15(1491~\mu\mathrm{m})
+= 223.65~\mu\mathrm{m}.
+\]
+
+Effective branch occupancies are sums of normalized droplet branch occupancy:
+
+\[
+N_{\mathrm{left}}(t) = \sum_j w_{\mathrm{left},j}(t),
+\qquad
+N_{\mathrm{right}}(t) = \sum_j w_{\mathrm{right},j}(t).
+\]
+
+The effective branch lengths are:
+
+\[
+L_{\mathrm{left,eff}}(t)
+=
+L_{\mathrm{left}} + \ell_d N_{\mathrm{left}}(t),
+\]
+
+\[
+L_{\mathrm{right,eff}}(t)
+=
+L_{\mathrm{right}} + \ell_d N_{\mathrm{right}}(t).
+\]
+
+\subsection{Flow Split}
+
+The total mixture flow is:
+
+\[
+Q_{\mathrm{mix}}
+= Q_{\mathrm{continuous}} + Q_{\mathrm{dispersed}}
+= 1960~\mu\mathrm{L}/\mathrm{hr}.
+\]
+
+For two parallel hydraulic resistors, the branch flow rates satisfy:
+
+\[
+Q_{\mathrm{left}}
+=
+Q_{\mathrm{mix}}\,
+\frac{R_{\mathrm{right}}}
+{R_{\mathrm{left}}+R_{\mathrm{right}}},
+\qquad
+Q_{\mathrm{right}}
+=
+Q_{\mathrm{mix}}\,
+\frac{R_{\mathrm{left}}}
+{R_{\mathrm{left}}+R_{\mathrm{right}}}.
+\]
+
+Since \(R_i \propto L_{i,\mathrm{eff}}\), the implementation uses:
+
+\[
+Q_{\mathrm{left}}
+=
+Q_{\mathrm{mix}}\,
+\frac{L_{\mathrm{right,eff}}}
+{L_{\mathrm{left,eff}}+L_{\mathrm{right,eff}}},
+\]
+
+\[
+Q_{\mathrm{right}}
+=
+Q_{\mathrm{mix}}\,
+\frac{L_{\mathrm{left,eff}}}
+{L_{\mathrm{left,eff}}+L_{\mathrm{right,eff}}}.
+\]
+
+\subsection{Superficial Mixture Velocity}
+
+The reported velocities are superficial mixture velocities based on the full
+channel cross-sectional area:
+
+\[
+U_i
+=
+\frac{Q_i}{A},
+\qquad
+A = WH.
+\]
+
+With \(W=H=100~\mu\mathrm{m}\), the conversion from
+\(\mu\mathrm{L}/\mathrm{hr}\) to \(\mu\mathrm{m}/\mathrm{s}\) is:
+
+\[
+U_i~[\mu\mathrm{m}/\mathrm{s}]
+=
+\frac{Q_i~[\mu\mathrm{L}/\mathrm{hr}]
+\times 10^9~\mu\mathrm{m}^3/\mu\mathrm{L}}
+{3600~\mathrm{s}/\mathrm{hr}\times WH}.
+\]
+
+\subsection{Implementation Details}
+
+The module:
+
+\begin{itemize}
+  \item aggregates occupancy by frame;
+  \item ignores inlet, outlet, and junction occupancy in branch resistance;
+  \item computes effective branch lengths;
+  \item splits total mixture flow between branches;
+  \item converts branch flow to superficial velocity;
+  \item verifies flow conservation for every frame.
+\end{itemize}
+
+The canonical future ML features are:
+
+\begin{verbatim}
+left_velocity_um_s
+right_velocity_um_s
+\end{verbatim}
+
+\subsection{Outputs and Diagnostics}
+
+\begin{verbatim}
+outputs/physics/video_2/baseline_hydraulic_state.csv
+outputs/physics/video_2/baseline_hydraulic_summary.json
+outputs/physics/video_2/baseline_hydraulic_diagnostics.png
+\end{verbatim}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth,height=0.75\textheight,keepaspectratio]{../outputs/physics/video_2/baseline_hydraulic_diagnostics.png}
+  \caption{Baseline branch hydraulics diagnostics. The plot shows effective branch occupancy, effective length, superficial velocity, and flow/occupancy relationships.}
+  \label{fig:baseline-hydraulic-diagnostics}
+\end{figure}
+
+\subsection{Execution}
+
+\begin{verbatim}
+.\.venv\Scripts\python.exe -m scripts.physics.compute_baseline_hydraulics \
+  --experiment configs\experiments\video_2.yml \
+  --overwrite
+\end{verbatim}
