@@ -1,0 +1,36 @@
+device_config: configs/devices/asymmetric_loop_h100.yml
+centerline_path: data/processed/2/centerlines.csv
+experiment_config: configs/experiments/video_2.yml
+
+channel_width_um: 100.0
+channel_height_um: 100.0
+
+# Production full-device CFD mesh.
+# Selected by field-level verification against the 12 um reference solution:
+# outputs/physics/full_device_cfd/convergence/field_comparison_24_vs_12/
+target_element_size_um: 24.0
+boundary_refinement_factor: 0.5
+
+solution:
+  case_id: alpha0_equal_split
+  viscosity_pa_s: 0.001
+  inlet_profile: parabolic
+  outlet_boundary_condition: natural_traction
+  pressure_gauge: single_pressure_dof
+
+alpha_calibration:
+  enabled: true
+  split_tolerance: 0.001
+  preferred_split_tolerance: 0.0005
+  bracket_growth_factor: 3.0
+  beta_initial: 0.1
+  beta_max: 100.0
+  observed_quantile_low: 0.01
+  observed_quantile_high: 0.99
+  split_margin: 0.03
+  natural_split_tolerance: 0.001
+  monotonicity_tolerance: 0.0001
+  grid_spacing_um: 8.0
+  cache_dir: outputs/physics/full_device_cfd/alpha_calibration
+  output_dir: outputs/physics/full_device_cfd/alpha_calibration
+  resume: true

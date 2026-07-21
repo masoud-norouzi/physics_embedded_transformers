@@ -4,8 +4,8 @@
 
 The physics-enrichment layer constructs a downstream feature superset of the
 tracked droplet table. It combines immutable droplet tracking, framewise
-baseline hydraulics, and sampled CFD background velocity from the frozen
-Version 1 interpolation library:
+baseline hydraulics, and sampled CFD background velocity from the full-device
+CFD interpolation library:
 
 \[
 \mathrm{tracked~droplets}
@@ -26,7 +26,7 @@ The module treats the following files as read-only upstream artifacts:
 \begin{itemize}
   \item \texttt{data/processed/2/tracked\_features.csv}
   \item \texttt{outputs/physics/video\_2/baseline\_hydraulic\_state.csv}
-  \item \texttt{outputs/physics/junction\_cfd/solutions/}
+  \item \texttt{outputs/physics/full\_device\_cfd/solutions/}
 \end{itemize}
 
 No tracking file, hydraulic file, CFD solution, mesh, or interpolation-library
@@ -77,10 +77,9 @@ computed from the total mixture flow rate and the \(100~\mu\mathrm{m}\times
 
 \subsection{Coordinate Mapping}
 
-The tracking centroids are image-pixel coordinates. The enrichment layer now
-stores both device Cartesian coordinates and frozen-CFD native coordinates.
-For the Version 1 CFD mesh, no crop translation or rotation is applied, but the
-y-axis orientation differs between the two physical frames:
+The tracking centroids are image-pixel coordinates. The enrichment layer stores
+device Cartesian coordinates in micrometers. The full-device CFD geometry uses
+the same physical device frame, so no crop translation or rotation is required:
 
 \[
   x_{\mathrm{device},\mu m} = x_{\mathrm{px}}\Delta_{\mu m/\mathrm{px}},
@@ -89,19 +88,11 @@ y-axis orientation differs between the two physical frames:
   (y_{\mathrm{reference,px}} - y_{\mathrm{px}})\Delta_{\mu m/\mathrm{px}},
 \]
 
+The same convention is used when sampling the full-device CFD field:
 \[
   x_{\mathrm{CFD},\mu m} = x_{\mathrm{device},\mu m},
   \qquad
-  y_{\mathrm{CFD},\mu m} =
-  y_{\mathrm{reference},\mu m} - y_{\mathrm{device},\mu m}.
-\]
-
-Vectors are transformed separately from points. CFD-native vectors are
-converted to device Cartesian components before storage in the enriched table:
-\[
-  u_{x,\mathrm{device}} = u_{x,\mathrm{cfd}},
-  \qquad
-  u_{y,\mathrm{device}} = -u_{y,\mathrm{cfd}}.
+  y_{\mathrm{CFD},\mu m} = y_{\mathrm{device},\mu m}.
 \]
 
 \subsection{CFD Background Sampling}
@@ -165,8 +156,8 @@ diagnostics.
 
 \subsection{Missing-Field Semantics}
 
-The CFD field covers only the upper junction patch. Droplets outside that
-patch are marked with
+The full-device CFD field covers the loop geometry. Droplets outside the final
+fluid polygon are marked with
 
 \[
   \texttt{inside\_cfd\_domain} = \mathrm{false}
@@ -243,7 +234,7 @@ Median angular difference & \(1.005^\circ\) \\
 \begin{figure}[H]
   \centering
   \includegraphics[width=0.95\linewidth,height=0.55\textheight,keepaspectratio]{../outputs/physics/video_2/enrichment/diagnostics/inside_domain_by_frame.png}
-  \caption{Number of tracked droplets inside the CFD junction patch as a function of frame.}
+  \caption{Number of tracked droplets inside the CFD domain as a function of frame.}
   \label{fig:enrichment-inside-by-frame}
 \end{figure}
 

@@ -9,7 +9,8 @@ variables. Its present responsibilities are:
   \item label physical channel regions at the device level;
   \item compute droplet occupancy fractions in those regions;
   \item compute baseline branch hydraulic state from occupancy;
-  \item generate a CFD-ready junction domain and finite-element mesh;
+  \item generate a CFD-ready full-device domain, finite-element mesh, and
+        validated steady Stokes velocity field;
   \item reserve an interface for future unified physics state.
 \end{enumerate}
 
@@ -26,12 +27,11 @@ src/physics/
     calculator.py
   hydraulics/
     baseline.py
-  cfd/
+  full_device_cfd/
     domain.py
     mesh.py
     solver.py
-    streamlines.py
-    velocity_field.py
+    field_verification.py
   state/
     physics_state.py
 \end{verbatim}
@@ -54,7 +54,7 @@ src/physics/
 \mathrm{baseline~branch~hydraulics}
 \\
 &\rightarrow
-\mathrm{CFD~domain/mesh~and~future~velocity~fields}.
+\mathrm{full\text{-}device~CFD~velocity~fields}.
 \end{aligned}
 \]
 

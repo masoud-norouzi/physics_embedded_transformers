@@ -27,9 +27,10 @@ src/physics/
   state/
 \end{verbatim}
 
-The current implementation is deterministic and data-preparatory. It does not
-train a transformer, solve Navier--Stokes equations, optimize temporal lag,
-fit hydraulic parameters, or compute velocity interpolation fields for ML use.
+The current implementation is deterministic and physics-preparatory. It does
+not train a transformer, optimize temporal lag, fit hydraulic parameters, or
+resolve droplets as moving multiphase CFD objects. It does include a validated
+steady Stokes full-device CFD solve for the continuous phase.
 
 \subsection{Top-Level Layout}
 
@@ -41,7 +42,7 @@ Path & Scientific responsibility \\
 \texttt{src/physics/geometry/} & Device centerlines, physical geometry, and region labels. \\
 \texttt{src/physics/occupancy/} & Droplet fractional occupancy over physical regions. \\
 \texttt{src/physics/hydraulics/} & Baseline branch-resistance and superficial-velocity model. \\
-\texttt{src/physics/cfd/} & CFD domain and mesh infrastructure; solver placeholders only. \\
+\texttt{src/physics/full\_device\_cfd/} & Full-loop CAD geometry, mesh generation, Stokes solve, and field verification. \\
 \texttt{src/physics/state/} & Placeholder for future unified physics state. \\
 \texttt{scripts/geometry/} & Geometry and device-region command-line tools. \\
 \texttt{scripts/occupancy/} & Droplet occupancy command-line tools. \\

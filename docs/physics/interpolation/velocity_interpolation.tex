@@ -1,15 +1,15 @@
-\section{Physics Interpolation: Continuous Split Velocity Fields}
+\section{Physics Interpolation: Full-Device Velocity Fields}
 
 \subsection{Architectural Role}
 
-The interpolation module is a downstream consumer of the frozen CFD Version 1
-library. It does not generate geometry, regenerate meshes, solve Stokes systems,
+The interpolation module is a downstream consumer of full-device CFD velocity
+fields. It does not generate geometry, regenerate meshes, solve Stokes systems,
 or alter CFD outputs. The scientific workflow is:
 
 \[
 \mathrm{Hydraulics}\rightarrow \alpha(t),
 \qquad
-\mathrm{CFD~Version~1}\rightarrow \mathbf{u}(x,y;\alpha_i),
+\mathrm{Full\text{-}device~CFD}\rightarrow \mathbf{u}(x,y;\alpha_i),
 \qquad
 \mathrm{Interpolation}\rightarrow \mathbf{u}(x,y;\alpha).
 \]
@@ -23,8 +23,8 @@ Here \(\alpha\) is the left-branch flow fraction,
 \]
 
 The present implementation interprets the two-dimensional CFD field as a
-height-averaged background-flow approximation for the junction patch. Future ML
-modules can sample this continuous background field, but no transformer
+height-averaged background-flow approximation over the full loop domain. Future
+ML modules can sample this continuous background field, but no transformer
 integration is implemented in this module.
 
 \subsection{Files}
@@ -86,7 +86,7 @@ The public sampling operations name the coordinate frame explicitly:
 
 \begin{verbatim}
 library = VelocityFieldLibrary.from_directory(
-    "outputs/physics/junction_cfd/solutions"
+    "outputs/physics/full_device_cfd/solutions"
 )
 field = library.interpolate(left_fraction=0.33)
 samples_cfd = field.sample_cfd(points_cfd_um)

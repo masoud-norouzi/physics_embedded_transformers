@@ -1,0 +1,505 @@
+\section{Physics CFD: Full-Device Stokes Model}
+
+\subsection{Scientific Role}
+
+The full-device CFD module provides a spatially resolved, continuum-flow
+description of the asymmetric loop device.  The simulated domain contains the
+incoming trunk, the upper bifurcation, the long left arm, the short right arm,
+the lower merge junction, and the downstream outlet.  The central solid island
+is treated as an internal no-slip boundary.
+
+The purpose of this module is to generate a reusable background velocity field
+for downstream physics enrichment and eventual machine-learning features.  The
+current model is a single-phase, steady, incompressible Stokes approximation of
+the continuous phase.  Droplets are not resolved as moving deformable bodies in
+this CFD layer; their influence is represented elsewhere through occupancy and
+hydraulic-state modules.
+
+\[
+\mathrm{centerline~geometry}
+\rightarrow
+\mathrm{Boolean~CAD~fluid~domain}
+\rightarrow
+\mathrm{triangular~finite\text{-}element~mesh}
+\rightarrow
+\mathrm{steady~Stokes~solution}
+\rightarrow
+\mathbf{u}(x,y),p(x,y).
+\]
+
+\subsection{Implemented Files}
+
+\begin{itemize}
+  \item \texttt{src/physics/full\_device\_cfd/domain.py}: constructs the
+        full-device CAD polygon from calibrated centerlines.
+  \item \texttt{src/physics/full\_device\_cfd/mesh.py}: generates and labels
+        the constrained triangular finite-element mesh.
+  \item \texttt{src/physics/full\_device\_cfd/solver.py}: assembles and solves
+        the mixed Stokes system on the full-device mesh.
+  \item \texttt{src/physics/full\_device\_cfd/field\_verification.py}: compares
+        the production-candidate field against the fine reference field.
+  \item \texttt{scripts/physics/build\_full\_device\_mesh.py}: writes the
+        full-device CAD, mesh, and geometry diagnostics.
+  \item \texttt{scripts/physics/run\_full\_device\_convergence.py}: runs scalar
+        mesh convergence for the \(\alpha=0\) case.
+  \item \texttt{scripts/physics/verify\_full\_device\_field\_convergence.py}:
+        performs the final \(24~\mu\mathrm{m}\) versus
+        \(12~\mu\mathrm{m}\) vector-field comparison.
+\end{itemize}
+
+\subsection{Configuration}
+
+The production full-device CFD configuration is:
+
+\begin{verbatim}
+configs/physics/full_device_cfd.yml
+\end{verbatim}
+
+The selected production mesh size is frozen at exactly
+
+\[
+h_{\mathrm{target}} = 24~\mu\mathrm{m},
+\qquad
+h_{\mathrm{boundary}} = 12~\mu\mathrm{m}.
+\]
+
+This value was selected after comparing the complete \(24~\mu\mathrm{m}\)
+velocity vector field against a \(12~\mu\mathrm{m}\) reference field on a common
+Cartesian evaluation grid.
+
+\subsection{Geometry Construction}
+
+The device geometry is reconstructed from the extracted centerlines and fixed
+channel dimensions, not from a segmentation mask.  Coordinates are stored in
+the device Cartesian frame in micrometers.  The channel width and height are
+both \(100~\mu\mathrm{m}\).
+
+The CAD construction is deliberately geometric:
+
+\[
+\mathrm{centerlines}
+\rightarrow
+\mathrm{offset~walls~at}~\pm 50~\mu\mathrm{m}
+\rightarrow
+\mathrm{Boolean~union~of~connected~channels}
+\rightarrow
+\mathrm{central~island~hole}
+\rightarrow
+\mathrm{boundary~rings}.
+\]
+
+This construction yields one connected fluid component with one internal solid
+island.  The inlet and outlet channels are blended into the loop as part of a
+single continuous CAD domain so that no artificial wall fragments remain inside
+the bifurcation or merge regions.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.84\linewidth,height=0.70\textheight,keepaspectratio]{../outputs/physics/full_device_cfd/mesh/full_device_polygon_with_centerlines.png}
+  \caption{Full-device fluid polygon reconstructed from calibrated centerlines.
+  The blue region is the continuous fluid domain and the white central island is
+  the no-slip solid boundary.}
+  \label{fig:full-device-polygon}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.48\linewidth,height=0.48\textheight,keepaspectratio]{../outputs/physics/full_device_cfd/mesh/inlet_junction_polygon_zoom.png}
+  \includegraphics[width=0.48\linewidth,height=0.48\textheight,keepaspectratio]{../outputs/physics/full_device_cfd/mesh/outlet_junction_polygon_zoom.png}
+  \caption{Zoomed CAD diagnostics at the inlet split and outlet merge.  These
+  checks verify that the branch transitions are continuous and do not contain
+  internal wall remnants.}
+  \label{fig:full-device-junction-cad}
+\end{figure}
+
+\subsection{Mesh Generation}
+
+The mesher receives the final CAD polygon as a planar straight-line graph.  The
+outer wall and inner island are sampled at the configured boundary spacing, and
+a constrained triangular mesh is generated over the fluid region.  Boundary
+facets are labeled as inlet, outlet, or wall for finite-element boundary
+conditions.
+
+For the frozen \(24~\mu\mathrm{m}\) production mesh:
+
+\begin{center}
+\begin{tabular}{lr}
+\toprule
+Quantity & Value \\
+\midrule
+Nodes & 2339 \\
+Elements & 3807 \\
+Minimum angle & \(25.727^\circ\) \\
+Maximum angle & \(122.392^\circ\) \\
+Median aspect ratio & 1.456 \\
+Maximum aspect ratio & 2.285 \\
+Fluid area & \(5.226\times10^5~\mu\mathrm{m}^2\) \\
+Boundary length & \(1.043\times10^4~\mu\mathrm{m}\) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.84\linewidth,height=0.70\textheight,keepaspectratio]{../outputs/physics/full_device_cfd/mesh/full_device_mesh.png}
+  \caption{Frozen \(24~\mu\mathrm{m}\) full-device triangular mesh.}
+  \label{fig:full-device-mesh}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.84\linewidth,height=0.70\textheight,keepaspectratio]{../outputs/physics/full_device_cfd/mesh/full_device_mesh_quality.png}
+  \caption{Mesh aspect-ratio diagnostic for the full-device production mesh.}
+  \label{fig:full-device-mesh-quality}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.48\linewidth,height=0.48\textheight,keepaspectratio]{../outputs/physics/full_device_cfd/mesh/inlet_junction_mesh_zoom.png}
+  \includegraphics[width=0.48\linewidth,height=0.48\textheight,keepaspectratio]{../outputs/physics/full_device_cfd/mesh/outlet_junction_mesh_zoom.png}
+  \caption{Production mesh near the inlet split and outlet merge.}
+  \label{fig:full-device-mesh-zooms}
+\end{figure}
+
+\subsection{Governing Equations}
+
+The full-device solver uses the steady incompressible Stokes equations in the
+two-dimensional channel midplane:
+
+\[
+-\mu\nabla^2\mathbf{u} + \nabla p + \alpha(\mathbf{x})\mathbf{u} = 0,
+\qquad
+\nabla\cdot\mathbf{u}=0.
+\]
+
+Here \(\mathbf{u}=(u_x,u_y)\) is the in-plane velocity, \(p\) is pressure,
+\(\mu\) is dynamic viscosity, and \(\alpha(\mathbf{x})\) is an optional
+distributed branch-resistance field.  For the validated \(\alpha=0\) baseline,
+
+\[
+\alpha_L=\alpha_R=0,
+\]
+
+so the equation reduces to the ordinary Stokes problem.  The solved
+two-dimensional velocity is interpreted as a height-averaged background field
+for the \(100~\mu\mathrm{m}\)-high channel.
+
+\subsection{Boundary Conditions}
+
+For the \(\alpha=0\) full-device validation case, the boundary formulation is:
+
+\begin{itemize}
+  \item prescribed parabolic inlet velocity profile with the experimental total
+        flow rate;
+  \item no-slip velocity on all channel walls and on the central island;
+  \item natural traction condition at the downstream outlet;
+  \item one pressure gauge degree of freedom to remove the constant pressure
+        null mode;
+  \item no pressure Dirichlet condition on the inlet or outlet.
+\end{itemize}
+
+The imposed inlet flux per unit depth is computed from the experimental total
+volumetric flow rate \(Q\) and channel height \(H\):
+
+\[
+q_{\mathrm{in}} = \frac{Q}{H}.
+\]
+
+The mean inlet velocity follows from the channel width \(W\):
+
+\[
+U_{\mathrm{mean}} = \frac{q_{\mathrm{in}}}{W}.
+\]
+
+The prescribed planar Poiseuille profile is
+
+\[
+\mathbf{u}_{\mathrm{in}}(s)
+=
+\frac{3}{2}U_{\mathrm{mean}}
+\left[1-\left(\frac{2s}{W}\right)^2\right]\mathbf{t}_{\mathrm{in}},
+\qquad
+-\frac{W}{2}\le s\le \frac{W}{2},
+\]
+
+where \(s\) is the transverse coordinate and \(\mathbf{t}_{\mathrm{in}}\) is
+the inlet centerline tangent.
+
+\subsection{Finite-Element Discretization}
+
+The solver uses a Taylor--Hood mixed finite-element pair:
+
+\[
+\mathbf{u}_h \in [P_2]^2,
+\qquad
+p_h \in P_1.
+\]
+
+The weak form is assembled with scikit-fem.  Velocity Dirichlet conditions are
+applied using labeled boundary facets so that P2 edge-midpoint velocity degrees
+of freedom are retained and constrained correctly.  The linear saddle-point
+system is solved with the direct backend.  No pressure-mass stabilization,
+least-squares fallback, or artificial compressibility term is used.
+
+\subsection{Validated \(\alpha=0\) Solution}
+
+The first validated full-device solution is saved under:
+
+\begin{verbatim}
+outputs/physics/full_device_cfd/alpha0_equal_split_smoke/
+\end{verbatim}
+
+The historical frozen baseline snapshot is:
+
+\begin{verbatim}
+outputs/physics/full_device_cfd/baseline_alpha0_v1/
+\end{verbatim}
+
+The \(\alpha=0\) case does not produce a 50/50 split in the asymmetric loop,
+because the long and short branches have different hydraulic resistances.  The
+computed branch split is:
+
+\[
+f_L = \frac{Q_L}{Q_L+Q_R}=0.458119,
+\qquad
+f_R=0.541881.
+\]
+
+Representative scalar quantities for the \(24~\mu\mathrm{m}\) mesh are:
+
+\begin{center}
+\begin{tabular}{lr}
+\toprule
+Quantity & Value \\
+\midrule
+Solver backend & scikit-fem/direct \\
+Inlet flux & \(-5.4444\times10^{-6}~\mathrm{m^2/s}\) \\
+Outlet flux & \(5.4774\times10^{-6}~\mathrm{m^2/s}\) \\
+Left branch flux & \(2.4932\times10^{-6}~\mathrm{m^2/s}\) \\
+Right branch flux & \(2.9490\times10^{-6}~\mathrm{m^2/s}\) \\
+Maximum velocity & \(8.1675\times10^{-2}~\mathrm{m/s}\) \\
+Pressure range & \(166.436~\mathrm{Pa}\) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.84\linewidth,height=0.70\textheight,keepaspectratio]{../outputs/physics/full_device_cfd/alpha0_equal_split_smoke/diagnostics/speed_magnitude.png}
+  \caption{Velocity magnitude for the validated full-device \(\alpha=0\)
+  Stokes solution.}
+  \label{fig:full-device-speed}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.84\linewidth,height=0.70\textheight,keepaspectratio]{../outputs/physics/full_device_cfd/alpha0_equal_split_smoke/diagnostics/pressure.png}
+  \caption{Pressure field for the validated full-device \(\alpha=0\) Stokes
+  solution.}
+  \label{fig:full-device-pressure}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.84\linewidth,height=0.70\textheight,keepaspectratio]{../outputs/physics/full_device_cfd/alpha0_equal_split_smoke/diagnostics/full_device_streamlines_very_dense_postprocessed.png}
+  \caption{Dense post-processed streamlines sampled from the solved
+  full-device velocity field.  These streamlines are visualization samples of a
+  continuous FEM velocity field, not a limit on CFD resolution.}
+  \label{fig:full-device-streamlines}
+\end{figure}
+
+\subsection{Scalar Mesh Convergence}
+
+A scalar convergence study was run for target element sizes
+\(48,36,24,18,12~\mu\mathrm{m}\).  The \(12~\mu\mathrm{m}\) case was used as
+the fine reference.  The branch split and maximum velocity are already stable
+at \(24~\mu\mathrm{m}\), while the pressure range continues to move by less
+than \(0.5\%\) relative to the \(12~\mu\mathrm{m}\) reference.
+
+\begin{center}
+\begin{tabular}{rrrrrr}
+\toprule
+\(h\) (\(\mu\mathrm{m}\)) & Elements & \(f_L\) & \(|\Delta f_L|\) vs 12 & \(v_{\max}\) rel. error & Pressure range rel. error \\
+\midrule
+48 & 1040 & 0.458190 & \(3.36\times10^{-6}\) & \(4.32\times10^{-4}\) & \(1.50\times10^{-2}\) \\
+36 & 1768 & 0.456614 & \(1.58\times10^{-3}\) & \(1.26\times10^{-3}\) & \(1.28\times10^{-2}\) \\
+24 & 3807 & 0.458119 & \(7.41\times10^{-5}\) & \(8.59\times10^{-4}\) & \(4.87\times10^{-3}\) \\
+18 & 6508 & 0.458378 & \(1.85\times10^{-4}\) & \(5.82\times10^{-4}\) & \(2.34\times10^{-3}\) \\
+12 & 14154 & 0.458193 & reference & reference & reference \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.95\linewidth,height=0.55\textheight,keepaspectratio]{../outputs/physics/full_device_cfd/convergence_alpha0_fine/full_device_alpha0_convergence.png}
+  \caption{Scalar mesh convergence for the full-device \(\alpha=0\) Stokes
+  solution.}
+  \label{fig:full-device-scalar-convergence}
+\end{figure}
+
+\subsection{Field-Level Mesh Verification}
+
+The production decision was made using a field-level comparison between the
+\(24~\mu\mathrm{m}\) candidate and the \(12~\mu\mathrm{m}\) reference.  Both
+solutions were evaluated on the same Cartesian grid with
+\(6~\mu\mathrm{m}\) spacing.  Points outside the final fluid polygon and points
+inside the central island were masked.  Velocity components were interpolated
+from the FEM basis directly and compared in SI units.
+
+For each region, the vector-field error was computed as
+
+\[
+E_{\mathbf{u}}
+=
+\frac{\|\mathbf{u}_{24}-\mathbf{u}_{12}\|_2}
+     {\|\mathbf{u}_{12}\|_2}.
+\]
+
+Angular error was computed from
+
+\[
+\theta =
+\cos^{-1}
+\left[
+\mathrm{clip}
+\left(
+\frac{\mathbf{u}_{24}\cdot\mathbf{u}_{12}}
+     {|\mathbf{u}_{24}||\mathbf{u}_{12}|},
+-1,1
+\right)
+\right],
+\]
+
+excluding points with reference speed below \(1\%\) of the maximum reference
+speed.  Relative speed errors used the same \(1\%\) speed floor to avoid
+letting stagnation-point noise dominate the decision.
+
+\begin{center}
+\begin{tabular}{lrrrr}
+\toprule
+Region & \(E_{\mathbf{u}}\) & Median angle & 95th angle & Speed L2 error \\
+\midrule
+Full domain & 0.009808 & \(0.0055^\circ\) & \(0.336^\circ\) & 0.008221 \\
+Inlet split junction & 0.012043 & \(0.0089^\circ\) & \(0.829^\circ\) & 0.009419 \\
+Outlet merge junction & 0.011063 & \(0.0127^\circ\) & \(0.865^\circ\) & 0.008380 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The inlet separatrix was estimated by tracing the same inlet seed set in both
+fields.  The transition seed location differed by
+
+\[
+1.533~\mu\mathrm{m}
+= 1.53\%~\mathrm{of~the~channel~width}.
+\]
+
+All field-level acceptance criteria passed:
+
+\begin{itemize}
+  \item full-domain vector relative L2 error below \(2\%\);
+  \item inlet-junction vector relative L2 error below \(2\%\);
+  \item outlet-junction vector relative L2 error below \(2\%\);
+  \item median angular error below \(1^\circ\);
+  \item 95th-percentile angular error below \(3^\circ\);
+  \item separatrix-location difference below \(2\%\) of channel width.
+\end{itemize}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.48\linewidth,height=0.48\textheight,keepaspectratio]{../outputs/physics/full_device_cfd/convergence/field_comparison_24_vs_12/velocity_magnitude_24um.png}
+  \includegraphics[width=0.48\linewidth,height=0.48\textheight,keepaspectratio]{../outputs/physics/full_device_cfd/convergence/field_comparison_24_vs_12/velocity_magnitude_12um.png}
+  \caption{Velocity magnitude on the common grid for the \(24~\mu\mathrm{m}\)
+  candidate and \(12~\mu\mathrm{m}\) reference.  Both panels use identical
+  color limits.}
+  \label{fig:field-verification-magnitudes}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.48\linewidth,height=0.48\textheight,keepaspectratio]{../outputs/physics/full_device_cfd/convergence/field_comparison_24_vs_12/absolute_vector_error_24_vs_12.png}
+  \includegraphics[width=0.48\linewidth,height=0.48\textheight,keepaspectratio]{../outputs/physics/full_device_cfd/convergence/field_comparison_24_vs_12/angular_error_24_vs_12.png}
+  \caption{Absolute vector error and angular error between the \(24~\mu\mathrm{m}\)
+  and \(12~\mu\mathrm{m}\) full-device velocity fields.}
+  \label{fig:field-verification-errors}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.48\linewidth,height=0.48\textheight,keepaspectratio]{../outputs/physics/full_device_cfd/convergence/field_comparison_24_vs_12/inlet_junction_error_zoom.png}
+  \includegraphics[width=0.48\linewidth,height=0.48\textheight,keepaspectratio]{../outputs/physics/full_device_cfd/convergence/field_comparison_24_vs_12/outlet_junction_error_zoom.png}
+  \caption{Field-level error zooms at the full-device inlet split and outlet
+  merge. Both fields come from the complete loop geometry.}
+  \label{fig:field-verification-junction-zooms}
+\end{figure}
+
+\subsection{Flux Diagnostic}
+
+The scalar convergence study showed a non-monotone inlet--outlet flux mismatch.
+The flux audit confirmed that the current reported boundary fluxes are
+computed from boundary facets using the FEM P2 velocity field, not from a
+coarse plotted grid.  Each boundary facet is evaluated at its two endpoints and
+midpoint with Simpson weights.
+
+For the field-verification runs:
+
+\begin{center}
+\begin{tabular}{lrr}
+\toprule
+Case & Inlet/outlet mismatch & Relative mismatch \\
+\midrule
+\(24~\mu\mathrm{m}\) & \(3.298\times10^{-8}~\mathrm{m^2/s}\) & 0.00606 \\
+\(12~\mu\mathrm{m}\) & \(1.541\times10^{-8}~\mathrm{m^2/s}\) & 0.00283 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+This scalar mismatch is documented but is not used to reject the
+\(24~\mu\mathrm{m}\) production mesh, because the field-level errors, branch
+split, pressure range, and separatrix comparison all satisfy the production
+criteria.
+
+\subsection{Production Decision}
+
+The full-device production mesh is frozen at:
+
+\[
+\boxed{h_{\mathrm{target}}=24~\mu\mathrm{m}.}
+\]
+
+The final recommendation is to use the \(24~\mu\mathrm{m}\) mesh as the default
+full-device CFD mesh.  The \(12~\mu\mathrm{m}\) mesh remains the fine reference
+for verification, not the default production mesh.
+
+\subsection{Execution}
+
+Build the full-device CAD and production mesh:
+
+\begin{verbatim}
+.\.venv\Scripts\python.exe -m scripts.physics.build_full_device_mesh
+\end{verbatim}
+
+Run the scalar mesh convergence study:
+
+\begin{verbatim}
+$env:MPLCONFIGDIR='outputs\.matplotlib'
+.\.venv\Scripts\python.exe scripts\physics\run_full_device_convergence.py `
+  --target-sizes-um 48 36 24 18 12 `
+  --output-dir outputs\physics\full_device_cfd\convergence_alpha0_fine
+\end{verbatim}
+
+Run the final field-level verification:
+
+\begin{verbatim}
+$env:MPLCONFIGDIR='outputs\.matplotlib'
+.\.venv\Scripts\python.exe scripts\physics\verify_full_device_field_convergence.py `
+  --grid-spacing-um 6 `
+  --output-dir outputs\physics\full_device_cfd\convergence\field_comparison_24_vs_12
+\end{verbatim}
+
+The field-verification artifacts are saved in:
+
+\begin{verbatim}
+outputs/physics/full_device_cfd/convergence/field_comparison_24_vs_12/
+\end{verbatim}

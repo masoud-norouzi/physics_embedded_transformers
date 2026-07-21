@@ -11,7 +11,8 @@ The test suite covers:
   \item droplet ellipse rasterization and occupancy normalization;
   \item baseline branch-hydraulic equations and flow conservation;
   \item centered finite-difference velocity validation;
-  \item junction CFD geometry and mesh generation.
+  \item full-device CFD geometry, mesh generation, solver assembly, and
+        field-level mesh verification.
 \end{itemize}
 
 Run all tests with:
@@ -23,7 +24,7 @@ Run all tests with:
 The latest validation before this documentation update passed:
 
 \begin{verbatim}
-75 passed
+143 passed
 \end{verbatim}
 
 \subsection{Primary Commands}
@@ -65,11 +66,25 @@ The latest validation before this documentation update passed:
   --overwrite
 \end{verbatim}
 
-  \item Build junction CFD mesh:
+  \item Build full-device CFD mesh:
 \begin{verbatim}
-.\.venv\Scripts\python.exe -m scripts.physics.build_junction_mesh \
-  --config configs\physics\junction_cfd.yml \
-  --overwrite
+.\.venv\Scripts\python.exe -m scripts.physics.build_full_device_mesh
+\end{verbatim}
+
+  \item Run full-device scalar mesh convergence:
+\begin{verbatim}
+$env:MPLCONFIGDIR='outputs\.matplotlib'
+.\.venv\Scripts\python.exe scripts\physics\run_full_device_convergence.py `
+  --target-sizes-um 48 36 24 18 12 `
+  --output-dir outputs\physics\full_device_cfd\convergence_alpha0_fine
+\end{verbatim}
+
+  \item Verify the frozen \(24~\mu\mathrm{m}\) full-device field:
+\begin{verbatim}
+$env:MPLCONFIGDIR='outputs\.matplotlib'
+.\.venv\Scripts\python.exe scripts\physics\verify_full_device_field_convergence.py `
+  --grid-spacing-um 6 `
+  --output-dir outputs\physics\full_device_cfd\convergence\field_comparison_24_vs_12
 \end{verbatim}
 \end{enumerate}
 
@@ -78,10 +93,6 @@ The latest validation before this documentation update passed:
 The project currently does not implement:
 
 \begin{itemize}
-  \item CFD solving;
-  \item pressure fields;
-  \item streamline extraction;
-  \item velocity-field lookup or interpolation;
   \item transformer training;
   \item hydraulic parameter fitting;
   \item droplet slip modeling;
