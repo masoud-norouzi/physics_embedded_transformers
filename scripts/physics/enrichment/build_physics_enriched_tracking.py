@@ -26,7 +26,8 @@ def main() -> None:
     print(f"  output: {summary.output_path}")
     print(f"  rows: {summary.row_count}")
     print(f"  columns: {summary.column_count}")
-    print(f"  inside CFD domain: {summary.inside_cfd_domain_rows} ({summary.inside_cfd_domain_fraction:.2%})")
+    print(f"  valid CFD rows: {summary.inside_cfd_domain_rows} ({summary.inside_cfd_domain_fraction:.2%})")
+    print(f"  invalid CFD rows: {summary.row_count - summary.inside_cfd_domain_rows}")
     print(f"  direction comparisons: {summary.flow_direction_alignment['valid_comparison_count']}")
 
 

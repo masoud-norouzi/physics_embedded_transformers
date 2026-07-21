@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate the production full-device CFD library indexed by achieved split.")
     parser.add_argument("--config", type=Path, default=Path("configs/physics/full_device_cfd.yml"))
     parser.add_argument("--calibration-cache-dir", type=Path, default=Path("outputs/physics/full_device_cfd/alpha_calibration"))
-    parser.add_argument("--output-dir", type=Path, default=Path("outputs/physics/full_device_cfd/production_split_library"))
+    parser.add_argument("--output-dir", type=Path, default=Path("outputs/physics/full_device_cfd/library"))
     parser.add_argument("--targets", type=float, nargs="+", default=DEFAULT_TARGETS)
     return parser.parse_args()
 

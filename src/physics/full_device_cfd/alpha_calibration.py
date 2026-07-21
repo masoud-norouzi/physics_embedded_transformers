@@ -22,7 +22,7 @@ from .solver import save_full_device_solution, solve_full_device_stokes
 
 
 DEFAULT_OUTPUT = Path("outputs/physics/full_device_cfd/alpha_calibration")
-DEFAULT_PRODUCTION_LIBRARY_OUTPUT = Path("outputs/physics/full_device_cfd/production_split_library")
+DEFAULT_PRODUCTION_LIBRARY_OUTPUT = Path("outputs/physics/full_device_cfd/library")
 DEFAULT_CONFIG = Path("configs/physics/full_device_cfd.yml")
 DEFAULT_HYDRAULIC_STATE = Path("outputs/physics/video_2/baseline_hydraulic_state.csv")
 DEFAULT_ALPHA0_SOLUTION = Path("outputs/physics/full_device_cfd/alpha0_equal_split_smoke/stokes_solution.npz")
@@ -447,7 +447,8 @@ def run_production_split_library(
             case_prefix="production",
         )
         if row.get("status") == "success":
-            row["solution_path"] = str((cache_dir / "cases" / row["case_id"]).resolve())
+            library_case_id = f"production_fL_{_token(float(target))}"
+            row["solution_path"] = str(_stage_production_case(cache_dir / "cases" / row["case_id"], output / "cases" / library_case_id).resolve())
         row["new_cfd_solves_total_for_target"] = evaluator.new_solves - before_solves
         row["cache_hits_total_for_target"] = evaluator.cache_hits - before_hits
         rows.append(row)
@@ -477,6 +478,29 @@ def run_production_split_library(
     }
     (output / "production_split_library_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return summary
+
+
+def _stage_production_case(source: Path, destination: Path) -> Path:
+    if destination.exists() and not source.exists():
+        metadata_path = destination / "metadata.json"
+        if metadata_path.exists():
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata["case_id"] = destination.name
+            metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        return destination
+    if not source.exists():
+        raise FileNotFoundError(f"Calibrated full-field case does not exist: {source}")
+    if source.resolve() == destination.resolve():
+        return destination
+    if destination.exists():
+        shutil.rmtree(destination)
+    shutil.copytree(source, destination)
+    metadata_path = destination / "metadata.json"
+    if metadata_path.exists():
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata["case_id"] = destination.name
+        metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    return destination
 
 
 def production_manifest_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

@@ -1,1 +1,1 @@
-"""Dataset package placeholder."""
+"""Dataset builders and dataset-loading utilities."""

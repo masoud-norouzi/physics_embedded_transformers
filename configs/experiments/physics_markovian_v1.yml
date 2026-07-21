@@ -1,0 +1,62 @@
+experiment:
+  id: physics_markovian_v1
+  description: Physics-enabled Markovian rollout Transformer using canonical_dataset_v2
+
+dataset:
+  path: outputs/processed/2/canonical_dataset_v2/canonical_dataset_v2.npz
+  stride: 5
+
+model:
+  type: markovian
+  input_dim: 15
+  target_features:
+    - vx
+    - vy
+  input_feature_names:
+    - x
+    - y
+    - vx
+    - vy
+    - circularity
+    - cfd_u
+    - cfd_v
+    - left_flow_fraction
+    - occupancy_inlet_channel
+    - occupancy_inlet_junction
+    - occupancy_left_branch
+    - occupancy_right_branch
+    - occupancy_outlet_junction
+    - occupancy_outlet_channel
+    - cfd_valid
+  T_history: 1
+  rollout_horizon: 50
+  max_droplets: 64
+  architecture:
+    d_model: 128
+    n_heads: 4
+    num_layers: 4
+    dim_feedforward: 512
+    dropout: 0.1
+
+training:
+  batch_size: 4
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  epochs: 50
+  random_seed: 123
+  num_workers: 0
+  loss_alpha: 2.0
+  log_every_n_batches: 25
+  output_dir: outputs/models/physics_markovian_v1
+
+device:
+  mode: auto
+
+smoke_test:
+  train_windows: 8
+  val_windows: 4
+  batch_size: 2
+  epochs: 1
+  optimization_steps: 2
+  rollout_horizon: 3

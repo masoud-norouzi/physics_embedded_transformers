@@ -4,8 +4,9 @@ import numpy as np
 from skfem import Basis, ElementTriP2, ElementVector, MeshTri
 
 from src.physics.cfd.domain import inside_junction_domain
-from src.physics.geometry.coordinates import CoordinateConvention
 from src.physics.cfd.solver import UM_TO_M
+from src.physics.full_device_cfd.domain import inside_full_device_domain
+from src.physics.geometry.coordinates import CoordinateConvention
 
 from .types import InterpolatedVelocityField, SampledVelocityField
 
@@ -16,10 +17,12 @@ ZERO_SPEED_DIRECTION_THRESHOLD_M_PER_S = 1.0e-14
 def sample_velocity_field_cfd(field: InterpolatedVelocityField, points_cfd_um: np.ndarray) -> SampledVelocityField:
     """Sample an interpolated P2 velocity field in the frozen CFD native frame."""
     points = np.asarray(points_cfd_um, dtype=float)
+    if points.ndim == 1 and points.shape == (2,):
+        points = points.reshape(1, 2)
     if points.ndim != 2 or points.shape[1] != 2:
         raise ValueError(f"points_um must have shape (N, 2), got {points.shape}")
 
-    inside = inside_junction_domain(points, field.mesh.geometry, tolerance_um=0.0)
+    inside = _inside_fluid_domain(points, field.mesh.geometry)
     velocity = np.full((len(points), 2), np.nan, dtype=float)
     if np.any(inside):
         basis = velocity_basis(field.nodes_um, field.elements)
@@ -56,6 +59,8 @@ def sample_velocity_field_device(
 ) -> SampledVelocityField:
     """Sample at device-Cartesian points and return device-Cartesian vectors."""
     points_device = np.asarray(points_device_um, dtype=float)
+    if points_device.ndim == 1 and points_device.shape == (2,):
+        points_device = points_device.reshape(1, 2)
     points_cfd = convention.device_points_to_cfd(points_device)
     sampled_cfd = sample_velocity_field_cfd(field, points_cfd)
     velocity_cfd = np.column_stack([sampled_cfd.u_x_m_per_s, sampled_cfd.u_y_m_per_s])
@@ -86,6 +91,12 @@ def sample_velocity_field_device(
 
 
 sample_velocity_field = sample_velocity_field_cfd
+
+
+def _inside_fluid_domain(points_um: np.ndarray, geometry) -> np.ndarray:
+    if hasattr(geometry, "outer_ring_um") and hasattr(geometry, "inner_ring_um"):
+        return inside_full_device_domain(points_um, geometry, tolerance_um=0.0)
+    return inside_junction_domain(points_um, geometry, tolerance_um=0.0)
 
 
 def velocity_basis(nodes_um: np.ndarray, elements: np.ndarray) -> Basis:

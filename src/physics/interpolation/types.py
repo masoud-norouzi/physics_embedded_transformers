@@ -6,8 +6,6 @@ from typing import Any
 
 import numpy as np
 
-from src.physics.cfd.mesh import TriangularMesh
-
 
 @dataclass(frozen=True)
 class VelocityFieldCase:
@@ -22,7 +20,7 @@ class VelocityFieldCase:
     velocity_node_m_per_s: np.ndarray
     nodes_um: np.ndarray
     elements: np.ndarray
-    mesh: TriangularMesh
+    mesh: Any
     metadata: dict[str, Any]
     flux_report: dict[str, Any]
     cfd_version: str
@@ -44,6 +42,30 @@ class SampledVelocityField:
     units: dict[str, str]
     coordinate_frame: str
 
+    @property
+    def cfd_u(self) -> np.ndarray:
+        return self.u_x_m_per_s
+
+    @property
+    def cfd_v(self) -> np.ndarray:
+        return self.u_y_m_per_s
+
+    @property
+    def cfd_speed(self) -> np.ndarray:
+        return self.speed_m_per_s
+
+    @property
+    def cfd_dir_x(self) -> np.ndarray:
+        return self.direction_x
+
+    @property
+    def cfd_dir_y(self) -> np.ndarray:
+        return self.direction_y
+
+    @property
+    def cfd_valid(self) -> np.ndarray:
+        return self.inside_domain
+
 
 @dataclass(frozen=True)
 class InterpolatedVelocityField:
@@ -59,7 +81,7 @@ class InterpolatedVelocityField:
     velocity_node_m_per_s: np.ndarray
     nodes_um: np.ndarray
     elements: np.ndarray
-    mesh: TriangularMesh
+    mesh: Any
     velocity_basis_metadata: dict[str, Any]
     units: dict[str, str]
     cfd_version: str

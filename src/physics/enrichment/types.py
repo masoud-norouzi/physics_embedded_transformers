@@ -15,7 +15,7 @@ class EnrichmentConfig:
     experiment_config_path: Path = Path("configs/experiments/video_2.yml")
     tracking_path: Path = Path("data/processed/2/tracked_features.csv")
     hydraulic_state_path: Path = Path("outputs/physics/video_2/baseline_hydraulic_state.csv")
-    cfd_library_path: Path = Path("outputs/physics/junction_cfd/solutions")
+    cfd_library_path: Path = Path("outputs/physics/full_device_cfd/library")
     occupancy_path: Path = Path("outputs/physics/video_2/droplet_occupancy.csv")
     output_root: Path = Path("outputs/physics/video_2/enrichment")
 

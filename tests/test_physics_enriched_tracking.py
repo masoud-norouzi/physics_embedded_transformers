@@ -62,13 +62,13 @@ def test_vectorized_framewise_cfd_sampling_and_nan_semantics(monkeypatch: pytest
             "right_flow_fraction": [0.75, 0.75, 0.25],
         }
     )
-    monkeypatch.setattr("src.physics.enrichment.tracking_enricher.inside_junction_domain", lambda points, geometry, tolerance_um=0.0: points[:, 0] >= 0)
-
     sampled = _sample_cfd_background(table, library)
 
     assert sampled["inside_cfd_domain"].tolist() == [True, False, True]
+    assert sampled["cfd_valid"].tolist() == [True, False, True]
+    assert np.isfinite(sampled.loc[[0, 2], "cfd_speed"]).all()
     assert np.isfinite(sampled.loc[[0, 2], "background_speed_m_per_s"]).all()
-    assert sampled.loc[1, ["background_u_x_device_m_per_s", "background_u_y_device_m_per_s", "background_speed_m_per_s"]].isna().all()
+    assert sampled.loc[1, ["cfd_u", "cfd_v", "cfd_speed", "background_u_x_device_m_per_s", "background_u_y_device_m_per_s", "background_speed_m_per_s"]].isna().all()
     assert np.allclose(
         sampled.loc[[0, 2], "background_speed_m_per_s"],
         np.sqrt(sampled.loc[[0, 2], "background_u_x_device_m_per_s"] ** 2 + sampled.loc[[0, 2], "background_u_y_device_m_per_s"] ** 2),
@@ -123,7 +123,6 @@ def test_build_enriched_tracking_preserves_inputs_and_is_deterministic(tmp_path:
     monkeypatch.setattr(loader, "load_experiment_config", fake_load_experiment_config)
     monkeypatch.setattr(coordinate_mapping, "load_experiment_config", fake_load_experiment_config)
     monkeypatch.setattr("src.physics.enrichment.tracking_enricher.VelocityFieldLibrary", SimpleNamespace(from_directory=lambda path: _FakeLibrary()))
-    monkeypatch.setattr("src.physics.enrichment.tracking_enricher.inside_junction_domain", lambda points, geometry, tolerance_um=0.0: points[:, 0] >= 0)
 
     config = EnrichmentConfig(
         experiment_id="video_2",
@@ -145,6 +144,7 @@ def test_build_enriched_tracking_preserves_inputs_and_is_deterministic(tmp_path:
     assert first_summary.row_count == second_summary.row_count == 3
     assert first_summary.column_count == second_summary.column_count
     assert not first[["frame", "track_id"]].duplicated().any()
+    assert first["cfd_valid"].equals(first["inside_cfd_domain"])
     assert first.loc[~first["inside_cfd_domain"], "background_speed_m_per_s"].isna().all()
 
 
@@ -167,6 +167,32 @@ class _FakeSample:
         self.u_x_m_per_s = np.where(self.inside_domain, alpha + points[:, 0] * 0.01, np.nan)
         self.u_y_m_per_s = np.where(self.inside_domain, 1.0 - alpha, np.nan)
         self.speed_m_per_s = np.sqrt(self.u_x_m_per_s**2 + self.u_y_m_per_s**2)
+        self.direction_x = self.u_x_m_per_s / self.speed_m_per_s
+        self.direction_y = self.u_y_m_per_s / self.speed_m_per_s
+
+    @property
+    def cfd_u(self) -> np.ndarray:
+        return self.u_x_m_per_s
+
+    @property
+    def cfd_v(self) -> np.ndarray:
+        return self.u_y_m_per_s
+
+    @property
+    def cfd_speed(self) -> np.ndarray:
+        return self.speed_m_per_s
+
+    @property
+    def cfd_dir_x(self) -> np.ndarray:
+        return self.direction_x
+
+    @property
+    def cfd_dir_y(self) -> np.ndarray:
+        return self.direction_y
+
+    @property
+    def cfd_valid(self) -> np.ndarray:
+        return self.inside_domain
 
 
 class _FakeField:

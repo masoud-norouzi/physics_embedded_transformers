@@ -61,7 +61,30 @@ def validate_row_preservation(original: pd.DataFrame, enriched: pd.DataFrame) ->
 
 
 def validate_sampled_fields(enriched: pd.DataFrame, alpha_tolerance: float = 1.0e-12) -> None:
+    if "cfd_valid" in enriched.columns and not enriched["cfd_valid"].equals(enriched["inside_cfd_domain"]):
+        raise ValueError("cfd_valid and inside_cfd_domain must match")
     inside = enriched["inside_cfd_domain"].to_numpy(bool)
+    cfd_cols = ["cfd_u", "cfd_v", "cfd_speed", "cfd_dir_x", "cfd_dir_y"]
+    if all(column in enriched.columns for column in cfd_cols):
+        cfd_inside = enriched.loc[inside, cfd_cols[:3]].to_numpy(float)
+        if len(cfd_inside) and not np.isfinite(cfd_inside).all():
+            raise ValueError("Valid CFD rows must have finite cfd_u, cfd_v, and cfd_speed")
+        cfd_outside = enriched.loc[~inside, cfd_cols].to_numpy(float)
+        if len(cfd_outside) and not np.isnan(cfd_outside).all():
+            raise ValueError("Invalid CFD rows must have NaN CFD values")
+        speed = enriched["cfd_speed"].to_numpy(float)
+        ux = enriched["cfd_u"].to_numpy(float)
+        uy = enriched["cfd_v"].to_numpy(float)
+        if np.any(inside):
+            expected = np.sqrt(ux[inside] ** 2 + uy[inside] ** 2)
+            if not np.allclose(speed[inside], expected, rtol=1.0e-12, atol=1.0e-14):
+                raise ValueError("cfd_speed does not match cfd_u/cfd_v")
+            nonzero = speed[inside] > 1.0e-14
+            dirs = enriched.loc[inside, ["cfd_dir_x", "cfd_dir_y"]].to_numpy(float)
+            if np.any(nonzero):
+                norms = np.linalg.norm(dirs[nonzero], axis=1)
+                if not np.allclose(norms, 1.0, atol=1.0e-10, rtol=0.0):
+                    raise ValueError("CFD direction vectors are not normalized")
     velocity_cols = [
         "background_u_x_device_m_per_s",
         "background_u_y_device_m_per_s",

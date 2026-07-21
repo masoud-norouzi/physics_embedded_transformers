@@ -15,7 +15,6 @@ import matplotlib.tri as mtri
 import numpy as np
 import pandas as pd
 
-from src.physics.cfd.domain import inside_junction_domain
 from src.physics.interpolation import VelocityFieldLibrary
 
 from .coordinate_mapping import build_coordinate_transform, map_tracking_coordinates, transform_metadata
@@ -81,6 +80,11 @@ def build_physics_enriched_tracking(config: EnrichmentConfig, overwrite: bool = 
     missing_counts = {
         column: int(enriched[column].isna().sum())
         for column in [
+            "cfd_u",
+            "cfd_v",
+            "cfd_speed",
+            "cfd_dir_x",
+            "cfd_dir_y",
             "background_u_x_device_m_per_s",
             "background_u_y_device_m_per_s",
             "background_speed_m_per_s",
@@ -158,10 +162,14 @@ def _order_columns(original_columns: list[str], table: pd.DataFrame) -> pd.DataF
 
 
 def _sample_cfd_background(enriched: pd.DataFrame, library: VelocityFieldLibrary, convention=None) -> pd.DataFrame:
-    points = enriched[["x_cfd_um", "y_cfd_um"]].to_numpy(float)
-    geometric_inside = inside_junction_domain(points, library.cases[0].mesh.geometry, tolerance_um=0.0)
+    points = _sampling_points(enriched, library)
     output = pd.DataFrame(index=enriched.index)
     for column in [
+        "cfd_u",
+        "cfd_v",
+        "cfd_speed",
+        "cfd_dir_x",
+        "cfd_dir_y",
         "background_u_x_device_m_per_s",
         "background_u_y_device_m_per_s",
         "background_speed_m_per_s",
@@ -169,6 +177,7 @@ def _sample_cfd_background(enriched: pd.DataFrame, library: VelocityFieldLibrary
         "background_direction_y",
     ]:
         output[column] = np.nan
+    output["cfd_valid"] = False
     output["inside_cfd_domain"] = False
     output["cfd_left_fraction"] = enriched["left_flow_fraction"].to_numpy(float)
     output["cfd_right_fraction"] = enriched["right_flow_fraction"].to_numpy(float)
@@ -180,46 +189,63 @@ def _sample_cfd_background(enriched: pd.DataFrame, library: VelocityFieldLibrary
     output["physics_enrichment_version"] = ENRICHMENT_VERSION
     output["coordinate_transform_version"] = COORDINATE_TRANSFORM_VERSION
 
-    inside_indices = np.flatnonzero(geometric_inside)
-    if len(inside_indices) == 0:
-        return output
-
-    inside_points = points[inside_indices]
     sampled_cases = {}
-    finite_any = np.zeros(len(inside_indices), dtype=bool)
+    valid_cases = {}
     for case in library.cases:
-        samples = library.interpolate(case.left_fraction).sample_cfd(inside_points)
-        uv = np.column_stack([samples.u_x_m_per_s, samples.u_y_m_per_s])
+        samples = library.interpolate(case.left_fraction).sample_cfd(points)
+        uv = np.column_stack([samples.cfd_u, samples.cfd_v])
         sampled_cases[case.left_fraction] = uv
-        finite_any |= samples.inside_domain & np.isfinite(uv).all(axis=1)
+        valid_cases[case.left_fraction] = samples.cfd_valid & np.isfinite(uv).all(axis=1)
 
-    row_low = alpha_low[inside_indices]
-    row_high = alpha_high[inside_indices]
-    row_weight = weight[inside_indices]
-    velocities = np.full((len(inside_indices), 2), np.nan, dtype=float)
-    for low in np.unique(row_low):
+    velocities = np.full((len(enriched), 2), np.nan, dtype=float)
+    valid = np.zeros(len(enriched), dtype=bool)
+    for low in np.unique(alpha_low):
         low = float(low)
-        mask_low = np.isclose(row_low, low, atol=1.0e-12, rtol=0.0)
-        for high in np.unique(row_high[mask_low]):
+        mask_low = np.isclose(alpha_low, low, atol=1.0e-12, rtol=0.0)
+        for high in np.unique(alpha_high[mask_low]):
             high = float(high)
-            mask = mask_low & np.isclose(row_high, high, atol=1.0e-12, rtol=0.0)
-            w = row_weight[mask]
+            mask = mask_low & np.isclose(alpha_high, high, atol=1.0e-12, rtol=0.0)
+            w = weight[mask]
             velocities[mask] = (1.0 - w[:, None]) * sampled_cases[low][mask] + w[:, None] * sampled_cases[high][mask]
+            valid[mask] = valid_cases[low][mask] & valid_cases[high][mask] & np.isfinite(velocities[mask]).all(axis=1)
 
-    finite = finite_any & np.isfinite(velocities).all(axis=1)
-    final_inside_indices = inside_indices[finite]
-    output.loc[final_inside_indices, "inside_cfd_domain"] = True
-    velocities_out = convention.cfd_vectors_to_device(velocities[finite]) if convention is not None else velocities[finite]
-    output.loc[final_inside_indices, "background_u_x_device_m_per_s"] = velocities_out[:, 0]
-    output.loc[final_inside_indices, "background_u_y_device_m_per_s"] = velocities_out[:, 1]
+    output.loc[valid, "cfd_valid"] = True
+    output.loc[valid, "inside_cfd_domain"] = True
+    output.loc[valid, "cfd_u"] = velocities[valid, 0]
+    output.loc[valid, "cfd_v"] = velocities[valid, 1]
+    cfd_speed = np.linalg.norm(velocities[valid], axis=1)
+    output.loc[valid, "cfd_speed"] = cfd_speed
+    cfd_dirs = np.full((len(cfd_speed), 2), np.nan, dtype=float)
+    cfd_nonzero = cfd_speed > 1.0e-14
+    cfd_dirs[cfd_nonzero] = velocities[valid][cfd_nonzero] / cfd_speed[cfd_nonzero, None]
+    output.loc[valid, "cfd_dir_x"] = cfd_dirs[:, 0]
+    output.loc[valid, "cfd_dir_y"] = cfd_dirs[:, 1]
+
+    velocities_out = _vectors_to_device_if_needed(velocities[valid], library, convention)
+    output.loc[valid, "background_u_x_device_m_per_s"] = velocities_out[:, 0]
+    output.loc[valid, "background_u_y_device_m_per_s"] = velocities_out[:, 1]
     speed = np.linalg.norm(velocities_out, axis=1)
-    output.loc[final_inside_indices, "background_speed_m_per_s"] = speed
+    output.loc[valid, "background_speed_m_per_s"] = speed
     nonzero = speed > 1.0e-14
     dirs = np.full((len(speed), 2), np.nan, dtype=float)
     dirs[nonzero] = velocities_out[nonzero] / speed[nonzero, None]
-    output.loc[final_inside_indices, "background_direction_x"] = dirs[:, 0]
-    output.loc[final_inside_indices, "background_direction_y"] = dirs[:, 1]
+    output.loc[valid, "background_direction_x"] = dirs[:, 0]
+    output.loc[valid, "background_direction_y"] = dirs[:, 1]
     return output
+
+
+def _sampling_points(enriched: pd.DataFrame, library: VelocityFieldLibrary) -> np.ndarray:
+    geometry = library.cases[0].mesh.geometry
+    if hasattr(geometry, "coordinate_frame") and geometry.coordinate_frame == "device_cartesian_y_up":
+        return enriched[["x_device_um", "y_device_um"]].to_numpy(float)
+    return enriched[["x_cfd_um", "y_cfd_um"]].to_numpy(float)
+
+
+def _vectors_to_device_if_needed(velocities: np.ndarray, library: VelocityFieldLibrary, convention) -> np.ndarray:
+    geometry = library.cases[0].mesh.geometry
+    if hasattr(geometry, "coordinate_frame") and geometry.coordinate_frame == "device_cartesian_y_up":
+        return velocities
+    return convention.cfd_vectors_to_device(velocities) if convention is not None else velocities
 
 
 def _neighbor_provenance(fractions: tuple[float, ...], alpha: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -321,31 +347,33 @@ def _save_diagnostics(enriched: pd.DataFrame, library: VelocityFieldLibrary, dia
 
 
 def _save_overlay(enriched: pd.DataFrame, library: VelocityFieldLibrary, path: Path) -> None:
-    counts = enriched.groupby("frame")["inside_cfd_domain"].sum()
-    frame = int(counts.idxmax())
-    subset = enriched[enriched["frame"] == frame]
+    subset = enriched
     inside = subset["inside_cfd_domain"].to_numpy(bool)
+    points = _sampling_points(subset, library)
     mesh = library.cases[0].mesh
     tri = mtri.Triangulation(mesh.nodes_um[:, 0], mesh.nodes_um[:, 1], mesh.elements)
     fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
     ax.triplot(tri, color="#94a3b8", linewidth=0.35, alpha=0.7)
-    ax.scatter(subset.loc[~inside, "x_cfd_um"], subset.loc[~inside, "y_cfd_um"], s=12, color="#9ca3af", label="outside CFD")
-    ax.scatter(subset.loc[inside, "x_cfd_um"], subset.loc[inside, "y_cfd_um"], s=22, color="#ef4444", label="inside CFD")
+    ax.scatter(points[~inside, 0], points[~inside, 1], s=4, color="#9ca3af", alpha=0.35, label="invalid CFD")
+    ax.scatter(points[inside, 0], points[inside, 1], s=5, color="#ef4444", alpha=0.45, label="valid CFD")
     if inside.any():
+        valid_positions = np.flatnonzero(inside)
+        stride = max(1, len(valid_positions) // 1200)
+        draw = valid_positions[::stride]
         ax.quiver(
-            subset.loc[inside, "x_cfd_um"],
-            subset.loc[inside, "y_cfd_um"],
-            subset.loc[inside, "background_u_x_device_m_per_s"],
-            -subset.loc[inside, "background_u_y_device_m_per_s"],
+            points[draw, 0],
+            points[draw, 1],
+            subset.iloc[draw]["cfd_u"],
+            subset.iloc[draw]["cfd_v"],
             color="#0f766e",
             scale=0.8,
-            width=0.004,
+            width=0.002,
+            alpha=0.65,
         )
-    ax.set_title(f"Tracked droplets over CFD junction domain, frame {frame}")
+    ax.set_title("Sampled full-device CFD vectors on tracked droplet centroids")
     ax.set_xlabel("x (um)")
     ax.set_ylabel("y (um)")
     ax.set_aspect("equal")
-    ax.invert_yaxis()
     ax.legend(loc="best")
     fig.savefig(path, dpi=180)
     plt.close(fig)
@@ -357,7 +385,7 @@ def _save_inside_by_frame(enriched: pd.DataFrame, path: Path) -> None:
     ax.plot(counts.index, counts["sum"], linewidth=1.0)
     ax.set_xlabel("frame")
     ax.set_ylabel("droplets inside CFD domain")
-    ax.set_title("CFD junction coverage over time")
+    ax.set_title("Full-device CFD coverage over time")
     ax.grid(True, alpha=0.3)
     fig.savefig(path, dpi=180)
     plt.close(fig)
@@ -412,7 +440,8 @@ def _markdown_summary(summary: dict[str, Any]) -> str:
         f"- Output: `{summary['output_path']}`",
         f"- Rows: {summary['row_count']}",
         f"- Columns: {summary['column_count']}",
-        f"- Inside CFD domain: {summary['inside_cfd_domain_rows']} ({summary['inside_cfd_domain_fraction']:.2%})",
+        f"- Valid CFD rows: {summary['inside_cfd_domain_rows']} ({summary['inside_cfd_domain_fraction']:.2%})",
+        f"- Invalid CFD rows: {summary['row_count'] - summary['inside_cfd_domain_rows']}",
         f"- Unique tracks entering CFD domain: {summary['unique_tracks_inside_cfd_domain']}",
         "",
         "## Coordinate Transform",
