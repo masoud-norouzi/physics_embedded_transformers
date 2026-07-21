@@ -664,6 +664,32 @@ def _plot_alpha_curve(rows: list[dict[str, Any]], path: Path, *, logx: bool) -> 
     plt.close(fig)
 
 
+def _plot_requested_vs_achieved(rows: list[dict[str, Any]], path: Path) -> None:
+    successful = [row for row in rows if row.get("status") == "success"]
+    if not successful:
+        return
+
+    requested = np.asarray([row["requested_left_fraction"] for row in successful], dtype=float)
+    achieved = np.asarray([row["achieved_left_fraction_cfd"] for row in successful], dtype=float)
+    lo = float(min(requested.min(), achieved.min()))
+    hi = float(max(requested.max(), achieved.max()))
+    pad = max(0.005, 0.04 * (hi - lo))
+
+    fig, ax = plt.subplots(figsize=(5.5, 5.0))
+    ax.plot(requested, achieved, marker="o", color="#2563eb", linewidth=1.5, label="CFD calibrated")
+    ax.plot([lo - pad, hi + pad], [lo - pad, hi + pad], linestyle="--", color="0.35", linewidth=1.0, label="ideal")
+    ax.set_xlabel("requested left-flow fraction")
+    ax.set_ylabel("achieved CFD left-flow fraction")
+    ax.set_title("Production split-library calibration")
+    ax.set_xlim(lo - pad, hi + pad)
+    ax.set_ylim(lo - pad, hi + pad)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
 def _save_streamline_figure(solution, path: Path) -> None:
     from matplotlib.tri import Triangulation, LinearTriInterpolator
 
