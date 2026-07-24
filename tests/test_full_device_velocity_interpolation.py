@@ -100,20 +100,103 @@ def test_full_device_sampling_exposes_dimensionless_normalized_cfd_components(fu
     )
 
 
-def test_full_device_outside_domain_returns_nan_without_extrapolation(full_device_library: VelocityFieldLibrary) -> None:
+def test_full_device_inside_point_is_not_projected(full_device_library: VelocityFieldLibrary) -> None:
+    geometry = build_full_device_cfd_geometry()
+    point = geometry.centerlines["left"].points_um[len(geometry.centerlines["left"].points_um) // 2]
     field = full_device_library.interpolate(0.5000000004936045)
-    outside = np.array([[0.0, 0.0]])
+    samples = field.sample_cfd(point)
+
+    assert samples.original_valid.tolist() == [True]
+    assert samples.cfd_valid.tolist() == [True]
+    assert np.allclose(samples.sample_points_um, point.reshape(1, 2))
+    assert samples.sample_x[0] == pytest.approx(point[0])
+    assert samples.sample_y[0] == pytest.approx(point[1])
+    assert samples.projection_distance[0] == pytest.approx(0.0)
+    assert np.isfinite(samples.cfd_u[0])
+    assert np.isfinite(samples.cfd_v[0])
+
+
+def test_full_device_outside_wall_projects_to_valid_sampling_point(full_device_library: VelocityFieldLibrary) -> None:
+    geometry = build_full_device_cfd_geometry()
+    line = geometry.centerlines["left"]
+    index = len(line.points_um) // 2
+    point = line.points_um[index] + line.normals[index] * 85.0
+    field = full_device_library.interpolate(0.5000000004936045)
+    samples = field.sample_cfd(point)
+
+    assert samples.original_valid.tolist() == [False]
+    assert samples.cfd_valid.tolist() == [True]
+    assert samples.projection_distance[0] > 0.0
+    assert np.isfinite(samples.cfd_u[0])
+    assert np.isfinite(samples.cfd_v[0])
+    assert np.isfinite(samples.cfd_speed[0])
+    assert field.sample_cfd(samples.sample_points_um).original_valid.tolist() == [True]
+
+
+def test_full_device_truncated_outlet_query_projects_without_nans(full_device_library: VelocityFieldLibrary) -> None:
+    field = full_device_library.interpolate(0.5000000004936045)
+    outside = np.array([[1318.0, 0.0]])
     samples = field.sample_cfd(outside)
 
-    assert samples.cfd_valid.tolist() == [False]
-    assert np.isnan(samples.cfd_u[0])
-    assert np.isnan(samples.cfd_v[0])
-    assert np.isnan(samples.cfd_speed[0])
-    assert np.isnan(samples.cfd_u_norm[0])
-    assert np.isnan(samples.cfd_v_norm[0])
-    assert np.isnan(samples.cfd_speed_norm[0])
-    assert np.isnan(samples.cfd_dir_x[0])
-    assert np.isnan(samples.cfd_dir_y[0])
+    assert samples.original_valid.tolist() == [False]
+    assert samples.cfd_valid.tolist() == [True]
+    assert samples.projection_distance[0] > 0.0
+    assert np.isfinite(samples.cfd_u[0])
+    assert np.isfinite(samples.cfd_v[0])
+    assert np.isfinite(samples.cfd_speed[0])
+    assert np.isfinite(samples.cfd_u_norm[0])
+    assert np.isfinite(samples.cfd_v_norm[0])
+    assert np.isfinite(samples.cfd_speed_norm[0])
+    assert field.sample_cfd(samples.sample_points_um).original_valid.tolist() == [True]
+
+
+def test_full_device_batched_projection_preserves_order(full_device_library: VelocityFieldLibrary) -> None:
+    geometry = build_full_device_cfd_geometry()
+    valid_point = geometry.centerlines["right"].points_um[len(geometry.centerlines["right"].points_um) // 2]
+    outside_wall = valid_point + np.array([95.0, 0.0])
+    outside_outlet = np.array([1318.0, 0.0])
+    points = np.vstack([valid_point, outside_wall, outside_outlet])
+    field = full_device_library.interpolate(0.5000000004936045)
+    samples = field.sample_cfd(points)
+
+    assert samples.original_valid.tolist() == [True, False, False]
+    assert samples.cfd_valid.tolist() == [True, True, True]
+    assert samples.projection_distance[0] == pytest.approx(0.0)
+    assert samples.projection_distance[1] > 0.0
+    assert samples.projection_distance[2] > 0.0
+    assert np.allclose(samples.sample_points_um[0], points[0])
+    assert np.isfinite(samples.cfd_u).all()
+    assert np.isfinite(samples.cfd_v).all()
+
+
+def test_full_device_exact_split_projection_recovers_stored_field(full_device_library: VelocityFieldLibrary) -> None:
+    case = full_device_library.case_for_fraction(0.5000000004936045)
+    field = full_device_library.interpolate(0.5000000004936045)
+    outside = np.array([[1318.0, 0.0]])
+    projected = field.sample_cfd(outside)
+
+    manual_field = full_device_library.interpolate(case.left_fraction)
+    manual = manual_field.sample_cfd(projected.sample_points_um)
+    assert projected.original_valid.tolist() == [False]
+    assert projected.cfd_valid.tolist() == [True]
+    assert np.allclose(projected.cfd_u, manual.cfd_u)
+    assert np.allclose(projected.cfd_v, manual.cfd_v)
+
+
+def test_full_device_interpolated_split_projection_combines_spatial_and_split_interpolation(full_device_library: VelocityFieldLibrary) -> None:
+    low = full_device_library.case_for_fraction(0.5000000004936045)
+    high = full_device_library.case_for_fraction(0.5200000001654056)
+    target = 0.5 * (low.left_fraction + high.left_fraction)
+    outside = np.array([[1318.0, 0.0]])
+    field = full_device_library.interpolate(target)
+    projected = field.sample_cfd(outside)
+    low_sample = full_device_library.interpolate(low.left_fraction).sample_cfd(projected.sample_points_um)
+    high_sample = full_device_library.interpolate(high.left_fraction).sample_cfd(projected.sample_points_um)
+
+    assert projected.original_valid.tolist() == [False]
+    assert projected.cfd_valid.tolist() == [True]
+    assert np.allclose(projected.cfd_u, 0.5 * (low_sample.cfd_u + high_sample.cfd_u))
+    assert np.allclose(projected.cfd_v, 0.5 * (low_sample.cfd_v + high_sample.cfd_v))
 
 
 def test_full_device_scalar_and_vectorized_sampling_agree(full_device_library: VelocityFieldLibrary) -> None:
@@ -126,6 +209,8 @@ def test_full_device_scalar_and_vectorized_sampling_agree(full_device_library: V
 
     assert scalar.cfd_valid.shape == (1,)
     assert np.array_equal(scalar.cfd_valid, vectorized.cfd_valid)
+    assert np.array_equal(scalar.original_valid, vectorized.original_valid)
+    assert np.allclose(scalar.sample_points_um, vectorized.sample_points_um)
     assert np.allclose(scalar.cfd_u, vectorized.cfd_u, equal_nan=True)
     assert np.allclose(scalar.cfd_v, vectorized.cfd_v, equal_nan=True)
     assert np.allclose(scalar.cfd_speed, vectorized.cfd_speed, equal_nan=True)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+from scipy.spatial import cKDTree
 from skfem import Basis, ElementTriP2, ElementVector, MeshTri
 
 from src.physics.cfd.domain import inside_junction_domain
@@ -12,6 +13,7 @@ from .types import InterpolatedVelocityField, SampledVelocityField
 
 
 ZERO_SPEED_DIRECTION_THRESHOLD_M_PER_S = 1.0e-14
+_PROJECTION_LOOKUP_CACHE: dict[tuple[int, int, int], "_ValidPointProjectionLookup"] = {}
 
 
 def sample_velocity_field_cfd(field: InterpolatedVelocityField, points_cfd_um: np.ndarray) -> SampledVelocityField:
@@ -22,15 +24,18 @@ def sample_velocity_field_cfd(field: InterpolatedVelocityField, points_cfd_um: n
     if points.ndim != 2 or points.shape[1] != 2:
         raise ValueError(f"points_um must have shape (N, 2), got {points.shape}")
 
-    inside = _inside_fluid_domain(points, field.mesh.geometry)
+    original_valid = _inside_fluid_domain(points, field.mesh.geometry)
+    sample_points = _sampling_points_with_projection(points, original_valid, field)
+    inside = _inside_fluid_domain(sample_points, field.mesh.geometry)
     velocity = np.full((len(points), 2), np.nan, dtype=float)
     if np.any(inside):
         basis = velocity_basis(field.nodes_um, field.elements)
         coefficients = paired_velocity_to_basis_coefficients(basis, field.velocity_dof_m_per_s)
-        inside_points_m = points[inside].T * UM_TO_M
+        inside_points_m = sample_points[inside].T * UM_TO_M
         velocity[inside] = _evaluate_basis_interpolator(basis, coefficients, inside_points_m)
 
     speed = np.linalg.norm(velocity, axis=1)
+    projection_distance = np.linalg.norm(sample_points - points, axis=1)
     direction = np.full_like(velocity, np.nan)
     nonzero = np.isfinite(speed) & (speed > ZERO_SPEED_DIRECTION_THRESHOLD_M_PER_S)
     direction[nonzero] = velocity[nonzero] / speed[nonzero, None]
@@ -42,9 +47,14 @@ def sample_velocity_field_cfd(field: InterpolatedVelocityField, points_cfd_um: n
         direction_x=direction[:, 0],
         direction_y=direction[:, 1],
         inside_domain=inside,
+        original_valid=original_valid,
+        sample_points_um=sample_points,
+        projection_distance_um=projection_distance,
         inlet_reference_velocity_m_per_s=field.inlet_reference_velocity_m_per_s,
         units={
             "position": "um in frozen CFD native frame",
+            "sample_position": "um in frozen CFD native frame; outside queries are projected to nearest cached valid CFD point",
+            "projection_distance": "um",
             "velocity": "m/s in frozen CFD native frame",
             "speed": "m/s",
             "normalized_velocity": "dimensionless; velocity divided by analytical inlet centerline maximum",
@@ -67,6 +77,7 @@ def sample_velocity_field_device(
     points_cfd = convention.device_points_to_cfd(points_device)
     sampled_cfd = sample_velocity_field_cfd(field, points_cfd)
     velocity_cfd = np.column_stack([sampled_cfd.u_x_m_per_s, sampled_cfd.u_y_m_per_s])
+    sample_points_device = convention.cfd_points_to_device(sampled_cfd.sample_points_um)
     velocity_device = np.full_like(velocity_cfd, np.nan)
     finite = np.isfinite(velocity_cfd).all(axis=1)
     if np.any(finite):
@@ -83,9 +94,14 @@ def sample_velocity_field_device(
         direction_x=direction[:, 0],
         direction_y=direction[:, 1],
         inside_domain=sampled_cfd.inside_domain,
+        original_valid=sampled_cfd.original_valid,
+        sample_points_um=sample_points_device,
+        projection_distance_um=sampled_cfd.projection_distance_um,
         inlet_reference_velocity_m_per_s=field.inlet_reference_velocity_m_per_s,
         units={
             "position": "um in device Cartesian frame",
+            "sample_position": "um in device Cartesian frame; outside queries are projected to nearest cached valid CFD point",
+            "projection_distance": "um",
             "velocity": "m/s in device Cartesian frame",
             "speed": "m/s",
             "normalized_velocity": "dimensionless; velocity divided by analytical inlet centerline maximum",
@@ -103,6 +119,65 @@ def _inside_fluid_domain(points_um: np.ndarray, geometry) -> np.ndarray:
     if hasattr(geometry, "outer_ring_um") and hasattr(geometry, "inner_ring_um"):
         return inside_full_device_domain(points_um, geometry, tolerance_um=0.0)
     return inside_junction_domain(points_um, geometry, tolerance_um=0.0)
+
+
+def _sampling_points_with_projection(points: np.ndarray, original_valid: np.ndarray, field: InterpolatedVelocityField) -> np.ndarray:
+    if np.all(original_valid):
+        return points.copy()
+    geometry = field.mesh.geometry
+    if not (hasattr(geometry, "outer_ring_um") and hasattr(geometry, "inner_ring_um")):
+        return points.copy()
+    sample_points = points.copy()
+    outside = ~original_valid
+    lookup = _projection_lookup(field)
+    sample_points[outside] = lookup.nearest_valid_points(points[outside])
+    return sample_points
+
+
+def _projection_lookup(field: InterpolatedVelocityField) -> "_ValidPointProjectionLookup":
+    key = (id(field.mesh), len(field.nodes_um), len(field.elements))
+    cached = _PROJECTION_LOOKUP_CACHE.get(key)
+    if cached is None:
+        cached = _ValidPointProjectionLookup.from_field(field)
+        _PROJECTION_LOOKUP_CACHE[key] = cached
+    return cached
+
+
+class _ValidPointProjectionLookup:
+    def __init__(self, valid_points_um: np.ndarray) -> None:
+        if len(valid_points_um) == 0:
+            raise ValueError("Cannot build CFD projection lookup without valid sample points")
+        self.valid_points_um = np.asarray(valid_points_um, dtype=float)
+        self.tree = cKDTree(self.valid_points_um)
+
+    @classmethod
+    def from_field(cls, field: InterpolatedVelocityField) -> "_ValidPointProjectionLookup":
+        nodes = np.asarray(field.nodes_um, dtype=float)
+        elements = np.asarray(field.elements, dtype=np.int64)
+        tri = nodes[elements]
+        edge_midpoints = np.vstack(
+            [
+                0.5 * (tri[:, 0, :] + tri[:, 1, :]),
+                0.5 * (tri[:, 1, :] + tri[:, 2, :]),
+                0.5 * (tri[:, 2, :] + tri[:, 0, :]),
+            ]
+        )
+        centroids = tri.mean(axis=1)
+        barycentric_samples = np.vstack(
+            [
+                0.6 * tri[:, 0, :] + 0.2 * tri[:, 1, :] + 0.2 * tri[:, 2, :],
+                0.2 * tri[:, 0, :] + 0.6 * tri[:, 1, :] + 0.2 * tri[:, 2, :],
+                0.2 * tri[:, 0, :] + 0.2 * tri[:, 1, :] + 0.6 * tri[:, 2, :],
+            ]
+        )
+        candidates = np.vstack([nodes, edge_midpoints, centroids, barycentric_samples])
+        candidates = np.unique(np.round(candidates, decimals=9), axis=0)
+        inside = _inside_fluid_domain(candidates, field.mesh.geometry)
+        return cls(candidates[inside])
+
+    def nearest_valid_points(self, points_um: np.ndarray) -> np.ndarray:
+        _, indices = self.tree.query(np.asarray(points_um, dtype=float), k=1)
+        return self.valid_points_um[np.asarray(indices, dtype=np.int64)]
 
 
 def velocity_basis(nodes_um: np.ndarray, elements: np.ndarray) -> Basis:

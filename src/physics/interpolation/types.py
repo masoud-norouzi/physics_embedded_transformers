@@ -40,6 +40,9 @@ class SampledVelocityField:
     direction_x: np.ndarray
     direction_y: np.ndarray
     inside_domain: np.ndarray
+    original_valid: np.ndarray
+    sample_points_um: np.ndarray
+    projection_distance_um: np.ndarray
     units: dict[str, str]
     coordinate_frame: str
     inlet_reference_velocity_m_per_s: float
@@ -91,6 +94,18 @@ class SampledVelocityField:
     @property
     def cfd_valid(self) -> np.ndarray:
         return self.inside_domain
+
+    @property
+    def sample_x(self) -> np.ndarray:
+        return self.sample_points_um[:, 0]
+
+    @property
+    def sample_y(self) -> np.ndarray:
+        return self.sample_points_um[:, 1]
+
+    @property
+    def projection_distance(self) -> np.ndarray:
+        return self.projection_distance_um
 
 
 @dataclass(frozen=True)
