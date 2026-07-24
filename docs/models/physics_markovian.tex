@@ -1,0 +1,146 @@
+\section{Physics-Embedded Markovian Rollout Model}
+
+\subsection{Scientific Purpose}
+
+The physics-embedded Markovian model tests whether a droplet's instantaneous
+state, augmented by Eulerian continuous-phase CFD information and reduced
+hydraulic state, is sufficient to predict near-future droplet motion.  The model
+is Markovian in the sense that it consumes only the current frame,
+\(T_{\mathrm{history}}=1\), then advances the state autoregressively.
+
+\subsection{State Definition}
+
+The canonical training input is
+\texttt{outputs/processed/2/canonical\_dataset\_v2/canonical\_dataset\_v2.npz}.
+Each droplet state has 15 features:
+
+\begin{enumerate}[label=\arabic*.]
+  \item \(x\)
+  \item \(y\)
+  \item \(v_x\)
+  \item \(v_y\)
+  \item circularity
+  \item \(\mathrm{cfd}\_u\)
+  \item \(\mathrm{cfd}\_v\)
+  \item left-flow fraction
+  \item occupancy in inlet channel
+  \item occupancy in inlet junction
+  \item occupancy in left branch
+  \item occupancy in right branch
+  \item occupancy in outlet junction
+  \item occupancy in outlet channel
+  \item \(\mathrm{cfd}\_\mathrm{valid}\)
+\end{enumerate}
+
+The network input dimension is therefore \(F=15\).  The prediction target is
+unchanged from the previous Markovian baseline:
+
+\[
+\hat{\mathbf{y}}_{t+1}
+=
+\begin{bmatrix}
+\hat{v}_{x,t+1} \\
+\hat{v}_{y,t+1}
+\end{bmatrix}.
+\]
+
+No loss is applied to \(\mathrm{cfd}\_u\), \(\mathrm{cfd}\_v\), flow split,
+occupancy fractions, or \(\mathrm{cfd}\_\mathrm{valid}\).  Those quantities are
+state inputs, not supervised targets.
+
+\subsection{Autoregressive Rollout}
+
+At rollout step \(k\), the model predicts velocity from the current state:
+
+\[
+(\hat{v}_{x,k},\hat{v}_{y,k})
+=
+f_\theta(\mathbf{s}_k).
+\]
+
+Predicted positions are integrated with the same first-order kinematics used by
+the previous Markovian trainer:
+
+\[
+\hat{x}_{k+1} = \hat{x}_k + \hat{v}_{x,k},
+\qquad
+\hat{y}_{k+1} = \hat{y}_k + \hat{v}_{y,k}.
+\]
+
+Newly appearing droplets are injected from truth, preserving the previous
+boundary-conditioned rollout semantics.  Non-target observed features
+(\(\mathrm{cfd}\), split, occupancy, and circularity) are refreshed from the
+corresponding observed future row when the droplet is present.  This matches the
+physics-model attention visualization and evaluation code; no future target
+velocity or future target position is used as model input.
+
+\subsection{Loss Masking}
+
+The dataset returns both a droplet-presence mask and a CFD-valid supervision
+mask.  The velocity loss is computed only where:
+
+\[
+\mathcal{M}_{\mathrm{loss}}
+=
+\mathcal{M}_{\mathrm{present}}
+\land
+\mathcal{M}_{\mathrm{cfd\ valid}}
+\land
+\neg \mathcal{M}_{\mathrm{truth\ injection}}.
+\]
+
+This prevents the cropped downstream outlet region, where CFD coverage is
+intentionally absent because of the video metadata crop, from contributing to
+the supervised velocity objective.  Invalid CFD values are neutralized
+numerically only after retaining \(\mathrm{cfd}\_\mathrm{valid}\) as a feature.
+
+\subsection{Implementation}
+
+The training entry point is:
+
+\begin{verbatim}
+python -m scripts.training.train_physics_markovian \
+  --config configs/experiments/physics_markovian_v1.yml
+\end{verbatim}
+
+The first production configuration uses:
+
+\begin{itemize}
+  \item \(T_{\mathrm{history}}=1\);
+  \item rollout horizon \(=50\);
+  \item maximum droplets per window \(=64\);
+  \item transformer width \(d_{\mathrm{model}}=128\);
+  \item 4 attention heads;
+  \item 4 encoder layers;
+  \item target features \((v_x,v_y)\).
+\end{itemize}
+
+The final uploaded training checkpoint used in the attention visualizations was
+\texttt{outputs/models/physics\_markovian\_v1/latest\_checkpoint.pt}, epoch 50.
+The best checkpoint copied into the self-contained evaluation bundle is
+\texttt{src/evaluation/models/physics\_embedded\_markovian/physics\_markovian\_v1\_best\_checkpoint.pt},
+epoch 33.
+
+\subsection{Attention and Trajectory Diagnostics}
+
+Attention videos are generated with:
+
+\begin{verbatim}
+python -m scripts.training.visualize_physics_markovian_attention \
+  --checkpoint outputs/models/physics_markovian_v1/latest_checkpoint.pt \
+  --window-index 125 \
+  --target-slot 4 \
+  --length 100 \
+  --output-dir outputs/models/physics_markovian_v1/attention_junction_stall_track2664_final_epoch50
+\end{verbatim}
+
+For track 2664, a stall period in the upper junction occurs over rollout steps
+21--28.  The final epoch-50 diagnostics reported:
+
+\begin{itemize}
+  \item 100 valid rollout rows;
+  \item mean position error \(7.33~\mathrm{px}\);
+  \item maximum position error \(9.79~\mathrm{px}\);
+  \item mean true speed during the stall interval \(0.111~\mathrm{px/frame}\).
+\end{itemize}
+

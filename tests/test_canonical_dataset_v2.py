@@ -5,11 +5,13 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from src.datasets.canonical_dataset_builder import (
     CANONICAL_V2_FEATURE_NAMES,
     CanonicalDatasetBuilder,
     CanonicalDatasetV2Builder,
+    velocity_scale_mm_s_per_px_frame,
 )
 
 
@@ -49,9 +51,10 @@ def test_v2_feature_alignment_and_invalid_cfd_neutralization(tmp_path: Path) -> 
     frame_index = {frame: i for i, frame in enumerate(frames)}
 
     row = Z[track_index[2], frame_index[2]]
-    assert row[idx["cfd_valid"]] == 0.0
-    assert row[idx["cfd_u"]] == 0.0
-    assert row[idx["cfd_v"]] == 0.0
+    assert "cfd_valid" not in idx
+    assert "cfd_valid_mask" not in data.files
+    assert row[idx["cfd_u_norm"]] == pytest.approx(2.1)
+    assert row[idx["cfd_v_norm"]] == pytest.approx(0.2)
 
     occupancy = row[
         [
@@ -65,7 +68,18 @@ def test_v2_feature_alignment_and_invalid_cfd_neutralization(tmp_path: Path) -> 
     ]
     assert np.isclose(occupancy.sum(), 1.0)
     assert row[idx["left_flow_fraction"]] == np.float32(0.52)
+    assert row[idx["superficial_velocity"]] == np.float32(56.944444)
     assert json.loads(metadata.read_text(encoding="utf-8"))["dataset_version"] == "canonical_dataset_v2"
+
+
+def test_v2_rejects_untrimmed_invalid_cfd_rows(tmp_path: Path) -> None:
+    _, v2_csv, occ_csv = _write_synthetic_inputs(tmp_path)
+    enriched = pd.read_csv(v2_csv)
+    enriched.loc[enriched.index[-1], "cfd_valid"] = False
+    enriched.to_csv(v2_csv, index=False)
+
+    with pytest.raises(ValueError, match="terminal outlet suffixes"):
+        CanonicalDatasetV2Builder(v2_csv, tmp_path / "bad.npz", occupancy_csv=occ_csv).run()
 
 
 def test_v2_output_shapes_match_previous_builder_contract(tmp_path: Path) -> None:
@@ -86,14 +100,70 @@ def test_v2_output_shapes_match_previous_builder_contract(tmp_path: Path) -> Non
     assert summary["feature_count"] == 15
 
 
+def test_v2_velocity_conversion_uses_mm_per_second(tmp_path: Path) -> None:
+    _, v2_csv, occ_csv = _write_synthetic_inputs(tmp_path)
+    output = tmp_path / "canonical_dataset_v2" / "canonical_dataset_v2.npz"
+    scale = velocity_scale_mm_s_per_px_frame(4.0, 2604.0)
+
+    CanonicalDatasetV2Builder(
+        v2_csv,
+        output,
+        occupancy_csv=occ_csv,
+        pixel_scale_um_per_px=4.0,
+        frame_rate_fps=2604.0,
+    ).run()
+
+    data = np.load(output)
+    features = [str(name) for name in data["feature_names"]]
+    idx = {name: i for i, name in enumerate(features)}
+    track_index = {track_id: i for i, track_id in enumerate(data["track_ids"])}
+    frame_index = {frame: i for i, frame in enumerate(data["frames"])}
+    row = data["Z"][track_index[1], frame_index[1]]
+    assert scale == pytest.approx(10.416)
+    assert row[idx["vx"]] == pytest.approx(10.416)
+    assert row[idx["vy"]] == pytest.approx(10.416)
+    assert str(data["velocity_units"]) == "mm/s"
+    assert "velocity_mm_s_per_px_frame" not in data.files
+    assert "pixel_scale_um_per_px" not in data.files
+    assert "frame_rate_fps" not in data.files
+
+
+def test_builder_recomputes_velocity_from_positions_not_existing_vx_vy(tmp_path: Path) -> None:
+    _, v2_csv, occ_csv = _write_synthetic_inputs(tmp_path)
+    enriched = pd.read_csv(v2_csv)
+    enriched["vx"] = 9999.0
+    enriched["vy"] = -9999.0
+    enriched.to_csv(v2_csv, index=False)
+    output = tmp_path / "canonical_dataset_v2" / "canonical_dataset_v2.npz"
+
+    CanonicalDatasetV2Builder(
+        v2_csv,
+        output,
+        occupancy_csv=occ_csv,
+        pixel_scale_um_per_px=4.0,
+        frame_rate_fps=2604.0,
+    ).run()
+
+    data = np.load(output)
+    features = [str(name) for name in data["feature_names"]]
+    idx = {name: i for i, name in enumerate(features)}
+    track_index = {track_id: i for i, track_id in enumerate(data["track_ids"])}
+    frame_index = {frame: i for i, frame in enumerate(data["frames"])}
+    row = data["Z"][track_index[1], frame_index[1]]
+    assert row[idx["vx"]] == pytest.approx(10.416)
+    assert row[idx["vy"]] == pytest.approx(10.416)
+    assert row[idx["vx"]] != pytest.approx(9999.0)
+    assert row[idx["vy"]] != pytest.approx(-9999.0)
+
+
 def _write_synthetic_inputs(tmp_path: Path) -> tuple[Path, Path, Path]:
     rows = [
-        {"frame": 0, "track_id": 1, "centroid_x": 10.0, "centroid_y": 50.0, "circularity": 0.91, "cfd_u": 1.0, "cfd_v": 0.1, "cfd_valid": True, "left_flow_fraction": 0.50},
-        {"frame": 1, "track_id": 1, "centroid_x": 11.0, "centroid_y": 51.0, "circularity": 0.92, "cfd_u": 1.1, "cfd_v": 0.1, "cfd_valid": True, "left_flow_fraction": 0.51},
-        {"frame": 3, "track_id": 1, "centroid_x": 13.0, "centroid_y": 53.0, "circularity": 0.94, "cfd_u": 1.3, "cfd_v": 0.1, "cfd_valid": True, "left_flow_fraction": 0.53},
-        {"frame": 1, "track_id": 2, "centroid_x": 20.0, "centroid_y": 70.0, "circularity": 0.81, "cfd_u": 2.0, "cfd_v": 0.2, "cfd_valid": True, "left_flow_fraction": 0.51},
-        {"frame": 2, "track_id": 2, "centroid_x": 21.0, "centroid_y": 71.0, "circularity": 0.82, "cfd_u": np.nan, "cfd_v": np.nan, "cfd_valid": False, "left_flow_fraction": 0.52},
-        {"frame": 3, "track_id": 2, "centroid_x": 22.0, "centroid_y": 72.0, "circularity": 0.83, "cfd_u": 2.2, "cfd_v": 0.2, "cfd_valid": True, "left_flow_fraction": 0.53},
+        {"frame": 0, "track_id": 1, "centroid_x": 10.0, "centroid_y": 50.0, "circularity": 0.91, "cfd_u_norm": 1.0, "cfd_v_norm": 0.1, "superficial_velocity": 56.944444, "cfd_valid": True, "left_flow_fraction": 0.50},
+        {"frame": 1, "track_id": 1, "centroid_x": 11.0, "centroid_y": 51.0, "circularity": 0.92, "cfd_u_norm": 1.1, "cfd_v_norm": 0.1, "superficial_velocity": 56.944444, "cfd_valid": True, "left_flow_fraction": 0.51},
+        {"frame": 3, "track_id": 1, "centroid_x": 13.0, "centroid_y": 53.0, "circularity": 0.94, "cfd_u_norm": 1.3, "cfd_v_norm": 0.1, "superficial_velocity": 56.944444, "cfd_valid": True, "left_flow_fraction": 0.53},
+        {"frame": 1, "track_id": 2, "centroid_x": 20.0, "centroid_y": 70.0, "circularity": 0.81, "cfd_u_norm": 2.0, "cfd_v_norm": 0.2, "superficial_velocity": 56.944444, "cfd_valid": True, "left_flow_fraction": 0.51},
+        {"frame": 2, "track_id": 2, "centroid_x": 21.0, "centroid_y": 71.0, "circularity": 0.82, "cfd_u_norm": 2.1, "cfd_v_norm": 0.2, "superficial_velocity": 56.944444, "cfd_valid": True, "left_flow_fraction": 0.52},
+        {"frame": 3, "track_id": 2, "centroid_x": 22.0, "centroid_y": 72.0, "circularity": 0.83, "cfd_u_norm": 2.2, "cfd_v_norm": 0.2, "superficial_velocity": 56.944444, "cfd_valid": True, "left_flow_fraction": 0.53},
     ]
     enriched = pd.DataFrame(rows)
     v2_csv = tmp_path / "physics_enriched_tracked_features.csv"

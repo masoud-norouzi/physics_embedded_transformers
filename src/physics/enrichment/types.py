@@ -40,6 +40,7 @@ class EnrichmentSummary:
     inside_cfd_domain_rows: int
     inside_cfd_domain_fraction: float
     unique_tracks_inside_cfd_domain: int
+    acquisition_domain_trim: dict[str, Any]
     inside_domain_by_region: dict[str, int]
     flow_direction_alignment: dict[str, float]
     missing_value_counts: dict[str, int]

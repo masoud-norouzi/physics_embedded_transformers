@@ -15,6 +15,7 @@ import matplotlib.tri as mtri
 import numpy as np
 import pandas as pd
 
+from src.config.loader import load_experiment_config
 from src.physics.interpolation import VelocityFieldLibrary
 
 from .coordinate_mapping import build_coordinate_transform, map_tracking_coordinates, transform_metadata
@@ -56,7 +57,8 @@ def build_physics_enriched_tracking(config: EnrichmentConfig, overwrite: bool = 
 
     transform = build_coordinate_transform(str(config.experiment_config_path))
     mapped = map_tracking_coordinates(tracking, transform)
-    hydraulic_features = _prepare_hydraulic_features(hydraulic)
+    superficial_velocity_mm_s = compute_inlet_superficial_velocity_mm_s(config.experiment_config_path)
+    hydraulic_features = _prepare_hydraulic_features(hydraulic, superficial_velocity_mm_s)
     joined = tracking.merge(hydraulic_features, on="frame", how="left", sort=False, validate="many_to_one")
     validate_tracking_hydraulic_join(tracking, hydraulic_features, joined)
 
@@ -70,9 +72,18 @@ def build_physics_enriched_tracking(config: EnrichmentConfig, overwrite: bool = 
     if occupancy_regions is not None:
         enriched = enriched.merge(occupancy_regions, on=["frame", "track_id"], how="left", sort=False, validate="one_to_one")
 
-    observed = _derive_observed_velocity_direction(enriched)
+    observed = _derive_observed_velocity_direction(enriched, transform.frame_rate_fps)
     enriched = pd.concat([enriched, observed], axis=1)
     validate_row_preservation(tracking, enriched)
+    original_enriched_row_count = int(len(enriched))
+    original_track_count = int(enriched["track_id"].nunique())
+    trim_config = load_acquisition_domain_trim_config(config.experiment_config_path)
+    enriched, acquisition_trim = trim_acquisition_domain(
+        enriched,
+        library,
+        transform.um_per_px,
+        trim_config,
+    )
     validate_sampled_fields(enriched)
     direction_alignment = _flow_direction_alignment(enriched)
     inside_by_region = _inside_domain_by_region(enriched)
@@ -80,9 +91,9 @@ def build_physics_enriched_tracking(config: EnrichmentConfig, overwrite: bool = 
     missing_counts = {
         column: int(enriched[column].isna().sum())
         for column in [
-            "cfd_u",
-            "cfd_v",
-            "cfd_speed",
+            "cfd_u_norm",
+            "cfd_v_norm",
+            "cfd_speed_norm",
             "cfd_dir_x",
             "cfd_dir_y",
             "background_u_x_device_m_per_s",
@@ -111,10 +122,22 @@ def build_physics_enriched_tracking(config: EnrichmentConfig, overwrite: bool = 
         inside_cfd_domain_rows=int(enriched["inside_cfd_domain"].sum()),
         inside_cfd_domain_fraction=float(enriched["inside_cfd_domain"].mean()),
         unique_tracks_inside_cfd_domain=int(enriched.loc[enriched["inside_cfd_domain"], "track_id"].nunique()),
+        acquisition_domain_trim={
+            **acquisition_trim,
+            "original_enriched_row_count": original_enriched_row_count,
+            "trimmed_enriched_row_count": int(len(enriched)),
+            "original_track_count": original_track_count,
+            "trimmed_track_count": int(enriched["track_id"].nunique()),
+        },
         inside_domain_by_region=inside_by_region,
         flow_direction_alignment=direction_alignment,
         missing_value_counts=missing_counts,
-        validation=validation_summary(tracking, enriched, hydraulic_features),
+        validation={
+            **validation_summary(tracking, enriched, hydraulic_features),
+            "row_count_preserved_before_terminal_trim": True,
+            "terminal_trim_applied_after_scene_physics": True,
+            "duplicate_rows_introduced": False,
+        },
         generation_timestamp_utc=datetime.now(timezone.utc).isoformat(),
     )
 
@@ -127,10 +150,14 @@ def build_physics_enriched_tracking(config: EnrichmentConfig, overwrite: bool = 
     return enriched, summary
 
 
-def _prepare_hydraulic_features(hydraulic: pd.DataFrame) -> pd.DataFrame:
+def _prepare_hydraulic_features(hydraulic: pd.DataFrame, superficial_velocity_mm_s: float | None = None) -> pd.DataFrame:
     total = hydraulic["total_mixture_input_flow_ul_hr"].to_numpy(float)
     if np.any(total <= 0):
         raise ValueError("total_mixture_input_flow_ul_hr must be positive")
+    if superficial_velocity_mm_s is None:
+        superficial_velocity_mm_s = float(_flow_ul_hr_to_velocity_m_s(total[:1])[0] * 1000.0)
+    if not np.isfinite(superficial_velocity_mm_s) or superficial_velocity_mm_s <= 0:
+        raise ValueError("superficial_velocity must be a positive finite value")
     left_fraction = hydraulic["left_flow_ul_hr"].to_numpy(float) / total
     right_fraction = hydraulic["right_flow_ul_hr"].to_numpy(float) / total
     features = pd.DataFrame(
@@ -138,9 +165,7 @@ def _prepare_hydraulic_features(hydraulic: pd.DataFrame) -> pd.DataFrame:
             "frame": hydraulic["frame"].to_numpy(),
             "left_flow_fraction": left_fraction,
             "right_flow_fraction": right_fraction,
-            "inlet_superficial_velocity_m_per_s": _flow_ul_hr_to_velocity_m_s(
-                hydraulic["total_mixture_input_flow_ul_hr"].to_numpy(float)
-            ),
+            "superficial_velocity": np.full(len(hydraulic), float(superficial_velocity_mm_s), dtype=float),
             "left_branch_superficial_velocity_m_per_s": hydraulic["left_velocity_um_s"].to_numpy(float) * 1.0e-6,
             "right_branch_superficial_velocity_m_per_s": hydraulic["right_velocity_um_s"].to_numpy(float) * 1.0e-6,
         }
@@ -148,6 +173,295 @@ def _prepare_hydraulic_features(hydraulic: pd.DataFrame) -> pd.DataFrame:
     if not np.allclose(left_fraction + right_fraction, 1.0, atol=1.0e-10, rtol=0.0):
         raise ValueError("Hydraulic left/right flow fractions do not sum to one")
     return features
+
+
+def load_acquisition_domain_trim_config(experiment_config_path: str | Path) -> dict[str, float | bool]:
+    loaded = load_experiment_config(experiment_config_path)
+    experiment = loaded["experiment"]["experiment"]
+    trim = experiment.get("acquisition", {}).get("domain_trim", {})
+    enabled = bool(trim.get("enabled", False))
+    inlet_margin_px = float(trim.get("inlet_margin_px", 0.0))
+    outlet_margin_px = float(trim.get("outlet_margin_px", 0.0))
+    if inlet_margin_px < 0 or outlet_margin_px < 0:
+        raise ValueError("acquisition.domain_trim margins must be non-negative")
+    if not np.isfinite(inlet_margin_px) or not np.isfinite(outlet_margin_px):
+        raise ValueError("acquisition.domain_trim margins must be finite")
+    return {
+        "enabled": enabled,
+        "inlet_margin_px": inlet_margin_px,
+        "outlet_margin_px": outlet_margin_px,
+    }
+
+
+def trim_acquisition_domain(
+    enriched: pd.DataFrame,
+    library: VelocityFieldLibrary,
+    um_per_px: float,
+    trim_config: dict[str, float | bool],
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    if not bool(trim_config.get("enabled", False)):
+        no_trim = _empty_acquisition_trim_report(enriched, library, um_per_px, trim_config)
+        return enriched.copy().reset_index(drop=True), no_trim
+
+    inlet_margin_px = float(trim_config.get("inlet_margin_px", 0.0))
+    outlet_margin_px = float(trim_config.get("outlet_margin_px", 0.0))
+    inlet_end_y_device_um, outlet_end_y_device_um = _domain_end_y_device_um(library)
+    inlet_cutoff_y_device_um = inlet_end_y_device_um - inlet_margin_px * um_per_px
+    outlet_cutoff_y_device_um = outlet_end_y_device_um + outlet_margin_px * um_per_px
+    return trim_acquisition_domain_by_cutoffs(
+        enriched,
+        inlet_end_y_device_um=inlet_end_y_device_um,
+        outlet_end_y_device_um=outlet_end_y_device_um,
+        inlet_margin_px=inlet_margin_px,
+        outlet_margin_px=outlet_margin_px,
+        um_per_px=um_per_px,
+        inlet_cutoff_y_device_um=inlet_cutoff_y_device_um,
+        outlet_cutoff_y_device_um=outlet_cutoff_y_device_um,
+    )
+
+
+def trim_acquisition_domain_by_cutoffs(
+    enriched: pd.DataFrame,
+    *,
+    inlet_end_y_device_um: float,
+    outlet_end_y_device_um: float,
+    inlet_margin_px: float,
+    outlet_margin_px: float,
+    um_per_px: float,
+    inlet_cutoff_y_device_um: float,
+    outlet_cutoff_y_device_um: float,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    required = {"track_id", "frame", "cfd_valid", "x_device_um", "y_device_um"}
+    missing = sorted(required.difference(enriched.columns))
+    if missing:
+        raise KeyError(f"Cannot trim acquisition domain; missing columns: {missing}")
+    if not {"dominant_region"}.issubset(enriched.columns):
+        raise KeyError("Cannot trim acquisition domain without dominant_region safeguards")
+
+    keep = np.ones(len(enriched), dtype=bool)
+    inlet_removed_parts: list[pd.DataFrame] = []
+    outlet_removed_parts: list[pd.DataFrame] = []
+    inlet_counts: list[int] = []
+    outlet_counts: list[int] = []
+
+    for track_id, group in enriched.groupby("track_id", sort=False):
+        ordered = group.sort_values("frame")
+        y = ordered["y_device_um"].to_numpy(float)
+        regions = ordered["dominant_region"].fillna("").astype(str).to_numpy()
+        inlet_excluded = np.asarray([_is_inlet_region(region) for region in regions]) & (y >= inlet_cutoff_y_device_um)
+        outlet_excluded = np.asarray([_is_outlet_region(region) for region in regions]) & (y <= outlet_cutoff_y_device_um)
+
+        remove_offsets: set[int] = set()
+        prefix_len = 0
+        while prefix_len < len(ordered) and inlet_excluded[prefix_len]:
+            prefix_len += 1
+        if prefix_len:
+            prefix_index = ordered.index[:prefix_len]
+            inlet_removed_parts.append(enriched.loc[prefix_index].copy())
+            inlet_counts.append(int(prefix_len))
+            remove_offsets.update(range(prefix_len))
+
+        outlet_candidates = np.flatnonzero(outlet_excluded)
+        if len(outlet_candidates):
+            first_outlet_offset = int(outlet_candidates[0])
+            suffix_index = ordered.index[first_outlet_offset:]
+            outlet_removed_parts.append(enriched.loc[suffix_index].copy())
+            outlet_counts.append(int(len(suffix_index)))
+            remove_offsets.update(range(first_outlet_offset, len(ordered)))
+
+        if remove_offsets:
+            remove_index = ordered.index[sorted(remove_offsets)]
+            keep[enriched.index.get_indexer(remove_index)] = False
+
+    inlet_removed = pd.concat(inlet_removed_parts, ignore_index=True) if inlet_removed_parts else enriched.iloc[0:0].copy()
+    outlet_removed = pd.concat(outlet_removed_parts, ignore_index=True) if outlet_removed_parts else enriched.iloc[0:0].copy()
+    trimmed = enriched.loc[keep].copy().reset_index(drop=True)
+    if (~trimmed["cfd_valid"].astype(bool)).any():
+        raise ValueError("Acquisition-domain trimming left invalid CFD rows in the enriched table")
+
+    original_ids = set(enriched["track_id"].unique())
+    final_ids = set(trimmed["track_id"].unique())
+    removed_track_ids = original_ids - final_ids
+    inlet_removed_track_ids = set(inlet_removed["track_id"].unique()) if len(inlet_removed) else set()
+    outlet_removed_track_ids = set(outlet_removed["track_id"].unique()) if len(outlet_removed) else set()
+    report = {
+        "method": "leading_inlet_and_terminal_outlet_geometric_cutoff",
+        "inlet": _side_trim_report(
+            inlet_removed,
+            inlet_counts,
+            side="inlet",
+            domain_end_y_device_um=inlet_end_y_device_um,
+            margin_px=inlet_margin_px,
+            margin_um=inlet_margin_px * um_per_px,
+            cutoff_y_device_um=inlet_cutoff_y_device_um,
+            length_label="removed_prefix_length",
+            removed_track_ids=removed_track_ids & inlet_removed_track_ids,
+        ),
+        "outlet": _side_trim_report(
+            outlet_removed,
+            outlet_counts,
+            side="outlet",
+            domain_end_y_device_um=outlet_end_y_device_um,
+            margin_px=outlet_margin_px,
+            margin_um=outlet_margin_px * um_per_px,
+            cutoff_y_device_um=outlet_cutoff_y_device_um,
+            length_label="removed_suffix_length",
+            removed_track_ids=removed_track_ids & outlet_removed_track_ids,
+        ),
+        "total_rows_removed": int(len(enriched) - len(trimmed)),
+        "rows_removed_by_region": _removed_by_region(pd.concat([inlet_removed, outlet_removed], ignore_index=True)),
+        "tracks_removed_entirely": {
+            "total": int(len(removed_track_ids)),
+            "inlet_only": int(len((removed_track_ids & inlet_removed_track_ids) - outlet_removed_track_ids)),
+            "outlet_only": int(len((removed_track_ids & outlet_removed_track_ids) - inlet_removed_track_ids)),
+            "both": int(len(removed_track_ids & inlet_removed_track_ids & outlet_removed_track_ids)),
+        },
+        "all_remaining_cfd_valid": True,
+    }
+    return trimmed, report
+
+
+def _empty_acquisition_trim_report(
+    enriched: pd.DataFrame,
+    library: VelocityFieldLibrary,
+    um_per_px: float,
+    trim_config: dict[str, float | bool],
+) -> dict[str, Any]:
+    inlet_end_y_device_um, outlet_end_y_device_um = _domain_end_y_device_um(library)
+    return {
+        "method": "disabled",
+        "inlet": _side_trim_report(
+            enriched.iloc[0:0],
+            [],
+            side="inlet",
+            domain_end_y_device_um=inlet_end_y_device_um,
+            margin_px=float(trim_config.get("inlet_margin_px", 0.0)),
+            margin_um=float(trim_config.get("inlet_margin_px", 0.0)) * um_per_px,
+            cutoff_y_device_um=inlet_end_y_device_um,
+            length_label="removed_prefix_length",
+            removed_track_ids=set(),
+        ),
+        "outlet": _side_trim_report(
+            enriched.iloc[0:0],
+            [],
+            side="outlet",
+            domain_end_y_device_um=outlet_end_y_device_um,
+            margin_px=float(trim_config.get("outlet_margin_px", 0.0)),
+            margin_um=float(trim_config.get("outlet_margin_px", 0.0)) * um_per_px,
+            cutoff_y_device_um=outlet_end_y_device_um,
+            length_label="removed_suffix_length",
+            removed_track_ids=set(),
+        ),
+        "total_rows_removed": 0,
+        "rows_removed_by_region": {},
+        "tracks_removed_entirely": {"total": 0, "inlet_only": 0, "outlet_only": 0, "both": 0},
+        "all_remaining_cfd_valid": bool(enriched["cfd_valid"].astype(bool).all()) if "cfd_valid" in enriched.columns else True,
+    }
+
+
+def _domain_end_y_device_um(library: VelocityFieldLibrary) -> tuple[float, float]:
+    mesh = library.cases[0].mesh
+    geometry = mesh.geometry
+    if getattr(geometry, "coordinate_frame", "") != "device_cartesian_y_up":
+        raise ValueError("Acquisition-domain trimming currently requires device_cartesian_y_up CFD geometry")
+    return float(np.max(mesh.nodes_um[:, 1])), float(np.min(mesh.nodes_um[:, 1]))
+
+
+def _is_inlet_region(region: str) -> bool:
+    return str(region).strip().lower() in {"inlet", "inlet channel", "inlet_channel"}
+
+
+def _is_outlet_region(region: str) -> bool:
+    return str(region).strip().lower() in {"outlet", "outlet channel", "outlet_channel"}
+
+
+def _side_trim_report(
+    removed: pd.DataFrame,
+    counts: list[int],
+    *,
+    side: str,
+    domain_end_y_device_um: float,
+    margin_px: float,
+    margin_um: float,
+    cutoff_y_device_um: float,
+    length_label: str,
+    removed_track_ids: set[Any],
+) -> dict[str, Any]:
+    return {
+        "domain_end_y_device_um": float(domain_end_y_device_um),
+        "margin_px": float(margin_px),
+        "margin_um": float(margin_um),
+        "cutoff_y_device_um": float(cutoff_y_device_um),
+        "rows_removed": int(len(removed)),
+        "affected_tracks": int(len(counts)),
+        "tracks_removed_entirely": int(len(removed_track_ids)),
+        length_label: _length_stats(counts),
+        "removed_coordinate_range": _coordinate_range(removed),
+        "removed_region_labels": _region_labels(removed),
+    }
+
+
+def _length_stats(counts: list[int]) -> dict[str, float | int]:
+    if not counts:
+        return {"min": 0, "median": 0.0, "max": 0, "mean": 0.0}
+    values = np.asarray(counts, dtype=float)
+    return {
+        "min": int(np.min(values)),
+        "median": float(np.median(values)),
+        "max": int(np.max(values)),
+        "mean": float(np.mean(values)),
+    }
+
+
+def _coordinate_range(table: pd.DataFrame) -> dict[str, float]:
+    if table.empty:
+        return {}
+    result = {
+        "x_device_um_min": float(table["x_device_um"].min()),
+        "x_device_um_max": float(table["x_device_um"].max()),
+        "y_device_um_min": float(table["y_device_um"].min()),
+        "y_device_um_max": float(table["y_device_um"].max()),
+    }
+    if {"x_cfd_um", "y_cfd_um"}.issubset(table.columns):
+        result.update(
+            {
+                "x_cfd_um_min": float(table["x_cfd_um"].min()),
+                "x_cfd_um_max": float(table["x_cfd_um"].max()),
+                "y_cfd_um_min": float(table["y_cfd_um"].min()),
+                "y_cfd_um_max": float(table["y_cfd_um"].max()),
+            }
+        )
+    return result
+
+
+def _region_labels(table: pd.DataFrame) -> list[str]:
+    if table.empty or "dominant_region" not in table.columns:
+        return []
+    return sorted(str(value) for value in table["dominant_region"].dropna().unique())
+
+
+def _removed_by_region(table: pd.DataFrame) -> dict[str, int]:
+    if table.empty or "dominant_region" not in table.columns:
+        return {}
+    return {str(key): int(value) for key, value in table["dominant_region"].fillna("unknown").value_counts().sort_index().items()}
+
+
+def compute_inlet_superficial_velocity_mm_s(experiment_config_path: str | Path) -> float:
+    loaded = load_experiment_config(experiment_config_path)
+    experiment = loaded["experiment"]["experiment"]
+    device = loaded["device"]["device"]
+    phases = experiment.get("phases", {})
+    continuous = phases.get("continuous", {})
+    dispersed = phases.get("dispersed", {})
+    q_continuous = float(continuous["flow_rate_ul_per_hr"])
+    q_dispersed = float(dispersed["flow_rate_ul_per_hr"])
+    channel = device.get("channel", {})
+    width_um = float(channel["width_um"])
+    height_um = float(channel["height_um"])
+    value = float(_flow_ul_hr_to_velocity_m_s(np.asarray([q_continuous + q_dispersed]), width_um, height_um)[0] * 1000.0)
+    if not np.isfinite(value) or value <= 0:
+        raise ValueError("Computed inlet superficial_velocity must be positive and finite")
+    return value
 
 
 def _flow_ul_hr_to_velocity_m_s(flow_ul_hr: np.ndarray, channel_width_um: float = 100.0, channel_height_um: float = 100.0) -> np.ndarray:
@@ -165,9 +479,9 @@ def _sample_cfd_background(enriched: pd.DataFrame, library: VelocityFieldLibrary
     points = _sampling_points(enriched, library)
     output = pd.DataFrame(index=enriched.index)
     for column in [
-        "cfd_u",
-        "cfd_v",
-        "cfd_speed",
+        "cfd_u_norm",
+        "cfd_v_norm",
+        "cfd_speed_norm",
         "cfd_dir_x",
         "cfd_dir_y",
         "background_u_x_device_m_per_s",
@@ -193,7 +507,7 @@ def _sample_cfd_background(enriched: pd.DataFrame, library: VelocityFieldLibrary
     valid_cases = {}
     for case in library.cases:
         samples = library.interpolate(case.left_fraction).sample_cfd(points)
-        uv = np.column_stack([samples.cfd_u, samples.cfd_v])
+        uv = np.column_stack([samples.u_x_m_per_s, samples.u_y_m_per_s])
         sampled_cases[case.left_fraction] = uv
         valid_cases[case.left_fraction] = samples.cfd_valid & np.isfinite(uv).all(axis=1)
 
@@ -211,10 +525,12 @@ def _sample_cfd_background(enriched: pd.DataFrame, library: VelocityFieldLibrary
 
     output.loc[valid, "cfd_valid"] = True
     output.loc[valid, "inside_cfd_domain"] = True
-    output.loc[valid, "cfd_u"] = velocities[valid, 0]
-    output.loc[valid, "cfd_v"] = velocities[valid, 1]
     cfd_speed = np.linalg.norm(velocities[valid], axis=1)
-    output.loc[valid, "cfd_speed"] = cfd_speed
+    reference = float(library.inlet_reference_velocity_m_per_s)
+    normalized = velocities[valid] / reference
+    output.loc[valid, "cfd_u_norm"] = normalized[:, 0]
+    output.loc[valid, "cfd_v_norm"] = normalized[:, 1]
+    output.loc[valid, "cfd_speed_norm"] = cfd_speed / reference
     cfd_dirs = np.full((len(cfd_speed), 2), np.nan, dtype=float)
     cfd_nonzero = cfd_speed > 1.0e-14
     cfd_dirs[cfd_nonzero] = velocities[valid][cfd_nonzero] / cfd_speed[cfd_nonzero, None]
@@ -232,7 +548,6 @@ def _sample_cfd_background(enriched: pd.DataFrame, library: VelocityFieldLibrary
     output.loc[valid, "background_direction_x"] = dirs[:, 0]
     output.loc[valid, "background_direction_y"] = dirs[:, 1]
     return output
-
 
 def _sampling_points(enriched: pd.DataFrame, library: VelocityFieldLibrary) -> np.ndarray:
     geometry = library.cases[0].mesh.geometry
@@ -280,10 +595,11 @@ def _load_occupancy_regions(path: Path) -> pd.DataFrame | None:
     return occupancy
 
 
-def _derive_observed_velocity_direction(enriched: pd.DataFrame) -> pd.DataFrame:
+def _derive_observed_velocity_direction(enriched: pd.DataFrame, frame_rate_fps: float) -> pd.DataFrame:
+    velocity_scale = frame_rate_fps / 1000.0
     observed = pd.DataFrame(index=enriched.index)
-    observed["observed_v_x_device_um_per_frame"] = np.nan
-    observed["observed_v_y_device_um_per_frame"] = np.nan
+    observed["observed_v_x_device_mm_per_s"] = np.nan
+    observed["observed_v_y_device_mm_per_s"] = np.nan
     for _, group in enriched.groupby("track_id", sort=False):
         order = group.sort_values("frame").index.to_numpy()
         if len(order) < 3:
@@ -293,12 +609,12 @@ def _derive_observed_velocity_direction(enriched: pd.DataFrame) -> pd.DataFrame:
         y = enriched.loc[order, "y_device_um"].to_numpy(float)
         valid = (frames[1:-1] - frames[:-2] == 1) & (frames[2:] - frames[1:-1] == 1)
         middle = order[1:-1][valid]
-        observed.loc[middle, "observed_v_x_device_um_per_frame"] = (x[2:][valid] - x[:-2][valid]) / 2.0
-        observed.loc[middle, "observed_v_y_device_um_per_frame"] = (y[2:][valid] - y[:-2][valid]) / 2.0
-    speed = np.sqrt(observed["observed_v_x_device_um_per_frame"] ** 2 + observed["observed_v_y_device_um_per_frame"] ** 2)
-    observed["observed_speed_um_per_frame"] = speed
-    observed["observed_direction_x_device"] = observed["observed_v_x_device_um_per_frame"] / speed
-    observed["observed_direction_y_device"] = observed["observed_v_y_device_um_per_frame"] / speed
+        observed.loc[middle, "observed_v_x_device_mm_per_s"] = (x[2:][valid] - x[:-2][valid]) / 2.0 * velocity_scale
+        observed.loc[middle, "observed_v_y_device_mm_per_s"] = (y[2:][valid] - y[:-2][valid]) / 2.0 * velocity_scale
+    speed = np.sqrt(observed["observed_v_x_device_mm_per_s"] ** 2 + observed["observed_v_y_device_mm_per_s"] ** 2)
+    observed["observed_speed_mm_per_s"] = speed
+    observed["observed_direction_x_device"] = observed["observed_v_x_device_mm_per_s"] / speed
+    observed["observed_direction_y_device"] = observed["observed_v_y_device_mm_per_s"] / speed
     observed.loc[speed <= 1.0e-12, ["observed_direction_x_device", "observed_direction_y_device"]] = np.nan
     return observed
 
@@ -363,8 +679,8 @@ def _save_overlay(enriched: pd.DataFrame, library: VelocityFieldLibrary, path: P
         ax.quiver(
             points[draw, 0],
             points[draw, 1],
-            subset.iloc[draw]["cfd_u"],
-            subset.iloc[draw]["cfd_v"],
+            subset.iloc[draw]["cfd_u_norm"],
+            subset.iloc[draw]["cfd_v_norm"],
             color="#0f766e",
             scale=0.8,
             width=0.002,
@@ -443,6 +759,8 @@ def _markdown_summary(summary: dict[str, Any]) -> str:
         f"- Valid CFD rows: {summary['inside_cfd_domain_rows']} ({summary['inside_cfd_domain_fraction']:.2%})",
         f"- Invalid CFD rows: {summary['row_count'] - summary['inside_cfd_domain_rows']}",
         f"- Unique tracks entering CFD domain: {summary['unique_tracks_inside_cfd_domain']}",
+        f"- Acquisition trim removed rows: {summary['acquisition_domain_trim']['total_rows_removed']}",
+        f"- Acquisition trim removed tracks entirely: {summary['acquisition_domain_trim']['tracks_removed_entirely']['total']}",
         "",
         "## Coordinate Transform",
         "",

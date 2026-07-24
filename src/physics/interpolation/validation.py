@@ -182,6 +182,7 @@ def _field_from_case(case: VelocityFieldCase) -> InterpolatedVelocityField:
         exact_match=True,
         lower_case_id=case.case_id,
         upper_case_id=case.case_id,
+        inlet_reference_velocity_m_per_s=case.inlet_reference_velocity_m_per_s,
     )
 
 

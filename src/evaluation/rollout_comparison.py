@@ -14,6 +14,8 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+from src.config.velocity import DEFAULT_EXPERIMENT_CONFIG, load_velocity_conversion_from_experiment
+
 
 try:
     from .canonical_rollout_transformer import CanonicalRolloutTransformer
@@ -25,6 +27,8 @@ try:
         run_sanity_tests as run_geometry_loss_sanity_tests,
     )
 except ImportError:
+    if __package__:
+        raise
     from canonical_rollout_transformer import CanonicalRolloutTransformer
     import rollout_functions as markovian_rollout
     from channel_mask import read_centerline_csv
@@ -315,6 +319,7 @@ class AlignedRolloutWindowDataset(Dataset):
         normalization_stats,
         input_feature_names: tuple[str, ...] | None = None,
         target_features: tuple[str, str] = ("vx", "vy"),
+        experiment_config: Path = DEFAULT_EXPERIMENT_CONFIG,
     ) -> None:
         self.npz_path = Path(npz_path)
         self.rollout_starts = np.asarray(rollout_starts, dtype=np.int64)
@@ -333,6 +338,13 @@ class AlignedRolloutWindowDataset(Dataset):
         self.track_ids = dataset["track_ids"]
         self.frames = dataset["frames"]
         self.source_feature_names = [str(name) for name in dataset["feature_names"]]
+        self.velocity_units = str(dataset["velocity_units"]) if "velocity_units" in dataset.files else "px/frame"
+        self.experiment_config = Path(experiment_config)
+        self.velocity_mm_s_per_px_frame = (
+            float(load_velocity_conversion_from_experiment(self.experiment_config)["velocity_mm_s_per_px_frame"])
+            if self.velocity_units == "mm/s"
+            else 1.0
+        )
         self.source_feature_indices = {name: index for index, name in enumerate(self.source_feature_names)}
         if self.requested_feature_names is None:
             self.feature_names = list(self.source_feature_names)

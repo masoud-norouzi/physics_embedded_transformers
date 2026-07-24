@@ -19,6 +19,19 @@ def _load_yaml(path: Path, label: str) -> dict[str, Any]:
     return loaded
 
 
+def _require_positive_number(mapping: dict[str, Any], key: str, label: str) -> float:
+    value = mapping.get(key)
+    if value is None:
+        raise ValueError(f"{label} is missing required numeric field: {key}")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label}.{key} must be numeric, got {value!r}") from exc
+    if numeric <= 0:
+        raise ValueError(f"{label}.{key} must be positive, got {value!r}")
+    return numeric
+
+
 def load_experiment_config(
     experiment_path: str | Path,
     configs_root: str | Path = "configs",
@@ -38,6 +51,7 @@ def load_experiment_config(
     device_id = experiment.get("device_id")
     if not device_id:
         raise ValueError(f"Experiment config is missing experiment.device_id: {experiment_path}")
+    _require_positive_number(experiment, "frame_rate_fps", "experiment")
 
     device_path = configs_root / "devices" / f"{device_id}.yml"
     if not device_path.exists():

@@ -67,9 +67,17 @@ def test_experiment_to_device_config_resolution(tmp_path: Path) -> None:
     (configs / "experiments").mkdir()
     (configs / "devices" / "dev.yml").write_text("device:\n  id: dev\n", encoding="utf-8")
     experiment = configs / "experiments" / "exp.yml"
-    experiment.write_text("experiment:\n  id: exp\n  device_id: dev\n", encoding="utf-8")
+    experiment.write_text("experiment:\n  id: exp\n  device_id: dev\n  frame_rate_fps: 1.0\n", encoding="utf-8")
     loaded = load_experiment_config(experiment, configs_root=configs)
     assert loaded["device"]["device"]["id"] == "dev"
+
+
+def test_video_2_experiment_metadata_loads_required_flow_and_frame_rate() -> None:
+    loaded = load_experiment_config(Path("configs/experiments/video_2.yml"))
+    experiment = loaded["experiment"]["experiment"]
+
+    assert experiment["phases"]["dispersed"]["flow_rate_ul_per_hr"] == pytest.approx(100.0)
+    assert experiment["frame_rate_fps"] == pytest.approx(2604.0)
 
 
 def test_configured_branch_length_tolerance(tmp_path: Path) -> None:

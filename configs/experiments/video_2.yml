@@ -4,6 +4,13 @@ experiment:
 
   # Link this experiment to its physical device
   device_id: asymmetric_loop_h100
+  frame_rate_fps: 2604.0
+
+  acquisition:
+    domain_trim:
+      enabled: true
+      inlet_margin_px: 5.0
+      outlet_margin_px: 5.0
 
   # Processed data associated with this experiment
   data:
@@ -23,7 +30,7 @@ experiment:
 
     dispersed:
       material: Bromohexadecane
-      flow_rate_ul_per_hr: 10.0
+      flow_rate_ul_per_hr: 100.0
       viscosity_pa_s: null
       density_kg_per_m3: null
 

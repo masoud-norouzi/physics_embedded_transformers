@@ -34,6 +34,7 @@ class VelocityFieldLibrary:
         self.index = index
         self.fractions = tuple(case.left_fraction for case in self.cases)
         self.cases_by_fraction = {case.left_fraction: case for case in self.cases}
+        self.inlet_reference_velocity_m_per_s = _validate_inlet_reference_invariant(self.cases)
 
     @classmethod
     def from_directory(
@@ -87,7 +88,11 @@ class VelocityFieldLibrary:
         return cls(root=root, cases=cases, index=index)
 
     def interpolate(self, left_fraction: float) -> InterpolatedVelocityField:
-        return interpolate_split(self.cases, left_fraction)
+        return interpolate_split(
+            self.cases,
+            left_fraction,
+            inlet_reference_velocity_m_per_s=self.inlet_reference_velocity_m_per_s,
+        )
 
     def case_for_fraction(self, left_fraction: float, atol: float = 1.0e-12) -> VelocityFieldCase:
         alpha = float(left_fraction)
@@ -112,6 +117,27 @@ def _validate_index(index: dict, path: Path) -> None:
 
 def _ordered_records(index: dict) -> list[dict]:
     return sorted(index["records"], key=lambda item: float(item["left_fraction"]))
+
+
+def _validate_inlet_reference_invariant(cases: Iterable[VelocityFieldCase], rtol: float = 1.0e-12, atol: float = 1.0e-14) -> float:
+    cases = tuple(cases)
+    if not cases:
+        raise ValueError("CFD library must contain at least one case")
+    references = np.asarray([case.inlet_reference_velocity_m_per_s for case in cases], dtype=float)
+    if not np.isfinite(references).all() or np.any(references <= 0.0):
+        raise ValueError(f"CFD inlet reference velocities must be positive and finite, got {references.tolist()}")
+    reference = float(references[0])
+    if not np.allclose(references, reference, rtol=rtol, atol=atol):
+        details = {
+            case.case_id: float(case.inlet_reference_velocity_m_per_s)
+            for case in cases
+        }
+        raise ValueError(
+            "CFD library inlet reference velocity is not invariant across split cases. "
+            f"Expected all cases to share the prescribed-inlet value within rtol={rtol:g}, atol={atol:g}; "
+            f"found {details}"
+        )
+    return reference
 
 
 def _load_case(root: Path, record: dict, geometry, reference_mesh: TriangularMesh | None = None) -> VelocityFieldCase:
@@ -185,6 +211,7 @@ def _load_case(root: Path, record: dict, geometry, reference_mesh: TriangularMes
             "velocity": "m/s",
             "split_parameter": "left branch flow fraction",
         },
+        inlet_reference_velocity_m_per_s=_inlet_reference_velocity_m_per_s(geometry, metadata, flux_report),
     )
 
 
@@ -262,7 +289,54 @@ def _load_full_device_case(root: Path, record: dict, geometry, reference_mesh: F
             "velocity": "m/s",
             "split_parameter": "achieved left branch flow fraction",
         },
+        inlet_reference_velocity_m_per_s=_inlet_reference_velocity_m_per_s(geometry, metadata, {"fluxes_m2_per_s": fluxes}),
     )
+
+
+def _inlet_reference_velocity_m_per_s(geometry, metadata: dict, flux_report: dict) -> float:
+    """Analytical maximum of the prescribed parabolic inlet profile."""
+    report = metadata.get("report", {}) if isinstance(metadata.get("report", {}), dict) else {}
+    for key in ("inlet_mean_velocity_m_per_s",):
+        if key in report:
+            mean = float(report[key])
+            if np.isfinite(mean) and mean > 0.0:
+                return 1.5 * mean
+        if key in metadata:
+            mean = float(metadata[key])
+            if np.isfinite(mean) and mean > 0.0:
+                return 1.5 * mean
+    flux = _inlet_flux_m2_per_s(metadata, flux_report)
+    width_m = float(geometry.channel_width_um) * 1.0e-6
+    if width_m <= 0.0 or not np.isfinite(width_m):
+        raise ValueError("Geometry channel width must be positive to define inlet reference velocity")
+    reference = 1.5 * abs(flux) / width_m
+    if reference <= 0.0 or not np.isfinite(reference):
+        raise ValueError(f"Invalid inlet reference velocity computed from inlet flux={flux!r}")
+    return float(reference)
+
+
+def _inlet_flux_m2_per_s(metadata: dict, flux_report: dict) -> float:
+    report = metadata.get("report", {}) if isinstance(metadata.get("report", {}), dict) else {}
+    candidates = [
+        report.get("inlet_flux_signed_m2_per_s"),
+        report.get("inlet_flux_m2_per_s"),
+        metadata.get("inlet_flux_m2_per_s"),
+        flux_report.get("inlet_flux"),
+        flux_report.get("inlet"),
+    ]
+    fluxes = flux_report.get("fluxes_m2_per_s")
+    if isinstance(fluxes, dict):
+        candidates.append(fluxes.get("inlet"))
+    metadata_fluxes = metadata.get("fluxes_m2_per_s")
+    if isinstance(metadata_fluxes, dict):
+        candidates.append(metadata_fluxes.get("inlet"))
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        value = float(candidate)
+        if np.isfinite(value) and value != 0.0:
+            return value
+    raise ValueError("Could not determine inlet flux for CFD normalization reference")
 
 
 def _validate_case_metadata(case_id: str, left_fraction: float, metadata: dict, flux_report: dict) -> None:

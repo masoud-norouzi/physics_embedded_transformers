@@ -17,8 +17,9 @@ V2_FEATURES = [
     "vx",
     "vy",
     "circularity",
-    "cfd_u",
-    "cfd_v",
+    "cfd_u_norm",
+    "cfd_v_norm",
+    "superficial_velocity",
     "left_flow_fraction",
     "occupancy_inlet_channel",
     "occupancy_inlet_junction",
@@ -26,7 +27,6 @@ V2_FEATURES = [
     "occupancy_right_branch",
     "occupancy_outlet_junction",
     "occupancy_outlet_channel",
-    "cfd_valid",
 ]
 
 
@@ -57,7 +57,7 @@ def test_v2_loader_keeps_previous_window_counts_splits_and_indexing(tmp_path: Pa
     assert sample["cfd_loss_mask"].shape == (2, 3)
 
 
-def test_v2_cfd_valid_feature_and_target_loss_mask_are_separate(tmp_path: Path) -> None:
+def test_v2_has_no_cfd_valid_feature_or_mask(tmp_path: Path) -> None:
     npz = _write_npz(tmp_path / "canonical_v2.npz", V2_FEATURES)
     dataset = CanonicalWindowDataset(
         npz,
@@ -68,19 +68,19 @@ def test_v2_cfd_valid_feature_and_target_loss_mask_are_separate(tmp_path: Path) 
     )
 
     sample = dataset[0]
-    cfd_valid_index = V2_FEATURES.index("cfd_valid")
 
     history_x = np.asarray(sample["history_x"])
     future_mask = np.asarray(sample["future_mask"])
     cfd_loss_mask = np.asarray(sample["cfd_loss_mask"])
 
-    assert history_x[0, 0, cfd_valid_index] == 1.0
-    assert history_x[1, 0, cfd_valid_index] == 0.0
+    assert "cfd_valid" not in dataset.feature_indices
+    assert "cfd_valid_mask" not in np.load(npz).files
+    assert history_x.shape[-1] == len(V2_FEATURES)
 
     assert future_mask[0, 0].item() is True
     assert cfd_loss_mask[0, 0].item() is True
     assert future_mask[1, 0].item() is True
-    assert cfd_loss_mask[1, 0].item() is False
+    assert cfd_loss_mask[1, 0].item() is True
 
 
 def test_invalid_cfd_values_do_not_remove_windows_or_future_targets(tmp_path: Path) -> None:
@@ -96,7 +96,7 @@ def test_invalid_cfd_values_do_not_remove_windows_or_future_targets(tmp_path: Pa
     assert len(dataset) == 3
     sample = dataset[0]
     assert np.asarray(sample["future_mask"]).sum().item() == 5
-    assert np.asarray(sample["cfd_loss_mask"]).sum().item() == 4
+    assert np.asarray(sample["cfd_loss_mask"]).sum().item() == 5
 
 
 def test_original_canonical_dataset_remains_backward_compatible(tmp_path: Path) -> None:
@@ -164,27 +164,25 @@ def _write_npz(path: Path, feature_names: list[str]) -> Path:
             Z[track_index, frame, features["vy"]] = -1.0 - track_index
             Z[track_index, frame, features["circularity"]] = 0.8
 
-            if "cfd_valid" in features:
-                Z[track_index, frame, features["cfd_u"]] = 0.1 * frame
-                Z[track_index, frame, features["cfd_v"]] = -0.1 * frame
+            if "cfd_u_norm" in features:
+                Z[track_index, frame, features["cfd_u_norm"]] = 0.1 * frame
+                Z[track_index, frame, features["cfd_v_norm"]] = -0.1 * frame
+                Z[track_index, frame, features["superficial_velocity"]] = 56.944444
                 Z[track_index, frame, features["left_flow_fraction"]] = 0.5
                 for name in feature_names:
                     if name.startswith("occupancy_"):
                         Z[track_index, frame, features[name]] = 1.0 / 6.0
-                Z[track_index, frame, features["cfd_valid"]] = 1.0
 
-    if "cfd_valid" in features:
-        Z[0, 1, features["cfd_valid"]] = 0.0
-        Z[0, 3, features["cfd_valid"]] = 0.0
-        Z[0, 3, features["cfd_u"]] = 0.0
-        Z[0, 3, features["cfd_v"]] = 0.0
+    if "cfd_u_norm" in features:
+        Z[0, 3, features["cfd_u_norm"]] = 0.0
+        Z[0, 3, features["cfd_v_norm"]] = 0.0
 
-    np.savez_compressed(
-        path,
-        Z=Z,
-        mask=mask,
-        track_ids=track_ids,
-        frames=frames,
-        feature_names=np.asarray(feature_names),
-    )
+    arrays = {
+        "Z": Z,
+        "mask": mask,
+        "track_ids": track_ids,
+        "frames": frames,
+        "feature_names": np.asarray(feature_names),
+    }
+    np.savez_compressed(path, **arrays)
     return path

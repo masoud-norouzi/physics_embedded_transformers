@@ -1,0 +1,293 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=0.65in]{geometry}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{caption}
+\usepackage{float}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{longtable}
+\usepackage{xcolor}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.35em}
+\captionsetup{font=small}
+
+\title{Executive Summary: Physics Infrastructure for the Asymmetric Microfluidic Loop}
+\author{Physics-Embedded Transformers Project}
+\date{July 22, 2026}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This document summarizes the physics-only portion of the project: device
+geometry, region labeling, droplet occupancy, branch hydraulics, full-device
+CFD, flow-split calibration, and interpolation of the computed continuous-phase
+velocity field onto measured droplet trajectories. It intentionally avoids
+machine-learning architecture and training details. The present physics
+pipeline produces a geometrically clean full-device computational domain, a
+validated finite-element Stokes solution on the frozen 24~\(\mu\mathrm{m}\)
+production mesh, a calibrated library of flow splits from 0.40 to 0.64 left
+fraction, and CFD-enriched droplet tracking data for video 2.
+\end{abstract}
+
+\section{Physical System}
+
+The device is an asymmetric loop microfluidic channel. A single inlet channel
+feeds an upstream junction, where the flow separates into a long left branch
+and a shorter right branch. The two branches reconnect at a downstream junction
+and discharge through a single outlet channel. The channel width and height are
+both 100~\(\mu\mathrm{m}\), corresponding to 25 pixels at the calibrated
+4~\(\mu\mathrm{m/px}\) image scale.
+
+The measured branch lengths are:
+\[
+L_{\mathrm{left}} = 1791~\mu\mathrm{m}, \qquad
+L_{\mathrm{right}} = 1491~\mu\mathrm{m}.
+\]
+The resulting geometric asymmetry is:
+\[
+\frac{L_{\mathrm{left}}}{L_{\mathrm{right}}} = 1.201207,
+\qquad
+\alpha_{\mathrm{geom}}
+= \frac{L_{\mathrm{left}} - L_{\mathrm{right}}}{L_{\mathrm{right}}}
+= 0.201207.
+\]
+
+The working physical picture is that droplets occupy finite portions of the
+network and alter the effective branch resistance. The continuous phase is
+treated as a low-Reynolds-number background flow field, while droplet occupancy
+and branch hydraulics provide framewise physical state variables.
+
+\section{Physics Tools}
+
+The physics pipeline is organized by scientific responsibility rather than by
+implementation history:
+
+\begin{enumerate}
+  \item \textbf{Geometry and region labeling:} reconstruct the calibrated
+        device coordinate system, centerlines, branches, junctions, and
+        channel-region labels.
+  \item \textbf{Droplet occupancy:} compute fractional droplet occupancy in
+        physical regions of the device.
+  \item \textbf{Branch hydraulics:} estimate framewise branch resistance and
+        flow split from normalized branch occupancy.
+  \item \textbf{Full-device CFD:} solve the steady continuous-phase Stokes
+        problem over the full loop geometry.
+  \item \textbf{CFD library and interpolation:} calibrate a library of flow
+        splits and sample the corresponding velocity field at arbitrary valid
+        points in the device.
+  \item \textbf{Physics-enriched tracking:} append local CFD velocity and
+        hydraulic state to measured droplet centroids.
+\end{enumerate}
+
+These tools are deterministic preprocessing and simulation components. Their
+outputs are reusable physical data products.
+
+\section{Geometry and Mesh}
+
+The full device is constructed as a continuous CAD-style fluid region using the
+known centerline topology and the fixed 100~\(\mu\mathrm{m}\) channel width.
+The domain is represented in physical units, with coordinates stored in
+micrometers. The final computational domain has one connected fluid component
+and one central island. Dedicated topology checks confirmed no self
+intersections, no dangling boundaries, no duplicated interior wall fragments,
+and no unintended internal boundaries.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.48\linewidth]{../outputs/physics/full_device_cfd/mesh/full_device_polygon_with_centerlines.png}
+  \includegraphics[width=0.48\linewidth]{../outputs/physics/full_device_cfd/mesh/full_device_mesh_quality.png}
+  \caption{Left: full-device CAD polygon with centerlines. Right: mesh-quality
+  visualization for the frozen production mesh.}
+  \label{fig:full-device-geometry}
+\end{figure}
+
+The frozen production mesh uses the 24~\(\mu\mathrm{m}\) configuration. Mesh
+quality is summarized in Table~\ref{tab:mesh-quality}. The mesh is fine enough
+to resolve the junctions and curved walls while avoiding unnecessary refinement
+in the long straight sections.
+
+\begin{table}[H]
+\centering
+\caption{Frozen 24~\(\mu\mathrm{m}\) production mesh quality.}
+\label{tab:mesh-quality}
+\begin{tabular}{@{}lr@{}}
+\toprule
+Quantity & Value \\
+\midrule
+Nodes & 2339 \\
+Triangular elements & 3807 \\
+Minimum angle & \(25.73^\circ\) \\
+Maximum angle & \(122.39^\circ\) \\
+Median aspect ratio & 1.456 \\
+Maximum aspect ratio & 2.285 \\
+Fluid area & \(5.226 \times 10^5~\mu\mathrm{m}^2\) \\
+Boundary length & \(1.043 \times 10^4~\mu\mathrm{m}\) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Continuous-Phase CFD}
+
+The continuous phase is modeled as a steady, incompressible, creeping flow.
+The governing equations are the Stokes equations:
+\[
+-\nabla p + \mu \nabla^2 \mathbf{u} = \mathbf{0},
+\qquad
+\nabla \cdot \mathbf{u} = 0,
+\]
+where \(\mathbf{u}\) is the two-dimensional velocity field, \(p\) is pressure,
+and \(\mu\) is the dynamic viscosity of the continuous phase. No-slip conditions
+are imposed on solid walls. The inlet carries a fixed incoming flux. Outlet
+and branch-flow conditions are formulated so that calibrated left/right flow
+fractions can be generated without changing the geometry.
+
+The validated equal-split case corresponds to
+\[
+f_L = \frac{Q_L}{Q_L + Q_R} \approx 0.50.
+\]
+For this case, the left and right branch fluxes are equal to numerical
+precision, and the velocity and pressure fields are smooth over the full device.
+The maximum speed in the production-library cases is approximately
+0.0817~\(\mathrm{m/s}\). Pressure ranges over the calibrated cases are about
+173--190~Pa, increasing as the imposed branch bias is made stronger.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.42\linewidth]{../outputs/physics/full_device_cfd/alpha0_equal_split_smoke/diagnostics/speed_magnitude.png}
+  \includegraphics[width=0.42\linewidth]{../outputs/physics/full_device_cfd/alpha0_equal_split_smoke/diagnostics/pressure.png}
+  \caption{Representative equal-split full-device CFD solution: velocity
+  magnitude and pressure field.}
+  \label{fig:cfd-fields}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+\includegraphics[width=0.48\linewidth]{../outputs/physics/full_device_cfd/alpha0_equal_split_smoke/diagnostics/full_device_streamlines_very_dense_postprocessed.png}
+\includegraphics[width=0.48\linewidth]{../outputs/physics/full_device_cfd/library/requested_vs_achieved_split.png}
+\caption{Left: dense streamline post-processing for the equal-split case.
+Right: production calibration curve for requested versus achieved left-flow
+fraction.}
+\label{fig:streamlines-and-library}
+\end{figure}
+
+\section{Flow-Split Calibration Library}
+
+The production CFD library spans requested left-flow fractions from 0.40 to
+0.64 in increments of 0.02. The achieved split is used as the interpolation
+coordinate. Calibration succeeded for all 13 requested targets, with no
+unreachable cases. The natural unmodified split is
+\[
+f_{L,\mathrm{natural}} = 0.458119.
+\]
+
+The maximum absolute calibration error over the production library is
+\[
+3.61 \times 10^{-9},
+\]
+and the achieved splits are strictly monotonic. The largest adjacent gap is
+0.020000004, matching the intended resolution.
+
+\begin{table}[H]
+\centering
+\caption{Production CFD split-library summary.}
+\label{tab:split-library}
+\begin{tabular}{@{}lrl@{}}
+\toprule
+Quantity & Value & Interpretation \\
+\midrule
+Successful cases & 13 & All requested targets reached \\
+Requested range & 0.40--0.64 & Left-flow fraction \\
+Natural split & 0.458119 & Unbiased full-device flow split \\
+Maximum calibration error & \(3.61\times10^{-9}\) & Achieved vs. requested split \\
+Largest adjacent gap & 0.020000004 & Library spacing \\
+Monotonic achieved splits & yes & Suitable for interpolation \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Mesh and Field Verification}
+
+A mesh convergence comparison was performed between the frozen 24~\(\mu\mathrm{m}\)
+production mesh and a finer 12~\(\mu\mathrm{m}\) mesh. The goal was not to
+replace the production mesh, but to verify that the velocity field, pressure
+field, and flux structure are stable at the selected resolution. The largest
+differences occur near the inlet and outlet junctions, which is expected because
+these are the regions with the strongest geometric curvature and flow
+redistribution.
+The production mesh was retained as the frozen default after this verification:
+it captured the same qualitative field structure as the finer mesh while
+remaining inexpensive enough for production library generation.
+
+\section{Physics-Enriched Droplet Data}
+
+The full-device CFD library is sampled at measured droplet centroids using the
+framewise hydraulic split as the library coordinate. This attaches local
+continuous-phase velocity information to each observed droplet without
+extrapolating outside the CFD fluid domain.
+
+For video 2, the enriched tracking table contains 432,460 observed droplet rows.
+Of these, 429,929 rows are inside the valid CFD fluid domain:
+\[
+\mathrm{valid~fraction} = 0.994147.
+\]
+The remaining invalid rows are confined to the outlet channel and are consistent
+with the known downstream video crop/metadata exclusion rather than a CFD
+failure.
+
+\begin{table}[H]
+\centering
+\caption{Regional validity of CFD samples on measured droplet centroids.}
+\label{tab:regional-validity}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+Region & Rows & Invalid rows & Invalid percentage \\
+\midrule
+Inlet channel & 65,614 & 0 & 0.00\% \\
+Inlet junction & 26,553 & 0 & 0.00\% \\
+Left branch & 100,083 & 0 & 0.00\% \\
+Right branch & 170,729 & 0 & 0.00\% \\
+Outlet junction & 8,399 & 0 & 0.00\% \\
+Outlet channel & 61,082 & 2,531 & 4.14\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.48\linewidth]{../outputs/physics/video_2/enrichment/diagnostics/sampled_field_overlay.png}
+  \includegraphics[width=0.48\linewidth]{../outputs/physics/video_2/enrichment/diagnostics/final_validity/invalid_percentage_by_region.png}
+  \caption{Left: sampled CFD vectors over tracked droplet centroids. Right:
+  invalid CFD percentage by physical region. Invalid samples are isolated to
+  the cropped outlet-channel region.}
+  \label{fig:enrichment}
+\end{figure}
+
+\section{Current Physics Status}
+
+The physics infrastructure is in a production-ready state for the current
+single-device, single-experiment analysis:
+
+\begin{itemize}
+  \item the full-device geometry is topologically clean;
+  \item the 24~\(\mu\mathrm{m}\) mesh is frozen as the production mesh;
+  \item the full-device Stokes solve produces smooth pressure and velocity
+        fields;
+  \item the calibrated CFD library provides monotonic flow splits from 0.40 to
+        0.64;
+  \item the library is interpolation-ready using achieved left-flow fraction;
+  \item measured droplet tracks are enriched with valid local CFD velocity for
+        99.4\% of observed rows.
+\end{itemize}
+
+Future physics extensions can build on this foundation by adding explicit
+droplet-induced resistance laws, pressure-loss models at the junctions,
+time-dependent coupling, or additional experimental devices. These are natural
+physics-modeling extensions and do not require revisiting the validated
+geometry, mesh, and production-library foundation summarized here.
+
+\end{document}

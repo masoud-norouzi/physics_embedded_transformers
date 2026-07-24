@@ -16,6 +16,7 @@ from scripts.training.train_physics_markovian import (
     normalize_features,
     refresh_observed_non_target_features,
     rollout_weights,
+    velocity_mm_s_to_px_frame_scale,
 )
 from src.datasets.canonical_window_dataset import CanonicalWindowDataset
 from src.models.canonical_rollout_transformer import CanonicalRolloutTransformer
@@ -55,6 +56,7 @@ def main() -> None:
         normalization_stats=checkpoint["normalization_stats"],
         history_length=int(checkpoint["model_config"]["T_history"]),
         max_droplets=int(checkpoint["model_config"]["max_droplets"]),
+        experiment_config=args.experiment_config,
     )
     video_path = resolve_video_path(args.video_path)
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -114,6 +116,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--npz-path", type=Path, default=Path("outputs/processed/2/canonical_dataset_v2/canonical_dataset_v2.npz"))
     parser.add_argument("--video-path", type=Path, default=Path("D:/Microfluidic loop projct/new loop experiments/confined droplets 2/2.avi"))
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/models/physics_markovian_v1/attention"))
+    parser.add_argument("--experiment-config", type=Path, default=Path("configs/experiments/video_2.yml"))
     parser.add_argument("--num-videos", type=int, default=5)
     parser.add_argument("--window-index", type=int, default=None)
     parser.add_argument("--target-slot", type=int, default=None)
@@ -132,7 +135,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_validation_dataset(npz_path, horizon, stride, normalization_stats, history_length, max_droplets):
+def build_validation_dataset(npz_path, horizon, stride, normalization_stats, history_length, max_droplets, experiment_config):
     data = np.load(npz_path, allow_pickle=False)
     T = len(data["frames"])
     total_window = history_length + horizon
@@ -147,6 +150,7 @@ def build_validation_dataset(npz_path, horizon, stride, normalization_stats, his
         T_future=horizon,
         max_droplets=max_droplets,
         normalization_stats=normalization_stats,
+        experiment_config=experiment_config,
     )
 
 
@@ -224,9 +228,10 @@ def collect_attention_rollout(args, sample_rank, model, batch, dataset, normaliz
         pred_step_phys_raw = denormalize_targets(pred_step_norm_raw[:, None, :, :], normalization_stats, device)[:, 0, :, :]
 
         last_frame = history_phys[:, -1, :, :]
+        velocity_to_px_frame = velocity_mm_s_to_px_frame_scale(dataset, device)
         new_frame_phys = last_frame.clone()
-        new_frame_phys[:, :, feature_index["x"]] = last_frame[:, :, feature_index["x"]] + pred_step_phys_raw[:, :, 0]
-        new_frame_phys[:, :, feature_index["y"]] = last_frame[:, :, feature_index["y"]] + pred_step_phys_raw[:, :, 1]
+        new_frame_phys[:, :, feature_index["x"]] = last_frame[:, :, feature_index["x"]] + pred_step_phys_raw[:, :, 0] * velocity_to_px_frame
+        new_frame_phys[:, :, feature_index["y"]] = last_frame[:, :, feature_index["y"]] + pred_step_phys_raw[:, :, 1] * velocity_to_px_frame
         new_frame_phys[:, :, feature_index["vx"]] = pred_step_phys_raw[:, :, 0]
         new_frame_phys[:, :, feature_index["vy"]] = pred_step_phys_raw[:, :, 1]
 

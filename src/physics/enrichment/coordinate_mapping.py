@@ -19,6 +19,7 @@ class CoordinateTransform:
     """Explicit map from tracking pixels to CFD physical coordinates."""
 
     um_per_px: float
+    frame_rate_fps: float
     y_reference_px: float
     tracking_x_column: str
     tracking_y_column: str
@@ -43,13 +44,18 @@ class CoordinateTransform:
 
 def build_coordinate_transform(experiment_config_path: str) -> CoordinateTransform:
     loaded = load_experiment_config(experiment_config_path)
+    experiment = loaded["experiment"]["experiment"]
     device = loaded["device"]["device"]
     um_per_px = float(device["calibration"]["um_per_px"])
     if um_per_px <= 0 or not np.isfinite(um_per_px):
         raise ValueError("Device calibration um_per_px must be positive and finite")
+    frame_rate_fps = float(experiment["frame_rate_fps"])
+    if frame_rate_fps <= 0 or not np.isfinite(frame_rate_fps):
+        raise ValueError("Experiment frame_rate_fps must be positive and finite")
     y_reference_px = _image_y_reference_px(device)
     return CoordinateTransform(
         um_per_px=um_per_px,
+        frame_rate_fps=frame_rate_fps,
         y_reference_px=y_reference_px,
         tracking_x_column="centroid_x",
         tracking_y_column="centroid_y",
@@ -81,6 +87,7 @@ def transform_metadata(transform: CoordinateTransform) -> dict[str, Any]:
     return {
         "version": transform.transform_version,
         "um_per_px": transform.um_per_px,
+        "frame_rate_fps": transform.frame_rate_fps,
         "y_reference_px": transform.y_reference_px,
         "y_reference_um": transform.convention.y_reference_um,
         "tracking_x_column": transform.tracking_x_column,

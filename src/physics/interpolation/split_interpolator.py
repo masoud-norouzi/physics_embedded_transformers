@@ -25,12 +25,14 @@ def interpolate_split(
     cases: Sequence[VelocityFieldCase],
     left_fraction: float,
     exact_atol: float = EXACT_FRACTION_ATOL,
+    inlet_reference_velocity_m_per_s: float | None = None,
 ) -> InterpolatedVelocityField:
     """Interpolate P2 FEM velocity coefficients between neighboring split cases."""
     if len(cases) < 2:
         raise ValueError("At least two CFD cases are required for split interpolation")
     alpha = validate_left_fraction(left_fraction)
     fractions = np.asarray([case.left_fraction for case in cases], dtype=float)
+    inlet_reference = _inlet_reference_from_cases(cases, inlet_reference_velocity_m_per_s)
     if np.any(np.diff(fractions) <= 0.0):
         raise ValueError("CFD split cases must be strictly ordered by left fraction")
     if alpha < fractions[0] - exact_atol or alpha > fractions[-1] + exact_atol:
@@ -61,6 +63,7 @@ def interpolate_split(
             exact_match=True,
             lower_case_id=case.case_id,
             upper_case_id=case.case_id,
+            inlet_reference_velocity_m_per_s=inlet_reference,
         )
 
     upper_idx = int(np.searchsorted(fractions, alpha, side="right"))
@@ -97,7 +100,23 @@ def interpolate_split(
         exact_match=False,
         lower_case_id=low.case_id,
         upper_case_id=high.case_id,
+        inlet_reference_velocity_m_per_s=inlet_reference,
     )
+
+
+def _inlet_reference_from_cases(cases: Sequence[VelocityFieldCase], reference: float | None) -> float:
+    if reference is not None:
+        value = float(reference)
+        if value <= 0.0 or not np.isfinite(value):
+            raise ValueError(f"inlet_reference_velocity_m_per_s must be positive and finite, got {reference!r}")
+        return value
+    references = np.asarray([case.inlet_reference_velocity_m_per_s for case in cases], dtype=float)
+    if not np.isfinite(references).all() or np.any(references <= 0.0):
+        raise ValueError(f"CFD inlet reference velocities must be positive and finite, got {references.tolist()}")
+    value = float(references[0])
+    if not np.allclose(references, value, rtol=1.0e-12, atol=1.0e-14):
+        raise ValueError("Cannot interpolate CFD field with non-invariant inlet reference velocities")
+    return value
 
 
 def _basis_metadata(case: VelocityFieldCase) -> dict[str, object]:

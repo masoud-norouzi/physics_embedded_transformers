@@ -11,6 +11,9 @@ variables. Its present responsibilities are:
   \item compute baseline branch hydraulic state from occupancy;
   \item generate a CFD-ready full-device domain, finite-element mesh, and
         validated steady Stokes velocity field;
+  \item interpolate the full-device CFD library onto tracked droplet centroids;
+  \item produce a physics-enriched canonical dataset for Markovian rollout
+        training;
   \item reserve an interface for future unified physics state.
 \end{enumerate}
 
@@ -60,3 +63,5 @@ src/physics/
 
 The transformer is intentionally outside this package. It should consume
 outputs from the physics package, not own the physical preprocessing itself.
+The first physics consumer is the 15-feature Markovian rollout model documented
+in the model section.

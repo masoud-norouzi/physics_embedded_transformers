@@ -18,8 +18,9 @@ model:
     - vx
     - vy
     - circularity
-    - cfd_u
-    - cfd_v
+    - cfd_u_norm
+    - cfd_v_norm
+    - superficial_velocity
     - left_flow_fraction
     - occupancy_inlet_channel
     - occupancy_inlet_junction
@@ -27,7 +28,6 @@ model:
     - occupancy_right_branch
     - occupancy_outlet_junction
     - occupancy_outlet_channel
-    - cfd_valid
   T_history: 1
   rollout_horizon: 50
   max_droplets: 64

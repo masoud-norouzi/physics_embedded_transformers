@@ -49,7 +49,7 @@ def test_batch_unpacking_and_cfd_loss_mask_from_loader(tmp_path: Path) -> None:
     assert batch["history_x"].shape == (1, 1, 4, 15)
     assert batch["cfd_loss_mask"].shape == (1, 3, 4)
     assert batch["future_mask"][0, 1, 0].item() is True
-    assert batch["cfd_loss_mask"][0, 1, 0].item() is False
+    assert batch["cfd_loss_mask"][0, 1, 0].item() is True
 
 
 def test_cfd_loss_mask_controls_supervised_loss(tmp_path: Path) -> None:
@@ -61,7 +61,7 @@ def test_cfd_loss_mask_controls_supervised_loss(tmp_path: Path) -> None:
     weights = trainer.rollout_weights(3, 2.0, torch.device("cpu"))
     rollout = trainer.boundary_conditioned_rollout(model, batch, dataset, stats, weights)
     assert rollout["mask"][0, 1, 0].item() is True
-    assert rollout["supervision_mask"][0, 1, 0].item() is False
+    assert rollout["supervision_mask"][0, 1, 0].item() is True
 
 
 def test_invalid_targets_make_zero_loss_contribution() -> None:
@@ -176,22 +176,20 @@ def _write_npz(path: Path, feature_names: list[str]) -> Path:
             Z[track, frame, idx["vx"]] = 1.0
             Z[track, frame, idx["vy"]] = 2.0
             Z[track, frame, idx["circularity"]] = 0.9
-            if "cfd_valid" in idx:
-                Z[track, frame, idx["cfd_u"]] = 0.1
-                Z[track, frame, idx["cfd_v"]] = 0.2
+            if "cfd_u_norm" in idx:
+                Z[track, frame, idx["cfd_u_norm"]] = 0.1
+                Z[track, frame, idx["cfd_v_norm"]] = 0.2
+                Z[track, frame, idx["superficial_velocity"]] = 56.944444
                 Z[track, frame, idx["left_flow_fraction"]] = 0.5
                 for name in feature_names:
                     if name.startswith("occupancy_"):
                         Z[track, frame, idx[name]] = 1.0 / 6.0
-                Z[track, frame, idx["cfd_valid"]] = 1.0
-    if "cfd_valid" in idx:
-        Z[0, 2, idx["cfd_valid"]] = 0.0
-    np.savez(
-        path,
-        Z=Z,
-        mask=mask,
-        track_ids=np.asarray([10, 20], dtype=np.int64),
-        frames=np.arange(frames, dtype=np.int64),
-        feature_names=np.asarray(feature_names),
-    )
+    arrays = {
+        "Z": Z,
+        "mask": mask,
+        "track_ids": np.asarray([10, 20], dtype=np.int64),
+        "frames": np.arange(frames, dtype=np.int64),
+        "feature_names": np.asarray(feature_names),
+    }
+    np.savez(path, **arrays)
     return path

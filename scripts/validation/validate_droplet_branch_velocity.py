@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 
 from src.config import load_experiment_config
+from src.config.velocity import velocity_scale_mm_s_per_px_frame
 
 BRANCH_INTERIOR_THRESHOLD = 0.95
 MINIMUM_BRANCH_INTERIOR_SAMPLES = 60
@@ -24,6 +25,18 @@ OUTPUT_NAMES = {
     "summary": "droplet_branch_velocity_summary.json",
     "scatter": "droplet_branch_velocity_scatter.png",
 }
+
+
+def velocity_conversion_from_config(config: dict[str, Any]) -> dict[str, float]:
+    experiment = config["experiment"]["experiment"]
+    device = config["device"]["device"]
+    pixel_scale_um_per_px = float(device["calibration"]["um_per_px"])
+    frame_rate_fps = float(experiment["frame_rate_fps"])
+    return {
+        "pixel_scale_um_per_px": pixel_scale_um_per_px,
+        "frame_rate_fps": frame_rate_fps,
+        "velocity_mm_s_per_px_frame": velocity_scale_mm_s_per_px_frame(pixel_scale_um_per_px, frame_rate_fps),
+    }
 
 
 def validate_unique_keys(df: pd.DataFrame, keys: list[str], label: str) -> None:
@@ -58,7 +71,10 @@ def detect_centroid_columns(tracks: pd.DataFrame) -> tuple[str, str]:
     )
 
 
-def prepare_tracked_velocity(tracks: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
+def prepare_tracked_velocity(
+    tracks: pd.DataFrame,
+    velocity_mm_s_per_px_frame: float | None = None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
     required_keys = {"frame", "track_id"}
     missing_keys = required_keys.difference(tracks.columns)
     if missing_keys:
@@ -72,6 +88,12 @@ def prepare_tracked_velocity(tracks: pd.DataFrame) -> tuple[pd.DataFrame, dict[s
         if not np.all(np.isfinite(velocity)):
             raise ValueError("Existing tracked velocity columns vx and vy must be finite")
         units = _velocity_units_from_columns(result) or "native tracked velocity units (unspecified)"
+        if units == "px/frame":
+            if velocity_mm_s_per_px_frame is None:
+                raise ValueError("velocity_mm_s_per_px_frame is required to convert existing px/frame velocities to mm/s")
+            result["vx"] *= velocity_mm_s_per_px_frame
+            result["vy"] *= velocity_mm_s_per_px_frame
+            units = "mm/s"
         result["tracked_velocity_units"] = units
         result["tracked_velocity_source"] = "existing_velocity_columns"
         result["velocity_x_column"] = "vx"
@@ -83,6 +105,8 @@ def prepare_tracked_velocity(tracks: pd.DataFrame) -> tuple[pd.DataFrame, dict[s
         }
 
     x_col, y_col = detect_centroid_columns(tracks)
+    if velocity_mm_s_per_px_frame is None:
+        raise ValueError("velocity_mm_s_per_px_frame is required to derive tracked velocities in mm/s")
     validate_unique_keys(tracks, ["frame", "track_id"], "Tracked position input")
     result = tracks.copy()
     result["vx"] = np.nan
@@ -100,21 +124,22 @@ def prepare_tracked_velocity(tracks: pd.DataFrame) -> tuple[pd.DataFrame, dict[s
         next_gap = frames[2:] - frames[1:-1]
         valid = (prev_gap == 1) & (next_gap == 1)
         middle_idx = idx[1:-1][valid]
-        result.loc[middle_idx, "vx"] = (x[2:][valid] - x[:-2][valid]) / 2.0
-        result.loc[middle_idx, "vy"] = (y[2:][valid] - y[:-2][valid]) / 2.0
-    result["tracked_velocity_units"] = "px/frame"
+        result.loc[middle_idx, "vx"] = (x[2:][valid] - x[:-2][valid]) / 2.0 * velocity_mm_s_per_px_frame
+        result.loc[middle_idx, "vy"] = (y[2:][valid] - y[:-2][valid]) / 2.0 * velocity_mm_s_per_px_frame
+    result["tracked_velocity_units"] = "mm/s"
     result["tracked_velocity_source"] = "centered_position_difference"
     result["velocity_x_column"] = x_col
     result["velocity_y_column"] = y_col
     return result, {
-        "tracked_velocity_units": "px/frame",
+        "tracked_velocity_units": "mm/s",
         "tracked_velocity_source": "centered_position_difference",
         "centroid_columns_used": [x_col, y_col],
+        "velocity_mm_s_per_px_frame": velocity_mm_s_per_px_frame,
     }
 
 
-def validate_tracked_velocity(tracks: pd.DataFrame) -> str:
-    _, metadata = prepare_tracked_velocity(tracks)
+def validate_tracked_velocity(tracks: pd.DataFrame, velocity_mm_s_per_px_frame: float | None = None) -> str:
+    _, metadata = prepare_tracked_velocity(tracks, velocity_mm_s_per_px_frame)
     return str(metadata["tracked_velocity_units"])
 
 
@@ -145,10 +170,11 @@ def build_branch_interior_samples(
     occupancy: pd.DataFrame,
     hydraulic_state: pd.DataFrame,
     branch_interior_threshold: float = BRANCH_INTERIOR_THRESHOLD,
+    velocity_mm_s_per_px_frame: float | None = None,
 ) -> pd.DataFrame:
     if not 0 < branch_interior_threshold <= 1:
         raise ValueError("branch_interior_threshold must be in (0, 1]")
-    tracks, velocity_metadata = prepare_tracked_velocity(tracks)
+    tracks, velocity_metadata = prepare_tracked_velocity(tracks, velocity_mm_s_per_px_frame)
     validate_occupancy_input(occupancy)
     validate_hydraulic_state_input(hydraulic_state)
 
@@ -383,7 +409,7 @@ def save_track_plot(row: pd.Series, samples: pd.DataFrame, output_dir: Path) -> 
     ax.text(
         0.01,
         0.01,
-        "Per-track normalized temporal variation; measured speed is px/frame, branch velocity is um/s.",
+        "Per-track normalized temporal variation; measured speed is mm/s, branch velocity is um/s.",
         transform=ax.transAxes,
         fontsize=8,
         va="bottom",
@@ -446,6 +472,7 @@ def build_summary(
     tracked_velocity_units: str,
     tracked_velocity_source: str,
     centroid_columns_used: list[str] | None,
+    velocity_conversion: dict[str, float],
     occupancy_path: Path,
     hydraulic_state_path: Path,
     branch_interior_threshold: float,
@@ -464,6 +491,7 @@ def build_summary(
         "tracked_velocity_units": tracked_velocity_units,
         "tracked_velocity_source": tracked_velocity_source,
         "centroid_columns_used": centroid_columns_used,
+        "velocity_conversion": velocity_conversion,
         "occupancy_source_path": str(occupancy_path),
         "hydraulic_state_source_path": str(hydraulic_state_path),
         "branch_interior_threshold": branch_interior_threshold,
@@ -495,11 +523,11 @@ def build_summary(
             "Correlation is not used for candidate ranking."
         ),
         "unit_interpretation": (
-            "Measured droplet speed is recorded in px/frame when derived from tracked positions, while "
-            "hydraulic branch velocity is in um/s. The comparison standardizes each signal independently "
+            "Measured droplet speed is recorded in mm/s after converting tracked pixel displacements "
+            "with device calibration and experiment frame rate. Hydraulic branch velocity remains stored "
+            "as um/s in the baseline hydraulic table. The comparison standardizes each signal independently "
             "within each selected track segment, so it compares normalized temporal variation rather than "
-            "absolute velocity magnitudes. No frame-rate or pixel-scale conversion is required for this "
-            "normalized comparison."
+            "absolute velocity magnitudes."
         ),
         "limitations": [
             "This is a temporal co-variation validation, not proof that branch velocity equals droplet speed.",
@@ -531,6 +559,7 @@ def run_validation(
     minimum_branch_interior_samples: int = MINIMUM_BRANCH_INTERIOR_SAMPLES,
 ) -> dict[str, Any]:
     config = load_experiment_config(experiment_path)
+    velocity_conversion = velocity_conversion_from_config(config)
     tracked_path = resolve_tracked_path(config)
     for label, path in [
         ("tracked velocity", tracked_path),
@@ -559,6 +588,7 @@ def run_validation(
         occupancy,
         hydraulic_state,
         branch_interior_threshold=branch_interior_threshold,
+        velocity_mm_s_per_px_frame=velocity_conversion["velocity_mm_s_per_px_frame"],
     )
     if branch_samples.empty:
         raise ValueError("No finite branch-interior samples are available after velocity derivation and joins")
@@ -590,6 +620,7 @@ def run_validation(
         tracked_velocity_units,
         tracked_velocity_source,
         centroid_columns_used,
+        velocity_conversion,
         occupancy_path,
         hydraulic_state_path,
         branch_interior_threshold,

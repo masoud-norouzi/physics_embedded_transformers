@@ -33,8 +33,9 @@ FEATURE_NAMES = [
     "vx",
     "vy",
     "circularity",
-    "cfd_u",
-    "cfd_v",
+    "cfd_u_norm",
+    "cfd_v_norm",
+    "superficial_velocity",
     "left_flow_fraction",
     "occupancy_inlet_channel",
     "occupancy_inlet_junction",
@@ -42,7 +43,6 @@ FEATURE_NAMES = [
     "occupancy_right_branch",
     "occupancy_outlet_junction",
     "occupancy_outlet_channel",
-    "cfd_valid",
 ]
 
 DIAGNOSTIC_STEPS = (1, 5, 10, 20, 30, 40, 50)
@@ -74,6 +74,7 @@ def main(argv: list[str] | None = None) -> None:
         T_future=int(config["model"]["rollout_horizon"]),
         max_droplets=int(config["model"]["max_droplets"]),
         target_features=tuple(config["model"]["target_features"]),
+        experiment_config=config["dataset"].get("experiment_config", "configs/experiments/video_2.yml"),
     )
     validate_feature_contract(train_ds, config)
     if args.smoke_test:
@@ -504,8 +505,9 @@ def boundary_conditioned_rollout(model, batch, dataset, normalization_stats, wei
 
         history_phys = denormalize_features(rollout_history, normalization_stats, device)
         last_frame = history_phys[:, -1, :, :]
-        x_next = last_frame[:, :, feature_index["x"]] + pred_step_phys_raw[:, :, 0]
-        y_next = last_frame[:, :, feature_index["y"]] + pred_step_phys_raw[:, :, 1]
+        velocity_to_px_frame = velocity_mm_s_to_px_frame_scale(dataset, device)
+        x_next = last_frame[:, :, feature_index["x"]] + pred_step_phys_raw[:, :, 0] * velocity_to_px_frame
+        y_next = last_frame[:, :, feature_index["y"]] + pred_step_phys_raw[:, :, 1] * velocity_to_px_frame
 
         new_frame_phys = last_frame.clone()
         new_frame_phys[:, :, feature_index["x"]] = x_next
@@ -585,6 +587,16 @@ def masked_velocity_mse(prediction, target, mask):
     if valid_error.numel() == 0:
         return squared_error.sum() * 0.0
     return valid_error.mean()
+
+
+def velocity_mm_s_to_px_frame_scale(dataset, device):
+    velocity_units = getattr(dataset, "velocity_units", "px/frame")
+    if velocity_units == "mm/s":
+        conversion = float(getattr(dataset, "velocity_mm_s_per_px_frame", 1.0))
+        if conversion <= 0 or not np.isfinite(conversion):
+            raise ValueError(f"Invalid velocity conversion factor: {conversion}")
+        return torch.as_tensor(1.0 / conversion, dtype=torch.float32, device=device)
+    return torch.as_tensor(1.0, dtype=torch.float32, device=device)
 
 
 def get_true_future_features(batch, dataset, device, horizon):

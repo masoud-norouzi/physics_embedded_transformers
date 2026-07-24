@@ -7,6 +7,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from src.config.velocity import velocity_scale_mm_s_per_px_frame
 
 CANONICAL_V2_FEATURE_NAMES = [
     "x",
@@ -14,8 +15,9 @@ CANONICAL_V2_FEATURE_NAMES = [
     "vx",
     "vy",
     "circularity",
-    "cfd_u",
-    "cfd_v",
+    "cfd_u_norm",
+    "cfd_v_norm",
+    "superficial_velocity",
     "left_flow_fraction",
     "occupancy_inlet_channel",
     "occupancy_inlet_junction",
@@ -23,7 +25,6 @@ CANONICAL_V2_FEATURE_NAMES = [
     "occupancy_right_branch",
     "occupancy_outlet_junction",
     "occupancy_outlet_channel",
-    "cfd_valid",
 ]
 
 
@@ -40,11 +41,25 @@ OCCUPANCY_COLUMNS = {
 class CanonicalDatasetBuilder:
     """Builder copied from the previous canonical dataset format."""
 
-    def __init__(self, input_csv, output_npz, feature_names=None, inlet_y_max_px=100.0):
+    def __init__(
+        self,
+        input_csv,
+        output_npz,
+        feature_names=None,
+        inlet_y_max_px=100.0,
+        pixel_scale_um_per_px=1.0,
+        frame_rate_fps=1000.0,
+    ):
         self.input_csv = Path(input_csv)
         self.output_npz = Path(output_npz)
         self.feature_names = feature_names or ["x", "y", "vx", "vy", "circularity"]
         self.inlet_y_max_px = float(inlet_y_max_px)
+        self.pixel_scale_um_per_px = float(pixel_scale_um_per_px)
+        self.frame_rate_fps = float(frame_rate_fps)
+        self.velocity_mm_s_per_px_frame = velocity_scale_mm_s_per_px_frame(
+            self.pixel_scale_um_per_px,
+            self.frame_rate_fps,
+        )
         self.inlet_velocity_diagnostics: dict[str, Any] = {}
 
     def run(self) -> dict[str, Any]:
@@ -59,14 +74,15 @@ class CanonicalDatasetBuilder:
 
         Z, mask, track_ids, frames = self._build_tensor(interpolated)
         self.output_npz.parent.mkdir(parents=True, exist_ok=True)
-        np.savez(
-            self.output_npz,
-            Z=Z,
-            mask=mask,
-            track_ids=track_ids,
-            frames=frames,
-            feature_names=np.asarray(self.feature_names, dtype=str),
-        )
+        arrays = {
+            "Z": Z,
+            "mask": mask,
+            "track_ids": track_ids,
+            "frames": frames,
+            "feature_names": np.asarray(self.feature_names, dtype=str),
+            "velocity_units": np.asarray("mm/s"),
+        }
+        np.savez(self.output_npz, **arrays)
 
         summary = self._summary(Z, mask, track_ids, frames, diagnostics)
         self._write_metadata(summary, interpolated)
@@ -104,8 +120,8 @@ class CanonicalDatasetBuilder:
 
     def _add_velocities(self, tracks: pd.DataFrame) -> pd.DataFrame:
         tracks = tracks.sort_values(["track_id", "frame"]).reset_index(drop=True)
-        tracks["vx"] = tracks.groupby("track_id")["x"].diff()
-        tracks["vy"] = tracks.groupby("track_id")["y"].diff()
+        tracks["vx"] = tracks.groupby("track_id")["x"].diff() * self.velocity_mm_s_per_px_frame
+        tracks["vy"] = tracks.groupby("track_id")["y"].diff() * self.velocity_mm_s_per_px_frame
         return tracks
 
     def _patch_new_inlet_velocities(self, tracks: pd.DataFrame) -> pd.DataFrame:
@@ -131,6 +147,7 @@ class CanonicalDatasetBuilder:
             "inlet_y_max_px": self.inlet_y_max_px,
             "mean_inlet_vx": mean_inlet_vx,
             "mean_inlet_vy": mean_inlet_vy,
+            "velocity_units": "mm/s",
             "finite_inlet_velocity_observations": int(len(inlet_velocity_samples)),
             "patched_rows": int(patch_rows.sum()),
             "patched_velocity_values": int(patch_vx.sum() + patch_vy.sum()),
@@ -172,6 +189,7 @@ class CanonicalDatasetBuilder:
             "Z_shape": list(Z.shape),
             "mask_shape": list(mask.shape),
             "mask_coverage": float(mask.mean()) if mask.size else 0.0,
+            "velocity_units": "mm/s",
             "inlet_velocity_patch": self.inlet_velocity_diagnostics,
             **diagnostics,
         }
@@ -202,8 +220,17 @@ class CanonicalDatasetV2Builder(CanonicalDatasetBuilder):
         feature_names=None,
         inlet_y_max_px=100.0,
         neutral_invalid_cfd_value=0.0,
+        pixel_scale_um_per_px=1.0,
+        frame_rate_fps=1000.0,
     ):
-        super().__init__(input_csv, output_npz, feature_names or CANONICAL_V2_FEATURE_NAMES, inlet_y_max_px)
+        super().__init__(
+            input_csv,
+            output_npz,
+            feature_names or CANONICAL_V2_FEATURE_NAMES,
+            inlet_y_max_px,
+            pixel_scale_um_per_px,
+            frame_rate_fps,
+        )
         self.occupancy_csv = Path(occupancy_csv) if occupancy_csv is not None else None
         self.metadata_json = Path(metadata_json) if metadata_json is not None else Path(output_npz).with_suffix(".metadata.json")
         self.neutral_invalid_cfd_value = float(neutral_invalid_cfd_value)
@@ -218,8 +245,9 @@ class CanonicalDatasetV2Builder(CanonicalDatasetBuilder):
             "x",
             "y",
             "circularity",
-            "cfd_u",
-            "cfd_v",
+            "cfd_u_norm",
+            "cfd_v_norm",
+            "superficial_velocity",
             "left_flow_fraction",
             "cfd_valid",
             *OCCUPANCY_COLUMNS.values(),
@@ -228,12 +256,24 @@ class CanonicalDatasetV2Builder(CanonicalDatasetBuilder):
         if missing:
             raise KeyError(f"Physics-enriched input is missing required columns: {missing}")
         before = len(tracks)
-        finite_required = ["frame", "track_id", "x", "y", "circularity", "left_flow_fraction", *OCCUPANCY_COLUMNS.values()]
+        finite_required = ["frame", "track_id", "x", "y", "circularity", "superficial_velocity", "left_flow_fraction", *OCCUPANCY_COLUMNS.values()]
         tracks = tracks[np.isfinite(tracks[finite_required].to_numpy(float)).all(axis=1)].copy()
         dropped_rows = before - len(tracks)
         tracks["cfd_valid"] = tracks["cfd_valid"].astype(float)
         self._validate_occupancy(tracks)
-        columns = ["frame", "track_id", "x", "y", "circularity", "cfd_u", "cfd_v", "left_flow_fraction", *OCCUPANCY_COLUMNS.values(), "cfd_valid"]
+        columns = [
+            "frame",
+            "track_id",
+            "x",
+            "y",
+            "circularity",
+            "cfd_u_norm",
+            "cfd_v_norm",
+            "superficial_velocity",
+            "left_flow_fraction",
+            *OCCUPANCY_COLUMNS.values(),
+            "cfd_valid",
+        ]
         tracks = tracks[columns].sort_values(["track_id", "frame"]).reset_index(drop=True)
         return tracks, {
             "dataset_version": "canonical_dataset_v2",
@@ -270,8 +310,12 @@ class CanonicalDatasetV2Builder(CanonicalDatasetBuilder):
         tracks = tracks.copy()
         cfd_valid = tracks["cfd_valid"].to_numpy(float) >= 0.5
         invalid = ~cfd_valid
-        invalid_nonfinite_before = int((~np.isfinite(tracks.loc[invalid, ["cfd_u", "cfd_v"]].to_numpy(float))).sum()) if invalid.any() else 0
-        tracks.loc[invalid, ["cfd_u", "cfd_v"]] = self.neutral_invalid_cfd_value
+        if invalid.any():
+            raise ValueError(
+                "Canonical dataset v2 expects terminal outlet suffixes with invalid CFD coverage to be removed during enrichment; "
+                f"found {int(invalid.sum())} invalid CFD rows."
+            )
+        invalid_nonfinite_before = 0
         tracks["cfd_valid"] = cfd_valid.astype(np.float32)
         return tracks, {
             "valid_cfd_fraction": float(cfd_valid.mean()) if len(cfd_valid) else 0.0,
@@ -289,11 +333,12 @@ class CanonicalDatasetV2Builder(CanonicalDatasetBuilder):
                 "normalization_rules": {
                     "occupancy": "six regional occupancy fractions are already normalized per droplet and verified to sum to 1",
                     "numeric_state": "no feature standardization is applied by the canonical builder",
-                    "velocity": "vx/vy are frame-to-frame first differences in image-pixel coordinates, preserving v1 behavior",
+                    "velocity": "vx/vy are frame-to-frame first differences in image-pixel coordinates converted to mm/s using device calibration and experiment frame rate",
+                    "cfd": "cfd_u_norm/cfd_v_norm are dimensionless CFD velocity components normalized by the library inlet-centerline reference velocity",
                 },
                 "invalid_cfd_handling": {
-                    "cfd_valid": "retained as a separate numeric validity feature before replacement",
-                    "invalid_cfd_u_v": f"invalid or outside-domain cfd_u/cfd_v are replaced with neutral value {self.neutral_invalid_cfd_value:g}",
+                    "cfd_valid": "required to be uniformly true after terminal outlet trimming and excluded from the model feature tensor",
+                    "invalid_cfd_u_v": "no invalid CFD rows are carried into canonical_dataset_v2",
                 },
                 "feature_names_and_order": list(self.feature_names),
             }

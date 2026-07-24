@@ -12,7 +12,10 @@ The test suite covers:
   \item baseline branch-hydraulic equations and flow conservation;
   \item centered finite-difference velocity validation;
   \item full-device CFD geometry, mesh generation, solver assembly, and
-        field-level mesh verification.
+        field-level mesh verification;
+  \item canonical dataset v2 construction and physics-enabled window loading;
+  \item full-device CFD interpolation and physics-enriched tracking;
+  \item physics Markovian trainer smoke-test behavior when PyTorch is available.
 \end{itemize}
 
 Run all tests with:
@@ -21,11 +24,15 @@ Run all tests with:
 .\.venv\Scripts\python.exe -m pytest tests
 \end{verbatim}
 
-The latest validation before this documentation update passed:
+The latest full repository test run before the training/evaluation additions
+passed:
 
 \begin{verbatim}
-143 passed
+173 passed, 1 skipped
 \end{verbatim}
+
+The skipped test is PyTorch-gated in the local environment; the physics
+Markovian smoke path was validated with a PyTorch environment separately.
 
 \subsection{Primary Commands}
 
@@ -86,6 +93,27 @@ $env:MPLCONFIGDIR='outputs\.matplotlib'
   --grid-spacing-um 6 `
   --output-dir outputs\physics\full_device_cfd\convergence\field_comparison_24_vs_12
 \end{verbatim}
+
+  \item Train the physics-enabled Markovian rollout model:
+\begin{verbatim}
+python -m scripts.training.train_physics_markovian \
+  --config configs/experiments/physics_markovian_v1.yml
+\end{verbatim}
+
+  \item Generate physics Markovian attention overlays:
+\begin{verbatim}
+python -m scripts.training.visualize_physics_markovian_attention \
+  --checkpoint outputs/models/physics_markovian_v1/latest_checkpoint.pt \
+  --window-index 125 \
+  --target-slot 4 \
+  --length 100
+\end{verbatim}
+
+  \item Run the three-model rollout comparison:
+\begin{verbatim}
+python -m src.evaluation.rollout_comparison \
+  --output-dir src/evaluation/outputs/rollout_model_comparison
+\end{verbatim}
 \end{enumerate}
 
 \subsection{Current Scope Boundaries}
@@ -93,7 +121,6 @@ $env:MPLCONFIGDIR='outputs\.matplotlib'
 The project currently does not implement:
 
 \begin{itemize}
-  \item transformer training;
   \item hydraulic parameter fitting;
   \item droplet slip modeling;
   \item junction loss modeling.

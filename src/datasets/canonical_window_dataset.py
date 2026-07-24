@@ -4,6 +4,8 @@ from pathlib import Path
 
 import numpy as np
 
+from src.config.velocity import DEFAULT_EXPERIMENT_CONFIG, load_velocity_conversion_from_experiment
+
 try:
     import torch
     from torch.utils.data import Dataset
@@ -38,6 +40,7 @@ class CanonicalWindowDataset(Dataset):
         target_features=("vx", "vy"),
         normalization_stats=None,
         fit_normalization=False,
+        experiment_config=DEFAULT_EXPERIMENT_CONFIG,
     ):
         self.npz_path = Path(npz_path)
         self.start_frames = np.asarray(start_frames, dtype=np.int64)
@@ -53,10 +56,12 @@ class CanonicalWindowDataset(Dataset):
         self.track_ids = dataset["track_ids"]
         self.frames = dataset["frames"]
         self.feature_names = [str(name) for name in dataset["feature_names"]]
+        self.velocity_units = str(dataset["velocity_units"]) if "velocity_units" in dataset.files else "px/frame"
+        self.experiment_config = Path(experiment_config)
+        self.velocity_mm_s_per_px_frame = self._runtime_velocity_conversion()
 
         self.feature_indices = self._feature_indices(self.feature_names)
         self.target_indices = [self.feature_indices[name] for name in self.target_features]
-        self.cfd_valid_index = self.feature_indices.get("cfd_valid")
 
         if fit_normalization:
             self.normalization_stats = self._fit_normalization()
@@ -66,6 +71,11 @@ class CanonicalWindowDataset(Dataset):
     @property
     def feature_dim(self) -> int:
         return len(self.feature_names)
+
+    def _runtime_velocity_conversion(self) -> float:
+        if self.velocity_units != "mm/s":
+            return 1.0
+        return float(load_velocity_conversion_from_experiment(self.experiment_config)["velocity_mm_s_per_px_frame"])
 
     def __len__(self):
         return len(self.start_frames)
@@ -127,10 +137,7 @@ class CanonicalWindowDataset(Dataset):
         }
 
     def _future_cfd_loss_mask(self, selected: np.ndarray, future_slice: slice) -> np.ndarray:
-        if self.cfd_valid_index is None:
-            return self.mask[selected, future_slice].copy()
-        target_cfd_valid = self.Z[selected, future_slice, self.cfd_valid_index]
-        return np.isfinite(target_cfd_valid) & (target_cfd_valid >= 0.5)
+        return self.mask[selected, future_slice].copy()
 
     def _feature_indices(self, feature_names):
         feature_indices = {name: index for index, name in enumerate(feature_names)}
@@ -231,6 +238,7 @@ def create_train_val_test_datasets(
     T_future=10,
     max_droplets=64,
     target_features=("vx", "vy"),
+    experiment_config=DEFAULT_EXPERIMENT_CONFIG,
 ):
     dataset = np.load(npz_path, allow_pickle=False)
     T = len(dataset["frames"])
@@ -252,6 +260,7 @@ def create_train_val_test_datasets(
         max_droplets=max_droplets,
         target_features=target_features,
         fit_normalization=True,
+        experiment_config=experiment_config,
     )
     normalization_stats = train_dataset.normalization_stats
 
@@ -263,6 +272,7 @@ def create_train_val_test_datasets(
         max_droplets=max_droplets,
         target_features=target_features,
         normalization_stats=normalization_stats,
+        experiment_config=experiment_config,
     )
     test_dataset = CanonicalWindowDataset(
         npz_path=npz_path,
@@ -272,6 +282,7 @@ def create_train_val_test_datasets(
         max_droplets=max_droplets,
         target_features=target_features,
         normalization_stats=normalization_stats,
+        experiment_config=experiment_config,
     )
 
     return train_dataset, val_dataset, test_dataset, normalization_stats

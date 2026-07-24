@@ -42,8 +42,9 @@ def boundary_conditioned_rollout(model, batch, dataset, normalization_stats, wei
 
         history_phys = denormalize_features(rollout_history, normalization_stats, device)
         last_frame = history_phys[:, -1, :, :]
-        x_next = last_frame[:, :, feature_index["x"]] + pred_step_phys_raw[:, :, 0]
-        y_next = last_frame[:, :, feature_index["y"]] + pred_step_phys_raw[:, :, 1]
+        velocity_to_px_frame = velocity_mm_s_to_px_frame_scale(dataset, device, torch)
+        x_next = last_frame[:, :, feature_index["x"]] + pred_step_phys_raw[:, :, 0] * velocity_to_px_frame
+        y_next = last_frame[:, :, feature_index["y"]] + pred_step_phys_raw[:, :, 1] * velocity_to_px_frame
 
         new_frame_phys = last_frame.clone()
         new_frame_phys[:, :, feature_index["x"]] = x_next
@@ -120,6 +121,16 @@ def masked_velocity_mse(prediction, target, mask):
     if valid_error.numel() == 0:
         return squared_error.sum() * 0.0
     return valid_error.mean()
+
+
+def velocity_mm_s_to_px_frame_scale(dataset, device, torch_module=torch):
+    velocity_units = getattr(dataset, "velocity_units", "px/frame")
+    if velocity_units == "mm/s":
+        conversion = float(getattr(dataset, "velocity_mm_s_per_px_frame", 1.0))
+        if conversion <= 0 or not np.isfinite(conversion):
+            raise ValueError(f"Invalid velocity conversion factor: {conversion}")
+        return torch_module.as_tensor(1.0 / conversion, dtype=torch.float32, device=device)
+    return torch_module.as_tensor(1.0, dtype=torch.float32, device=device)
 
 
 def get_true_future_features(batch, dataset, device, horizon):

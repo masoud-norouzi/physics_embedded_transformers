@@ -96,8 +96,8 @@ def run_coordinate_audit(
         "tracked_velocity_frame": {
             "source_columns": "tracked_features.csv contains centroid positions only, not canonical vx/vy columns",
             "derived_observed_velocity": "centered finite difference of centroid_x/centroid_y gives pixels/frame in image frame",
-            "device_conversion": "v_x_device_um_per_frame = scale*v_x_image_px_per_frame; v_y_device_um_per_frame = -scale*v_y_image_px_per_frame",
-            "frame_rate": "not available in current experiment configuration, so observed velocities remain um/frame for direction diagnostics",
+            "device_conversion": "v_x_device_mm_per_s = scale_um_per_px/1000*fps*v_x_image_px_per_frame; v_y_device_mm_per_s = -scale_um_per_px/1000*fps*v_y_image_px_per_frame",
+            "frame_rate": "experiment.frame_rate_fps is available and should be used when converting observed droplet velocities to mm/s",
         },
         "cfd_version": field.cfd_version,
         "mesh_version": field.mesh_version,

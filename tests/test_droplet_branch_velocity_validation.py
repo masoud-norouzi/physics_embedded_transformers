@@ -18,7 +18,11 @@ from scripts.validation.validate_droplet_branch_velocity import (
     spearman_r,
     validate_normalized_samples,
     validate_tracked_velocity,
+    velocity_scale_mm_s_per_px_frame,
 )
+
+UNIT_SCALE = 1.0
+VIDEO_2_SCALE = 10.416
 
 
 def _tracks(rows: list[dict]) -> pd.DataFrame:
@@ -56,7 +60,7 @@ def _candidate(track_id: int, branch: str, std: float, corr: float = 0.0, n: int
         "std_branch_velocity_um_s": std,
         "pearson_r": corr,
         "spearman_r": corr,
-        "tracked_velocity_units": "px/frame",
+        "tracked_velocity_units": "mm/s",
     }
 
 
@@ -66,17 +70,28 @@ def test_speed_is_calculated_from_vx_vy() -> None:
 
 
 def test_constant_x_motion_derives_expected_vx_and_speed() -> None:
-    prepared, metadata = prepare_tracked_velocity(_position_tracks(xs=[0.0, 2.0, 4.0], ys=[5.0, 5.0, 5.0]))
+    prepared, metadata = prepare_tracked_velocity(_position_tracks(xs=[0.0, 2.0, 4.0], ys=[5.0, 5.0, 5.0]), UNIT_SCALE)
     middle = prepared.loc[prepared["frame"] == 1].iloc[0]
     assert middle["vx"] == pytest.approx(2.0)
     assert middle["vy"] == pytest.approx(0.0)
     assert calculate_speeds(prepared).loc[prepared["frame"] == 1, "droplet_speed"].iloc[0] == pytest.approx(2.0)
     assert metadata["tracked_velocity_source"] == "centered_position_difference"
-    assert metadata["tracked_velocity_units"] == "px/frame"
+    assert metadata["tracked_velocity_units"] == "mm/s"
+
+
+def test_one_pixel_per_frame_converts_to_video_2_mm_per_s() -> None:
+    scale = velocity_scale_mm_s_per_px_frame(pixel_scale_um_per_px=4.0, frame_rate_fps=2604.0)
+    prepared, metadata = prepare_tracked_velocity(_position_tracks(xs=[0.0, 1.0, 2.0], ys=[0.0, 1.0, 2.0]), scale)
+    middle = prepared.loc[prepared["frame"] == 1].iloc[0]
+    assert scale == pytest.approx(VIDEO_2_SCALE)
+    assert middle["vx"] == pytest.approx(VIDEO_2_SCALE)
+    assert middle["vy"] == pytest.approx(VIDEO_2_SCALE)
+    assert calculate_speeds(prepared).loc[prepared["frame"] == 1, "droplet_speed"].iloc[0] == pytest.approx(np.sqrt(2.0) * VIDEO_2_SCALE)
+    assert metadata["tracked_velocity_units"] == "mm/s"
 
 
 def test_constant_y_motion_derives_expected_vy_and_speed() -> None:
-    prepared, _ = prepare_tracked_velocity(_position_tracks(xs=[1.0, 1.0, 1.0], ys=[0.0, 3.0, 6.0]))
+    prepared, _ = prepare_tracked_velocity(_position_tracks(xs=[1.0, 1.0, 1.0], ys=[0.0, 3.0, 6.0]), UNIT_SCALE)
     middle = calculate_speeds(prepared).loc[prepared["frame"] == 1].iloc[0]
     assert middle["vx"] == pytest.approx(0.0)
     assert middle["vy"] == pytest.approx(3.0)
@@ -84,7 +99,7 @@ def test_constant_y_motion_derives_expected_vy_and_speed() -> None:
 
 
 def test_diagonal_motion_derives_speed_from_components() -> None:
-    prepared, _ = prepare_tracked_velocity(_position_tracks(xs=[0.0, 3.0, 6.0], ys=[0.0, 4.0, 8.0]))
+    prepared, _ = prepare_tracked_velocity(_position_tracks(xs=[0.0, 3.0, 6.0], ys=[0.0, 4.0, 8.0]), UNIT_SCALE)
     middle = calculate_speeds(prepared).loc[prepared["frame"] == 1].iloc[0]
     assert middle["vx"] == pytest.approx(3.0)
     assert middle["vy"] == pytest.approx(4.0)
@@ -92,13 +107,13 @@ def test_diagonal_motion_derives_speed_from_components() -> None:
 
 
 def test_centered_difference_aligns_velocity_with_middle_frame_and_excludes_endpoints() -> None:
-    prepared, _ = prepare_tracked_velocity(_position_tracks(frames=[10, 11, 12, 13], xs=[0, 2, 4, 6], ys=[0, 0, 0, 0]))
+    prepared, _ = prepare_tracked_velocity(_position_tracks(frames=[10, 11, 12, 13], xs=[0, 2, 4, 6], ys=[0, 0, 0, 0]), UNIT_SCALE)
     assert prepared.loc[prepared["frame"].isin([10, 13]), ["vx", "vy"]].isna().all().all()
     assert prepared.loc[prepared["frame"].isin([11, 12]), "vx"].tolist() == [2.0, 2.0]
 
 
 def test_samples_adjacent_to_frame_gap_are_excluded_from_derived_velocity() -> None:
-    prepared, _ = prepare_tracked_velocity(_position_tracks(frames=[0, 1, 3, 4], xs=[0, 1, 3, 4], ys=[0, 0, 0, 0]))
+    prepared, _ = prepare_tracked_velocity(_position_tracks(frames=[0, 1, 3, 4], xs=[0, 1, 3, 4], ys=[0, 0, 0, 0]), UNIT_SCALE)
     assert prepared[["vx", "vy"]].isna().all().all()
 
 
@@ -110,7 +125,7 @@ def test_track_boundaries_are_never_mixed() -> None:
         ],
         ignore_index=True,
     )
-    prepared, _ = prepare_tracked_velocity(tracks)
+    prepared, _ = prepare_tracked_velocity(tracks, UNIT_SCALE)
     assert prepared.loc[prepared["track_id"] == 1, "vx"].isna().all()
     assert prepared.loc[(prepared["track_id"] == 2) & (prepared["frame"] == 3), "vx"].iloc[0] == pytest.approx(3.0)
 
@@ -135,13 +150,13 @@ def test_existing_vx_vy_columns_are_preferred_when_present() -> None:
 
 
 def test_position_derived_velocity_is_used_when_vx_vy_absent() -> None:
-    prepared, metadata = prepare_tracked_velocity(_position_tracks())
+    prepared, metadata = prepare_tracked_velocity(_position_tracks(), UNIT_SCALE)
     assert metadata["tracked_velocity_source"] == "centered_position_difference"
     assert prepared.loc[prepared["frame"] == 1, "vx"].iloc[0] == pytest.approx(1.0)
 
 
 def test_left_interior_samples_receive_left_velocity() -> None:
-    samples = build_branch_interior_samples(_tracks([{}]), _occupancy([{}]), _hydraulic([{}]))
+    samples = build_branch_interior_samples(_tracks([{}]), _occupancy([{}]), _hydraulic([{}]), velocity_mm_s_per_px_frame=UNIT_SCALE)
     assert samples.loc[0, "branch"] == "left"
     assert samples.loc[0, "calculated_branch_velocity_um_s"] == pytest.approx(10.0)
 
@@ -151,6 +166,7 @@ def test_right_interior_samples_receive_right_velocity() -> None:
         _tracks([{}]),
         _occupancy([{"w_left": 0.0, "w_right": 1.0}]),
         _hydraulic([{}]),
+        velocity_mm_s_per_px_frame=UNIT_SCALE,
     )
     assert samples.loc[0, "branch"] == "right"
     assert samples.loc[0, "calculated_branch_velocity_um_s"] == pytest.approx(20.0)
@@ -167,6 +183,7 @@ def test_junction_and_transition_samples_are_excluded() -> None:
             ]
         ),
         _hydraulic([{"frame": 0}, {"frame": 1}, {"frame": 2}]),
+        velocity_mm_s_per_px_frame=UNIT_SCALE,
     )
     assert samples.empty
 
@@ -176,6 +193,7 @@ def test_ambiguous_dual_branch_samples_are_rejected() -> None:
         _tracks([{}]),
         _occupancy([{"w_left": 0.96, "w_right": 0.96}]),
         _hydraulic([{}]),
+        velocity_mm_s_per_px_frame=UNIT_SCALE,
     )
     assert samples.empty
 
@@ -188,7 +206,7 @@ def test_per_track_z_score_has_zero_mean_and_unit_sample_std() -> None:
             "branch": "left",
             "droplet_speed": [1, 2, 3, 4, 5],
             "calculated_branch_velocity_um_s": [2, 4, 6, 8, 10],
-            "tracked_velocity_units": "px/frame",
+            "tracked_velocity_units": "mm/s",
             "w_left": 1.0,
             "w_right": 0.0,
         }
@@ -209,7 +227,7 @@ def test_zero_variance_tracks_are_rejected() -> None:
             "branch": "left",
             "droplet_speed": [1, 1, 1, 1, 1],
             "calculated_branch_velocity_um_s": [2, 3, 4, 5, 6],
-            "tracked_velocity_units": "px/frame",
+            "tracked_velocity_units": "mm/s",
             "w_left": 1.0,
             "w_right": 0.0,
         }
@@ -315,9 +333,10 @@ def test_summary_metadata_records_normalization_and_units(tmp_path) -> None:
     summary = build_summary(
         config,
         tmp_path / "tracks.csv",
-        "px/frame",
+        "mm/s",
         "centered_position_difference",
         ["centroid_x", "centroid_y"],
+        {"pixel_scale_um_per_px": 4.0, "frame_rate_fps": 2604.0, "velocity_mm_s_per_px_frame": VIDEO_2_SCALE},
         tmp_path / "occ.csv",
         tmp_path / "hyd.csv",
         0.95,
@@ -329,7 +348,8 @@ def test_summary_metadata_records_normalization_and_units(tmp_path) -> None:
     )
     assert summary["normalization_method"] == "per selected (track_id, branch) z-score"
     assert summary["normalization_ddof"] == 1
-    assert summary["tracked_velocity_units"] == "px/frame"
+    assert summary["tracked_velocity_units"] == "mm/s"
+    assert summary["velocity_conversion"]["velocity_mm_s_per_px_frame"] == pytest.approx(VIDEO_2_SCALE)
     assert summary["tracked_velocity_source"] == "centered_position_difference"
     assert "normalized temporal variation" in summary["unit_interpretation"]
     assert json.dumps(summary)
@@ -337,12 +357,12 @@ def test_summary_metadata_records_normalization_and_units(tmp_path) -> None:
 
 def test_duplicate_join_keys_are_rejected() -> None:
     with pytest.raises(ValueError, match="duplicate"):
-        validate_tracked_velocity(_tracks([{}, {}]))
+        validate_tracked_velocity(_tracks([{}, {}]), UNIT_SCALE)
 
 
 def test_missing_velocity_and_position_columns_fail_loudly() -> None:
     with pytest.raises(ValueError, match="supported centroid"):
-        validate_tracked_velocity(pd.DataFrame({"frame": [0], "track_id": [1]}))
+        validate_tracked_velocity(pd.DataFrame({"frame": [0], "track_id": [1]}), UNIT_SCALE)
 
 
 def test_normalized_comparison_proceeds_with_different_physical_units() -> None:
@@ -363,10 +383,10 @@ def test_normalized_comparison_proceeds_with_different_physical_units() -> None:
             "right_velocity_um_s": [20] * 5,
         }
     )
-    samples = build_branch_interior_samples(tracks, occ, hyd)
+    samples = build_branch_interior_samples(tracks, occ, hyd, velocity_mm_s_per_px_frame=UNIT_SCALE)
     candidates, _ = build_candidate_table(samples, minimum_branch_interior_samples=3)
     assert len(candidates) == 1
-    assert candidates.loc[0, "tracked_velocity_units"] == "px/frame"
+    assert candidates.loc[0, "tracked_velocity_units"] == "mm/s"
 
 
 def test_validate_normalized_samples_rejects_nonselected_track() -> None:

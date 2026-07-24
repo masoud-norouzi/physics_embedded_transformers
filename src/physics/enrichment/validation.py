@@ -63,22 +63,29 @@ def validate_row_preservation(original: pd.DataFrame, enriched: pd.DataFrame) ->
 def validate_sampled_fields(enriched: pd.DataFrame, alpha_tolerance: float = 1.0e-12) -> None:
     if "cfd_valid" in enriched.columns and not enriched["cfd_valid"].equals(enriched["inside_cfd_domain"]):
         raise ValueError("cfd_valid and inside_cfd_domain must match")
+    if "superficial_velocity" not in enriched.columns:
+        raise ValueError("Enriched output is missing superficial_velocity")
+    superficial = enriched["superficial_velocity"].to_numpy(float)
+    if len(superficial) and (not np.isfinite(superficial).all() or np.any(superficial <= 0)):
+        raise ValueError("superficial_velocity must be positive and finite")
+    if len(superficial) and not np.allclose(superficial, superficial[0], rtol=0.0, atol=1.0e-12):
+        raise ValueError("superficial_velocity must be constant for this fixed experiment")
     inside = enriched["inside_cfd_domain"].to_numpy(bool)
-    cfd_cols = ["cfd_u", "cfd_v", "cfd_speed", "cfd_dir_x", "cfd_dir_y"]
+    cfd_cols = ["cfd_u_norm", "cfd_v_norm", "cfd_speed_norm", "cfd_dir_x", "cfd_dir_y"]
     if all(column in enriched.columns for column in cfd_cols):
         cfd_inside = enriched.loc[inside, cfd_cols[:3]].to_numpy(float)
         if len(cfd_inside) and not np.isfinite(cfd_inside).all():
-            raise ValueError("Valid CFD rows must have finite cfd_u, cfd_v, and cfd_speed")
+            raise ValueError("Valid CFD rows must have finite cfd_u_norm, cfd_v_norm, and cfd_speed_norm")
         cfd_outside = enriched.loc[~inside, cfd_cols].to_numpy(float)
         if len(cfd_outside) and not np.isnan(cfd_outside).all():
             raise ValueError("Invalid CFD rows must have NaN CFD values")
-        speed = enriched["cfd_speed"].to_numpy(float)
-        ux = enriched["cfd_u"].to_numpy(float)
-        uy = enriched["cfd_v"].to_numpy(float)
+        speed = enriched["cfd_speed_norm"].to_numpy(float)
+        ux = enriched["cfd_u_norm"].to_numpy(float)
+        uy = enriched["cfd_v_norm"].to_numpy(float)
         if np.any(inside):
             expected = np.sqrt(ux[inside] ** 2 + uy[inside] ** 2)
             if not np.allclose(speed[inside], expected, rtol=1.0e-12, atol=1.0e-14):
-                raise ValueError("cfd_speed does not match cfd_u/cfd_v")
+                raise ValueError("cfd_speed_norm does not match cfd_u_norm/cfd_v_norm")
             nonzero = speed[inside] > 1.0e-14
             dirs = enriched.loc[inside, ["cfd_dir_x", "cfd_dir_y"]].to_numpy(float)
             if np.any(nonzero):

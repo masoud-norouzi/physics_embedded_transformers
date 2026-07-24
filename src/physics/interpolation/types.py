@@ -26,6 +26,7 @@ class VelocityFieldCase:
     cfd_version: str
     mesh_version: str
     units: dict[str, str]
+    inlet_reference_velocity_m_per_s: float
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,7 @@ class SampledVelocityField:
     inside_domain: np.ndarray
     units: dict[str, str]
     coordinate_frame: str
+    inlet_reference_velocity_m_per_s: float
 
     @property
     def cfd_u(self) -> np.ndarray:
@@ -53,6 +55,30 @@ class SampledVelocityField:
     @property
     def cfd_speed(self) -> np.ndarray:
         return self.speed_m_per_s
+
+    @property
+    def u_x_norm(self) -> np.ndarray:
+        return self.u_x_m_per_s / self.inlet_reference_velocity_m_per_s
+
+    @property
+    def u_y_norm(self) -> np.ndarray:
+        return self.u_y_m_per_s / self.inlet_reference_velocity_m_per_s
+
+    @property
+    def speed_norm(self) -> np.ndarray:
+        return self.speed_m_per_s / self.inlet_reference_velocity_m_per_s
+
+    @property
+    def cfd_u_norm(self) -> np.ndarray:
+        return self.u_x_norm
+
+    @property
+    def cfd_v_norm(self) -> np.ndarray:
+        return self.u_y_norm
+
+    @property
+    def cfd_speed_norm(self) -> np.ndarray:
+        return self.speed_norm
 
     @property
     def cfd_dir_x(self) -> np.ndarray:
@@ -89,6 +115,7 @@ class InterpolatedVelocityField:
     exact_match: bool
     lower_case_id: str
     upper_case_id: str
+    inlet_reference_velocity_m_per_s: float
 
     def sample_cfd(self, points_cfd_um: np.ndarray) -> SampledVelocityField:
         """Sample at points in the frozen CFD native frame; returns CFD-frame vectors."""

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import math
 from pathlib import Path
 
@@ -42,6 +43,17 @@ def test_full_device_interpolation_between_adjacent_splits(full_device_library: 
     assert field.upper_case_id == "production_fL_0p52"
     assert math.isclose(field.interpolation_weight, 0.5, abs_tol=1.0e-12)
     assert np.allclose(field.velocity_dof_m_per_s, 0.5 * (low.velocity_dof_m_per_s + high.velocity_dof_m_per_s))
+    assert field.inlet_reference_velocity_m_per_s == pytest.approx(full_device_library.inlet_reference_velocity_m_per_s)
+
+
+def test_full_device_library_requires_invariant_inlet_reference(full_device_library: VelocityFieldLibrary) -> None:
+    references = [case.inlet_reference_velocity_m_per_s for case in full_device_library.cases]
+    assert np.allclose(references, full_device_library.inlet_reference_velocity_m_per_s, rtol=1.0e-12, atol=1.0e-14)
+
+    cases = list(full_device_library.cases)
+    cases[-1] = replace(cases[-1], inlet_reference_velocity_m_per_s=cases[-1].inlet_reference_velocity_m_per_s * 1.01)
+    with pytest.raises(ValueError, match="inlet reference velocity is not invariant"):
+        VelocityFieldLibrary(full_device_library.root, cases, dict(full_device_library.index))
 
 
 def test_full_device_sampling_succeeds_in_all_major_regions(full_device_library: VelocityFieldLibrary) -> None:
@@ -63,8 +75,29 @@ def test_full_device_sampling_succeeds_in_all_major_regions(full_device_library:
     assert np.isfinite(samples.cfd_u).all()
     assert np.isfinite(samples.cfd_v).all()
     assert np.isfinite(samples.cfd_speed).all()
+    assert np.isfinite(samples.cfd_u_norm).all()
+    assert np.isfinite(samples.cfd_v_norm).all()
+    assert np.isfinite(samples.cfd_speed_norm).all()
     assert np.isfinite(samples.cfd_dir_x).all()
     assert np.isfinite(samples.cfd_dir_y).all()
+
+
+def test_full_device_sampling_exposes_dimensionless_normalized_cfd_components(full_device_library: VelocityFieldLibrary) -> None:
+    geometry = build_full_device_cfd_geometry()
+    point = geometry.centerlines["inlet"].points_um[len(geometry.centerlines["inlet"].points_um) // 2]
+    field = full_device_library.interpolate(0.5000000004936045)
+    samples = field.sample_cfd(point)
+    reference = field.inlet_reference_velocity_m_per_s
+
+    assert reference > 0.0
+    assert samples.inlet_reference_velocity_m_per_s == pytest.approx(reference)
+    assert samples.cfd_u_norm[0] == pytest.approx(samples.u_x_m_per_s[0] / reference)
+    assert samples.cfd_v_norm[0] == pytest.approx(samples.u_y_m_per_s[0] / reference)
+    assert samples.cfd_speed_norm[0] == pytest.approx(samples.speed_m_per_s[0] / reference)
+    assert np.allclose(
+        [samples.cfd_dir_x[0], samples.cfd_dir_y[0]],
+        np.asarray([samples.cfd_u_norm[0], samples.cfd_v_norm[0]]) / samples.cfd_speed_norm[0],
+    )
 
 
 def test_full_device_outside_domain_returns_nan_without_extrapolation(full_device_library: VelocityFieldLibrary) -> None:
@@ -76,6 +109,9 @@ def test_full_device_outside_domain_returns_nan_without_extrapolation(full_devic
     assert np.isnan(samples.cfd_u[0])
     assert np.isnan(samples.cfd_v[0])
     assert np.isnan(samples.cfd_speed[0])
+    assert np.isnan(samples.cfd_u_norm[0])
+    assert np.isnan(samples.cfd_v_norm[0])
+    assert np.isnan(samples.cfd_speed_norm[0])
     assert np.isnan(samples.cfd_dir_x[0])
     assert np.isnan(samples.cfd_dir_y[0])
 

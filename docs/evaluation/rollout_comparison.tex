@@ -1,0 +1,189 @@
+\section{Rollout Model Comparison}
+
+\subsection{Purpose}
+
+The rollout comparison module evaluates whether physics-embedded state improves
+long-horizon droplet trajectory prediction relative to the two previous
+Markovian baselines.  The comparison is intentionally aligned: all models are
+evaluated on the same validation windows, with the same droplet slot ordering
+and the same truth-injection semantics for newly appearing droplets.
+
+\subsection{Models Compared}
+
+The self-contained evaluation bundle lives under \texttt{src/evaluation/}.  It
+contains local copies of the old comparison pipeline, the attention model class,
+geometry-admissibility helpers, centerline/mask data, and the exact checkpoints
+used for evaluation.
+
+\begin{longtable}{@{}lll@{}}
+\toprule
+Label & Input state & Checkpoint \\
+\midrule
+Geometry-naive Markovian & 5 features &
+\texttt{src/evaluation/models/geometry\_naive\_markovian/markovian\_rollout\_transformer\_best.pt} \\
+Geometry-aware Markovian & 5 features &
+\texttt{src/evaluation/models/geometry\_aware\_markovian/geometry\_aware\_markovian\_rollout\_best.pt} \\
+Physics-embedded Markovian & 15 features &
+\texttt{src/evaluation/models/physics\_embedded\_markovian/physics\_markovian\_v1\_best\_checkpoint.pt} \\
+\bottomrule
+\end{longtable}
+
+The two previous baselines consume only:
+
+\[
+(x,y,v_x,v_y,\mathrm{circularity}).
+\]
+
+The physics-embedded model consumes the full 15-feature state described in the
+previous section.  All three models predict only \((v_x,v_y)\).
+
+\subsection{Rollout Semantics}
+
+For each model, predicted velocity is integrated autoregressively:
+
+\[
+\hat{\mathbf{x}}_{k+1}
+=
+\hat{\mathbf{x}}_k
++
+\hat{\mathbf{v}}_k.
+\]
+
+The comparison preserves the original rollout framework:
+
+\begin{itemize}
+  \item identical validation rollout starts for all models;
+  \item identical selected droplet slots for all models;
+  \item truth injection only for newly appearing droplets;
+  \item no future target velocity or position as model input;
+  \item 50-step rollout horizon;
+  \item 1000 bootstrap replicates for confidence intervals.
+\end{itemize}
+
+For old models, the evaluator slices the current canonical state down to the
+first five physical/tracking features.  For the physics model, it passes the
+full 15-feature tensor and uses the same non-target feature refresh rule as the
+physics attention visualizer.
+
+\subsection{Metrics}
+
+The comparison reports:
+
+\begin{itemize}
+  \item per-step position RMSE;
+  \item per-step velocity RMSE;
+  \item integrated position RMSE over the rollout;
+  \item final-step position RMSE;
+  \item tangential and normal error relative to the centerline tangent basis;
+  \item channel footprint outside-fraction and violation rates;
+  \item trajectory-level geometry-violation statistics;
+  \item junction branch-decision outcomes.
+\end{itemize}
+
+Directional decomposition projects position or velocity error onto the local
+centerline basis:
+
+\[
+e_\parallel = \mathbf{e}\cdot\mathbf{t},
+\qquad
+e_\perp = \mathbf{e}\cdot\mathbf{n},
+\]
+
+where \(\mathbf{t}\) is the local tangent and \(\mathbf{n}\) is the local
+normal.  Channel admissibility uses the droplet bounding ellipse and reports
+the fraction of its footprint outside the binary channel mask.
+
+\subsection{Final Results}
+
+The complete comparison used 1174 validation windows and 50 rollout steps.
+Headline position metrics are:
+
+\begin{longtable}{@{}lrrrr@{}}
+\toprule
+Model & Integrated RMSE & 95\% CI low & 95\% CI high & S50 RMSE \\
+\midrule
+Geometry-naive Markovian & 15.683 & 13.844 & 17.266 & 37.082 \\
+Geometry-aware Markovian & 15.958 & 14.168 & 17.646 & 38.179 \\
+Physics-embedded Markovian & 1.540 & 1.449 & 1.628 & 2.401 \\
+\bottomrule
+\end{longtable}
+
+Selected stepwise position RMSE values are:
+
+\begin{longtable}{@{}lrrrrrrr@{}}
+\toprule
+Model & S1 & S5 & S10 & S20 & S30 & S40 & S50 \\
+\midrule
+Geometry-naive Markovian & 0.366 & 1.283 & 3.090 & 9.444 & 18.160 & 27.827 & 37.082 \\
+Geometry-aware Markovian & 0.365 & 1.271 & 2.804 & 9.176 & 18.483 & 28.777 & 38.179 \\
+Physics-embedded Markovian & 0.264 & 0.619 & 0.956 & 1.415 & 1.762 & 2.049 & 2.401 \\
+\bottomrule
+\end{longtable}
+
+Junction branch-decision metrics were:
+
+\begin{longtable}{@{}lrrrr@{}}
+\toprule
+Model & True events & Correct & Wrong branch rate & Noncommitment rate \\
+\midrule
+Geometry-naive Markovian & 4990 & 4513 & 0.08198 & 0.01483 \\
+Geometry-aware Markovian & 4990 & 4557 & 0.07958 & 0.00782 \\
+Physics-embedded Markovian & 4990 & 4949 & 0.00020 & 0.00802 \\
+\bottomrule
+\end{longtable}
+
+Trajectory-level channel-admissibility metrics were:
+
+\begin{longtable}{@{}lrrrr@{}}
+\toprule
+Model & Evaluable trajectories & Violation fraction & Mean first violation step & Persistent violation fraction \\
+\midrule
+Geometry-naive Markovian & 17842 & 0.7226 & 19.90 & 0.3862 \\
+Geometry-aware Markovian & 17842 & 0.6007 & 22.62 & 0.4143 \\
+Physics-embedded Markovian & 17842 & 0.4784 & 24.42 & 0.2687 \\
+\bottomrule
+\end{longtable}
+
+\subsection{Figures}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.78\linewidth]{../src/evaluation/outputs/rollout_model_comparison/position_rmse_vs_rollout_step.png}
+  \caption{Position RMSE over a 50-step rollout for the two previous Markovian baselines and the physics-embedded Markovian model.}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.78\linewidth]{../src/evaluation/outputs/rollout_model_comparison/velocity_rmse_vs_rollout_step.png}
+  \caption{Velocity RMSE over the same aligned validation windows.}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.78\linewidth]{../src/evaluation/outputs/rollout_model_comparison/channel_violation_rate_2pct_vs_rollout_step.png}
+  \caption{Fraction of predicted droplet footprints with more than 2\% of the ellipse outside the channel mask.}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.78\linewidth]{../src/evaluation/outputs/rollout_model_comparison/junction_decision_outcomes.png}
+  \caption{Junction branch-decision outcomes for true junction events.}
+\end{figure}
+
+\subsection{Execution}
+
+The completed local resume command was:
+
+\begin{verbatim}
+python -m src.evaluation.rollout_comparison \
+  --predictions-path src/evaluation/outputs/outputs/rollout_model_comparison/rollout_predictions.npz \
+  --output-dir src/evaluation/outputs/rollout_model_comparison \
+  --cpu
+\end{verbatim}
+
+The clean final output directory is:
+
+\begin{verbatim}
+src/evaluation/outputs/rollout_model_comparison
+\end{verbatim}
+

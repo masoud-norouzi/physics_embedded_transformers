@@ -28,9 +28,11 @@ src/physics/
 \end{verbatim}
 
 The current implementation is deterministic and physics-preparatory. It does
-not train a transformer, optimize temporal lag, fit hydraulic parameters, or
-resolve droplets as moving multiphase CFD objects. It does include a validated
-steady Stokes full-device CFD solve for the continuous phase.
+not optimize temporal lag, fit hydraulic parameters, or resolve droplets as
+moving multiphase CFD objects. It does include a validated steady Stokes
+full-device CFD solve for the continuous phase, a physics-enriched canonical
+training dataset, a physics-embedded Markovian rollout model, and a
+self-contained rollout comparison against the two previous Markovian baselines.
 
 \subsection{Top-Level Layout}
 
@@ -44,9 +46,13 @@ Path & Scientific responsibility \\
 \texttt{src/physics/hydraulics/} & Baseline branch-resistance and superficial-velocity model. \\
 \texttt{src/physics/full\_device\_cfd/} & Full-loop CAD geometry, mesh generation, Stokes solve, and field verification. \\
 \texttt{src/physics/state/} & Placeholder for future unified physics state. \\
+\texttt{src/evaluation/} & Self-contained rollout comparison bundle for baseline and physics-embedded models. \\
+\texttt{src/datasets/} & Canonical dataset builders and window loaders. \\
+\texttt{src/models/} & Transformer model architecture used by the physics Markovian trainer. \\
 \texttt{scripts/geometry/} & Geometry and device-region command-line tools. \\
 \texttt{scripts/occupancy/} & Droplet occupancy command-line tools. \\
 \texttt{scripts/physics/} & Hydraulics and CFD command-line tools. \\
+\texttt{scripts/training/} & Physics Markovian training and attention visualization entry points. \\
 \texttt{scripts/validation/} & Standalone scientific validation analyses. \\
 \bottomrule
 \end{longtable}
