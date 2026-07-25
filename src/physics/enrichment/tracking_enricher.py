@@ -87,6 +87,7 @@ def build_physics_enriched_tracking(config: EnrichmentConfig, overwrite: bool = 
     validate_sampled_fields(enriched)
     direction_alignment = _flow_direction_alignment(enriched)
     inside_by_region = _inside_domain_by_region(enriched)
+    enriched = _drop_deprecated_geometry_columns(enriched)
 
     missing_counts = {
         column: int(enriched[column].isna().sum())
@@ -473,6 +474,10 @@ def _flow_ul_hr_to_velocity_m_s(flow_ul_hr: np.ndarray, channel_width_um: float 
 def _order_columns(original_columns: list[str], table: pd.DataFrame) -> pd.DataFrame:
     added = [column for column in table.columns if column not in original_columns]
     return table[original_columns + added]
+
+
+def _drop_deprecated_geometry_columns(table: pd.DataFrame) -> pd.DataFrame:
+    return table.drop(columns=[column for column in ["circularity"] if column in table.columns])
 
 
 def _sample_cfd_background(enriched: pd.DataFrame, library: VelocityFieldLibrary, convention=None) -> pd.DataFrame:

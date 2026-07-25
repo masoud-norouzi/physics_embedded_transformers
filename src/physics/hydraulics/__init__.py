@@ -5,6 +5,7 @@ from .baseline import (
     compute_effective_branch_lengths_um,
     compute_effective_branch_occupancies,
     compute_frame_baseline_hydraulics,
+    compute_frame_baseline_hydraulics_from_occupancies,
     compute_isolated_droplet_equivalent_length_um,
     flow_rate_ul_hr_to_superficial_velocity_um_s,
 )
@@ -16,6 +17,7 @@ __all__ = [
     "compute_effective_branch_lengths_um",
     "compute_effective_branch_occupancies",
     "compute_frame_baseline_hydraulics",
+    "compute_frame_baseline_hydraulics_from_occupancies",
     "compute_isolated_droplet_equivalent_length_um",
     "flow_rate_ul_hr_to_superficial_velocity_um_s",
 ]

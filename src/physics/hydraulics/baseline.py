@@ -147,6 +147,47 @@ def compute_frame_baseline_hydraulics(
 ) -> dict[str, Any]:
     """Compute one frame of baseline branch hydraulics."""
     n_left_eff, n_right_eff = compute_effective_branch_occupancies(frame_occupancy)
+    return compute_frame_baseline_hydraulics_from_occupancies(
+        n_left_eff,
+        n_right_eff,
+        frame=frame,
+        n_droplets_total=len(frame_occupancy),
+        left_length_um=left_length_um,
+        right_length_um=right_length_um,
+        droplet_equivalent_length_um=droplet_equivalent_length_um,
+        total_mixture_flow_ul_hr=total_mixture_flow_ul_hr,
+        channel_width_um=channel_width_um,
+        channel_height_um=channel_height_um,
+        continuous_flow_ul_hr=continuous_flow_ul_hr,
+        dispersed_flow_ul_hr=dispersed_flow_ul_hr,
+    )
+
+
+def compute_frame_baseline_hydraulics_from_occupancies(
+    left_effective_occupancy: float,
+    right_effective_occupancy: float,
+    *,
+    frame: int,
+    n_droplets_total: int,
+    left_length_um: float,
+    right_length_um: float,
+    droplet_equivalent_length_um: float,
+    total_mixture_flow_ul_hr: float,
+    channel_width_um: float,
+    channel_height_um: float,
+    continuous_flow_ul_hr: float | None = None,
+    dispersed_flow_ul_hr: float | None = None,
+) -> dict[str, Any]:
+    """Compute one frame of baseline branch hydraulics from numeric occupancies.
+
+    This is the runtime-friendly equivalent of
+    :func:`compute_frame_baseline_hydraulics`; the pandas entry point delegates
+    here after summing per-droplet branch occupancies.
+    """
+    if n_droplets_total < 0:
+        raise ValueError("n_droplets_total must be nonnegative")
+    n_left_eff = float(left_effective_occupancy)
+    n_right_eff = float(right_effective_occupancy)
     left_eff, right_eff = compute_effective_branch_lengths_um(
         left_length_um,
         right_length_um,
@@ -167,7 +208,7 @@ def compute_frame_baseline_hydraulics(
         raise ValueError(f"Flow conservation error exceeds tolerance: {conservation_error}")
     return {
         "frame": int(frame),
-        "n_droplets_total": int(len(frame_occupancy)),
+        "n_droplets_total": int(n_droplets_total),
         "n_left_eff": n_left_eff,
         "n_right_eff": n_right_eff,
         "left_base_length_um": float(left_length_um),

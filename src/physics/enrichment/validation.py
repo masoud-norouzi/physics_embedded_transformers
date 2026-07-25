@@ -58,9 +58,20 @@ def validate_row_preservation(original: pd.DataFrame, enriched: pd.DataFrame) ->
     for key in ("frame", "track_id"):
         if key in original.columns and not original[key].equals(enriched[key]):
             raise ValueError(f"{key} values changed during enrichment")
+    for key in ("bbox_w", "bbox_h"):
+        if key in enriched.columns:
+            values = enriched[key].to_numpy(float)
+            if not np.isfinite(values).all() or np.any(values <= 0):
+                raise ValueError(f"{key} must be finite positive source-pixel dimensions")
 
 
 def validate_sampled_fields(enriched: pd.DataFrame, alpha_tolerance: float = 1.0e-12) -> None:
+    missing_bbox = [column for column in ("bbox_w", "bbox_h") if column not in enriched.columns]
+    if missing_bbox:
+        raise ValueError(f"Enriched output is missing bounding-box dimensions: {missing_bbox}")
+    bbox = enriched[["bbox_w", "bbox_h"]].to_numpy(float)
+    if len(bbox) and (not np.isfinite(bbox).all() or np.any(bbox <= 0)):
+        raise ValueError("bbox_w and bbox_h must be finite positive source-pixel dimensions")
     if "cfd_valid" in enriched.columns and not enriched["cfd_valid"].equals(enriched["inside_cfd_domain"]):
         raise ValueError("cfd_valid and inside_cfd_domain must match")
     if "superficial_velocity" not in enriched.columns:

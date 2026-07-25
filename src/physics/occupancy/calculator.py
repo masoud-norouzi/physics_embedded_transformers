@@ -62,6 +62,18 @@ def calculate_ellipse_occupancy(
     if not 0 <= minimum_physical_coverage <= 1:
         raise ValueError("minimum_physical_coverage must be in [0, 1]")
     raster = rasterize_bbox_ellipse(center_x, center_y, bbox_width, bbox_height, labels.shape)
+    return calculate_raster_occupancy(labels, raster, minimum_physical_coverage)
+
+
+def calculate_raster_occupancy(
+    region_labels: np.ndarray,
+    raster,
+    minimum_physical_coverage: float = 0.95,
+) -> dict[str, Any]:
+    """Calculate raw and normalized physical-region occupancy for one ellipse raster."""
+    labels = validate_label_map(region_labels)
+    if not 0 <= minimum_physical_coverage <= 1:
+        raise ValueError("minimum_physical_coverage must be in [0, 1]")
     local_labels = labels[raster.y0 : raster.y1, raster.x0 : raster.x1][raster.mask]
     total = int(local_labels.size)
     if total == 0:

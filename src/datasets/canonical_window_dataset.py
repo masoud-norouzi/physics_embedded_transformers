@@ -141,7 +141,7 @@ class CanonicalWindowDataset(Dataset):
 
     def _feature_indices(self, feature_names):
         feature_indices = {name: index for index, name in enumerate(feature_names)}
-        for required_name in ["x", "y", "vx", "vy", "circularity"]:
+        for required_name in ["x", "y", "vx", "vy"]:
             if required_name not in feature_indices:
                 raise KeyError(f"Missing required feature: {required_name}")
         for target_name in self.target_features:

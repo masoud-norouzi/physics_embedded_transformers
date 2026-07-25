@@ -14,7 +14,8 @@ CANONICAL_V2_FEATURE_NAMES = [
     "y",
     "vx",
     "vy",
-    "circularity",
+    "bbox_w",
+    "bbox_h",
     "cfd_u_norm",
     "cfd_v_norm",
     "superficial_velocity",
@@ -244,7 +245,8 @@ class CanonicalDatasetV2Builder(CanonicalDatasetBuilder):
             "track_id",
             "x",
             "y",
-            "circularity",
+            "bbox_w",
+            "bbox_h",
             "cfd_u_norm",
             "cfd_v_norm",
             "superficial_velocity",
@@ -256,9 +258,11 @@ class CanonicalDatasetV2Builder(CanonicalDatasetBuilder):
         if missing:
             raise KeyError(f"Physics-enriched input is missing required columns: {missing}")
         before = len(tracks)
-        finite_required = ["frame", "track_id", "x", "y", "circularity", "superficial_velocity", "left_flow_fraction", *OCCUPANCY_COLUMNS.values()]
+        finite_required = ["frame", "track_id", "x", "y", "bbox_w", "bbox_h", "superficial_velocity", "left_flow_fraction", *OCCUPANCY_COLUMNS.values()]
         tracks = tracks[np.isfinite(tracks[finite_required].to_numpy(float)).all(axis=1)].copy()
         dropped_rows = before - len(tracks)
+        if (tracks["bbox_w"] <= 0).any() or (tracks["bbox_h"] <= 0).any():
+            raise ValueError("bbox_w and bbox_h must be strictly positive pixel dimensions")
         tracks["cfd_valid"] = tracks["cfd_valid"].astype(float)
         self._validate_occupancy(tracks)
         columns = [
@@ -266,7 +270,8 @@ class CanonicalDatasetV2Builder(CanonicalDatasetBuilder):
             "track_id",
             "x",
             "y",
-            "circularity",
+            "bbox_w",
+            "bbox_h",
             "cfd_u_norm",
             "cfd_v_norm",
             "superficial_velocity",
@@ -334,6 +339,7 @@ class CanonicalDatasetV2Builder(CanonicalDatasetBuilder):
                     "occupancy": "six regional occupancy fractions are already normalized per droplet and verified to sum to 1",
                     "numeric_state": "no feature standardization is applied by the canonical builder",
                     "velocity": "vx/vy are frame-to-frame first differences in image-pixel coordinates converted to mm/s using device calibration and experiment frame rate",
+                    "bbox": "bbox_w/bbox_h are retained in source pixel units without conversion",
                     "cfd": "cfd_u_norm/cfd_v_norm are dimensionless CFD velocity components normalized by the library inlet-centerline reference velocity",
                 },
                 "invalid_cfd_handling": {

@@ -34,9 +34,9 @@ def test_cuda_auto_selection_without_requiring_cuda(monkeypatch) -> None:
     assert info["gpu_name"] == "Mock CUDA GPU"
 
 
-def test_model_accepts_15_dimensional_markovian_state() -> None:
-    model = _small_model(input_dim=15, horizon=1, max_droplets=4)
-    history_x = torch.randn(2, 1, 4, 15)
+def test_model_accepts_16_dimensional_markovian_state() -> None:
+    model = _small_model(input_dim=16, horizon=1, max_droplets=4)
+    history_x = torch.randn(2, 1, 4, 16)
     history_mask = torch.ones(2, 1, 4, dtype=torch.bool)
     output = model(history_x, history_mask)
     assert output.shape == (2, 4, 2)
@@ -46,7 +46,7 @@ def test_batch_unpacking_and_cfd_loss_mask_from_loader(tmp_path: Path) -> None:
     npz = _write_npz(tmp_path / "v2.npz", V2_FEATURES)
     dataset = CanonicalWindowDataset(npz, start_frames=[0], T_history=1, T_future=3, max_droplets=4)
     batch = next(iter(DataLoader(dataset, batch_size=1)))
-    assert batch["history_x"].shape == (1, 1, 4, 15)
+    assert batch["history_x"].shape == (1, 1, 4, 16)
     assert batch["cfd_loss_mask"].shape == (1, 3, 4)
     assert batch["future_mask"][0, 1, 0].item() is True
     assert batch["cfd_loss_mask"][0, 1, 0].item() is True
@@ -56,8 +56,8 @@ def test_cfd_loss_mask_controls_supervised_loss(tmp_path: Path) -> None:
     npz = _write_npz(tmp_path / "v2.npz", V2_FEATURES)
     dataset = CanonicalWindowDataset(npz, start_frames=[0], T_history=1, T_future=3, max_droplets=4)
     batch = trainer.move_batch_to_device(next(iter(DataLoader(dataset, batch_size=1))), torch.device("cpu"))
-    model = _small_model(input_dim=15, horizon=1, max_droplets=4)
-    stats = _identity_stats(15)
+    model = _small_model(input_dim=16, horizon=1, max_droplets=4)
+    stats = _identity_stats(16)
     weights = trainer.rollout_weights(3, 2.0, torch.device("cpu"))
     rollout = trainer.boundary_conditioned_rollout(model, batch, dataset, stats, weights)
     assert rollout["mask"][0, 1, 0].item() is True
@@ -82,13 +82,13 @@ def test_no_valid_cfd_targets_do_not_produce_nan() -> None:
 
 
 def test_checkpoint_save_load_with_map_location(tmp_path: Path) -> None:
-    model = _small_model(input_dim=15, horizon=1, max_droplets=4)
+    model = _small_model(input_dim=16, horizon=1, max_droplets=4)
     optimizer = AdamW(model.parameters(), lr=1e-4)
     checkpoint = {
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "model_config": {
-            "input_dim": 15,
+            "input_dim": 16,
             "target_dim": 2,
             "T_history": 1,
             "max_droplets": 4,
@@ -111,9 +111,9 @@ def test_one_optimization_step_and_short_rollout(tmp_path: Path) -> None:
     npz = _write_npz(tmp_path / "v2.npz", V2_FEATURES)
     dataset = CanonicalWindowDataset(npz, start_frames=[0], T_history=1, T_future=3, max_droplets=4)
     loader = DataLoader(dataset, batch_size=1)
-    model = _small_model(input_dim=15, horizon=1, max_droplets=4)
+    model = _small_model(input_dim=16, horizon=1, max_droplets=4)
     optimizer = AdamW(model.parameters(), lr=1e-4)
-    stats = _identity_stats(15)
+    stats = _identity_stats(16)
     weights = trainer.rollout_weights(3, 2.0, torch.device("cpu"))
     summary = trainer.train_one_epoch(
         model,
@@ -175,7 +175,11 @@ def _write_npz(path: Path, feature_names: list[str]) -> Path:
             Z[track, frame, idx["y"]] = 2 * frame + track
             Z[track, frame, idx["vx"]] = 1.0
             Z[track, frame, idx["vy"]] = 2.0
-            Z[track, frame, idx["circularity"]] = 0.9
+            if "circularity" in idx:
+                Z[track, frame, idx["circularity"]] = 0.9
+            if "bbox_w" in idx:
+                Z[track, frame, idx["bbox_w"]] = 20.0
+                Z[track, frame, idx["bbox_h"]] = 12.0
             if "cfd_u_norm" in idx:
                 Z[track, frame, idx["cfd_u_norm"]] = 0.1
                 Z[track, frame, idx["cfd_v_norm"]] = 0.2

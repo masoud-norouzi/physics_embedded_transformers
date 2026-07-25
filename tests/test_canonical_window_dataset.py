@@ -16,7 +16,8 @@ V2_FEATURES = [
     "y",
     "vx",
     "vy",
-    "circularity",
+    "bbox_w",
+    "bbox_h",
     "cfd_u_norm",
     "cfd_v_norm",
     "superficial_velocity",
@@ -50,7 +51,7 @@ def test_v2_loader_keeps_previous_window_counts_splits_and_indexing(tmp_path: Pa
 
     sample = train[0]
     assert int(sample["frame_start"]) == 0
-    assert sample["history_x"].shape == (2, 3, 15)
+    assert sample["history_x"].shape == (2, 3, 16)
     assert sample["future_y"].shape == (2, 3, 2)
     assert sample["history_mask"].shape == (2, 3)
     assert sample["future_mask"].shape == (2, 3)
@@ -135,7 +136,7 @@ def test_rollout_compatible_batch_contract_only_adds_cfd_mask(tmp_path: Path) ->
     )
     sample = dataset[0]
 
-    assert sample["history_x"].shape == (3, 2, 15)
+    assert sample["history_x"].shape == (3, 2, 16)
     assert sample["future_y"].shape == (1, 2, 2)
     assert np.asarray(sample["droplet_ids"]).tolist() == [101, 202]
     assert sample["cfd_loss_mask"].shape == sample["future_mask"].shape
@@ -162,7 +163,11 @@ def _write_npz(path: Path, feature_names: list[str]) -> Path:
             Z[track_index, frame, features["y"]] = 20 * track_index + frame
             Z[track_index, frame, features["vx"]] = 1.0 + track_index
             Z[track_index, frame, features["vy"]] = -1.0 - track_index
-            Z[track_index, frame, features["circularity"]] = 0.8
+            if "circularity" in features:
+                Z[track_index, frame, features["circularity"]] = 0.8
+            if "bbox_w" in features:
+                Z[track_index, frame, features["bbox_w"]] = 20.0 + track_index
+                Z[track_index, frame, features["bbox_h"]] = 10.0 + track_index
 
             if "cfd_u_norm" in features:
                 Z[track_index, frame, features["cfd_u_norm"]] = 0.1 * frame

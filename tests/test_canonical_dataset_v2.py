@@ -52,7 +52,10 @@ def test_v2_feature_alignment_and_invalid_cfd_neutralization(tmp_path: Path) -> 
 
     row = Z[track_index[2], frame_index[2]]
     assert "cfd_valid" not in idx
+    assert "circularity" not in idx
     assert "cfd_valid_mask" not in data.files
+    assert row[idx["bbox_w"]] == pytest.approx(24.0)
+    assert row[idx["bbox_h"]] == pytest.approx(13.0)
     assert row[idx["cfd_u_norm"]] == pytest.approx(2.1)
     assert row[idx["cfd_v_norm"]] == pytest.approx(0.2)
 
@@ -97,7 +100,7 @@ def test_v2_output_shapes_match_previous_builder_contract(tmp_path: Path) -> Non
     assert v2["frames"].shape == v1["frames"].shape == (4,)
     assert summary["num_tracks"] == 2
     assert summary["num_frames"] == 4
-    assert summary["feature_count"] == 15
+    assert summary["feature_count"] == 16
 
 
 def test_v2_velocity_conversion_uses_mm_per_second(tmp_path: Path) -> None:
@@ -158,12 +161,12 @@ def test_builder_recomputes_velocity_from_positions_not_existing_vx_vy(tmp_path:
 
 def _write_synthetic_inputs(tmp_path: Path) -> tuple[Path, Path, Path]:
     rows = [
-        {"frame": 0, "track_id": 1, "centroid_x": 10.0, "centroid_y": 50.0, "circularity": 0.91, "cfd_u_norm": 1.0, "cfd_v_norm": 0.1, "superficial_velocity": 56.944444, "cfd_valid": True, "left_flow_fraction": 0.50},
-        {"frame": 1, "track_id": 1, "centroid_x": 11.0, "centroid_y": 51.0, "circularity": 0.92, "cfd_u_norm": 1.1, "cfd_v_norm": 0.1, "superficial_velocity": 56.944444, "cfd_valid": True, "left_flow_fraction": 0.51},
-        {"frame": 3, "track_id": 1, "centroid_x": 13.0, "centroid_y": 53.0, "circularity": 0.94, "cfd_u_norm": 1.3, "cfd_v_norm": 0.1, "superficial_velocity": 56.944444, "cfd_valid": True, "left_flow_fraction": 0.53},
-        {"frame": 1, "track_id": 2, "centroid_x": 20.0, "centroid_y": 70.0, "circularity": 0.81, "cfd_u_norm": 2.0, "cfd_v_norm": 0.2, "superficial_velocity": 56.944444, "cfd_valid": True, "left_flow_fraction": 0.51},
-        {"frame": 2, "track_id": 2, "centroid_x": 21.0, "centroid_y": 71.0, "circularity": 0.82, "cfd_u_norm": 2.1, "cfd_v_norm": 0.2, "superficial_velocity": 56.944444, "cfd_valid": True, "left_flow_fraction": 0.52},
-        {"frame": 3, "track_id": 2, "centroid_x": 22.0, "centroid_y": 72.0, "circularity": 0.83, "cfd_u_norm": 2.2, "cfd_v_norm": 0.2, "superficial_velocity": 56.944444, "cfd_valid": True, "left_flow_fraction": 0.53},
+        {"frame": 0, "track_id": 1, "centroid_x": 10.0, "centroid_y": 50.0, "bbox_w": 20, "bbox_h": 10, "circularity": 0.91, "cfd_u_norm": 1.0, "cfd_v_norm": 0.1, "superficial_velocity": 56.944444, "cfd_valid": True, "left_flow_fraction": 0.50},
+        {"frame": 1, "track_id": 1, "centroid_x": 11.0, "centroid_y": 51.0, "bbox_w": 21, "bbox_h": 11, "circularity": 0.92, "cfd_u_norm": 1.1, "cfd_v_norm": 0.1, "superficial_velocity": 56.944444, "cfd_valid": True, "left_flow_fraction": 0.51},
+        {"frame": 3, "track_id": 1, "centroid_x": 13.0, "centroid_y": 53.0, "bbox_w": 23, "bbox_h": 13, "circularity": 0.94, "cfd_u_norm": 1.3, "cfd_v_norm": 0.1, "superficial_velocity": 56.944444, "cfd_valid": True, "left_flow_fraction": 0.53},
+        {"frame": 1, "track_id": 2, "centroid_x": 20.0, "centroid_y": 70.0, "bbox_w": 22, "bbox_h": 12, "circularity": 0.81, "cfd_u_norm": 2.0, "cfd_v_norm": 0.2, "superficial_velocity": 56.944444, "cfd_valid": True, "left_flow_fraction": 0.51},
+        {"frame": 2, "track_id": 2, "centroid_x": 21.0, "centroid_y": 71.0, "bbox_w": 24, "bbox_h": 13, "circularity": 0.82, "cfd_u_norm": 2.1, "cfd_v_norm": 0.2, "superficial_velocity": 56.944444, "cfd_valid": True, "left_flow_fraction": 0.52},
+        {"frame": 3, "track_id": 2, "centroid_x": 22.0, "centroid_y": 72.0, "bbox_w": 26, "bbox_h": 14, "circularity": 0.83, "cfd_u_norm": 2.2, "cfd_v_norm": 0.2, "superficial_velocity": 56.944444, "cfd_valid": True, "left_flow_fraction": 0.53},
     ]
     enriched = pd.DataFrame(rows)
     v2_csv = tmp_path / "physics_enriched_tracked_features.csv"

@@ -104,6 +104,9 @@ def test_build_enriched_tracking_preserves_inputs_and_is_deterministic(tmp_path:
             "track_id": [1, 1, 2],
             "centroid_x": [1.0, 2.0, -1.0],
             "centroid_y": [0.0, 0.0, 6.0],
+            "bbox_w": [20, 21, 22],
+            "bbox_h": [10, 11, 12],
+            "circularity": [0.8, 0.81, 0.82],
             "label": [1, 1, 2],
         }
     )
@@ -175,7 +178,9 @@ def test_build_enriched_tracking_preserves_inputs_and_is_deterministic(tmp_path:
 
     assert tracking_path.read_bytes() == before_bytes
     assert len(first) == len(tracking) - 1
-    assert list(first.columns[: len(tracking.columns)]) == list(tracking.columns)
+    assert "circularity" not in first.columns
+    assert "bbox_w" in first.columns
+    assert "bbox_h" in first.columns
     pd.testing.assert_frame_equal(first, second)
     assert first_summary.row_count == second_summary.row_count == 2
     assert first_summary.column_count == second_summary.column_count
@@ -185,6 +190,8 @@ def test_build_enriched_tracking_preserves_inputs_and_is_deterministic(tmp_path:
     assert not first[["frame", "track_id"]].duplicated().any()
     assert first["superficial_velocity"].nunique() == 1
     assert first["superficial_velocity"].iloc[0] == pytest.approx(56.94444444444444)
+    assert first["bbox_w"].tolist() == [20, 21]
+    assert first["bbox_h"].tolist() == [10, 11]
     assert first["cfd_valid"].all()
     assert first["cfd_valid"].equals(first["inside_cfd_domain"])
     assert first.loc[~first["inside_cfd_domain"], "background_speed_m_per_s"].isna().all()
