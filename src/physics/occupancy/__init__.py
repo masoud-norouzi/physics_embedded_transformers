@@ -5,6 +5,7 @@ from .calculator import (
     REGION_COLUMNS,
     calculate_dataset_occupancy,
     calculate_ellipse_occupancy,
+    calculate_raster_occupancy,
     summarize_occupancy,
 )
 from .ellipse import EllipseRaster, rasterize_bbox_ellipse
@@ -17,6 +18,7 @@ __all__ = [
     "REGION_COLUMNS",
     "calculate_dataset_occupancy",
     "calculate_ellipse_occupancy",
+    "calculate_raster_occupancy",
     "rasterize_bbox_ellipse",
     "summarize_occupancy",
 ]
