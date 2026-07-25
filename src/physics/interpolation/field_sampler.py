@@ -214,7 +214,9 @@ def _finite_interpolation_support(
 
 
 def velocity_basis(nodes_um: np.ndarray, elements: np.ndarray) -> Basis:
-    skmesh = MeshTri(np.asarray(nodes_um, dtype=float).T * UM_TO_M, np.asarray(elements, dtype=np.int64).T)
+    nodes_m = np.ascontiguousarray(np.asarray(nodes_um, dtype=float).T * UM_TO_M)
+    element_indices = np.ascontiguousarray(np.asarray(elements, dtype=np.int64).T)
+    skmesh = MeshTri(nodes_m, element_indices)
     return Basis(skmesh, ElementVector(ElementTriP2()), intorder=4)
 
 
