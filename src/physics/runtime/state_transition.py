@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +51,22 @@ _OCCUPANCY_FEATURES = tuple(_OCCUPANCY_FEATURE_TO_RAW)
 
 
 @dataclass(frozen=True)
+class PhysicsRuntimeDiagnostics:
+    """Mutable counters for passive closed-loop physics consistency monitoring."""
+
+    counters: dict[str, int] = field(default_factory=dict)
+
+    def increment(self, name: str, amount: int = 1) -> None:
+        self.counters[name] = int(self.counters.get(name, 0)) + int(amount)
+
+    def reset(self) -> None:
+        self.counters.clear()
+
+    def snapshot(self) -> dict[str, int]:
+        return dict(self.counters)
+
+
+@dataclass(frozen=True)
 class PhysicsRuntimeContext:
     """Dependencies required for deterministic closed-loop physics updates."""
 
@@ -62,6 +78,7 @@ class PhysicsRuntimeContext:
     coordinate_convention: CoordinateConvention
     superficial_velocity_mm_s: float
     minimum_physical_coverage: float = 0.95
+    diagnostics: PhysicsRuntimeDiagnostics = field(default_factory=PhysicsRuntimeDiagnostics)
 
     @property
     def feature_index(self) -> dict[str, int]:
@@ -113,6 +130,8 @@ def step(
     state = _state_matrix(current_state, context)
     prediction = _prediction_matrix(model_prediction, len(state))
     active = infer_active_mask(state, context) if active_mask is None else _mask(active_mask, len(state))
+    _increment_diagnostic(context, "runtime_calls")
+    _increment_diagnostic(context, "active_droplet_updates", int(np.count_nonzero(active)))
 
     updated = state.copy()
     update_positions(updated, prediction, context, active)
@@ -165,12 +184,14 @@ def construct_ellipses(
                 context.region_labels.shape,
             )
         except ValueError as exc:
-            recoverable = (
-                "does not intersect the image" in str(exc)
-                or "contains zero raster pixels" in str(exc)
-            )
+            message = str(exc)
+            recoverable = "does not intersect the image" in message or "contains zero raster pixels" in message
             if not recoverable:
                 raise
+            if "does not intersect the image" in message:
+                _increment_diagnostic(context, "ellipse_outside_image")
+            elif "contains zero raster pixels" in message:
+                _increment_diagnostic(context, "ellipse_zero_raster_pixels")
     return ellipses
 
 
@@ -191,6 +212,7 @@ def compute_occupancy(
             context.minimum_physical_coverage,
         )
         if not bool(result["occupancy_computable"]):
+            _increment_diagnostic(context, "occupancy_not_computable")
             continue
         occupancy[row] = [float(result[raw_name]) for raw_name in _OCCUPANCY_FEATURE_TO_RAW.values()]
     return occupancy
@@ -239,13 +261,27 @@ def sample_cfd(
         return {"cfd_u_norm": cfd_u, "cfd_v_norm": cfd_v}
 
     split_min, split_max = context.cfd_split_bounds
+    if left_flow_fraction < split_min:
+        _increment_diagnostic(context, "cfd_split_clamped_low")
+    elif left_flow_fraction > split_max:
+        _increment_diagnostic(context, "cfd_split_clamped_high")
     sample_split = float(np.clip(left_flow_fraction, split_min, split_max))
     idx = context.feature_index
     points_px = state[active_mask][:, [idx["x"], idx["y"]]]
     points_um = _image_points_to_library_frame(points_px, context)
     samples = context.cfd_library.interpolate(sample_split).sample_cfd(points_um)
+    original_valid = getattr(samples, "original_valid", np.ones(len(points_um), dtype=bool))
+    projection_distance = getattr(samples, "projection_distance_um", np.zeros(len(points_um), dtype=float))
+    projected = np.asarray(projection_distance, dtype=float) > 0.0
+    _increment_diagnostic(context, "cfd_query_projected", int(np.count_nonzero(~np.asarray(original_valid, dtype=bool))))
+    _increment_diagnostic(
+        context,
+        "cfd_fem_retry_projected",
+        int(np.count_nonzero(np.asarray(original_valid, dtype=bool) & projected)),
+    )
     finite = np.isfinite(samples.cfd_u_norm) & np.isfinite(samples.cfd_v_norm)
     if not np.all(finite):
+        _increment_diagnostic(context, "cfd_nonfinite_after_retry", int(np.count_nonzero(~finite)))
         raise ValueError("CFD sampling returned non-finite normalized velocity for an active droplet")
     active_rows = np.flatnonzero(active_mask)
     cfd_u[active_rows] = samples.cfd_u_norm
@@ -379,3 +415,9 @@ def _validate_next_state(state: np.ndarray, context: PhysicsRuntimeContext, acti
     split = state[active_mask, idx["left_flow_fraction"]]
     if np.any((split < -1e-12) | (split > 1.0 + 1e-12)):
         raise ValueError("left_flow_fraction must remain in [0, 1]")
+
+
+def _increment_diagnostic(context: PhysicsRuntimeContext, name: str, amount: int = 1) -> None:
+    diagnostics = getattr(context, "diagnostics", None)
+    if diagnostics is not None and amount:
+        diagnostics.increment(name, amount)

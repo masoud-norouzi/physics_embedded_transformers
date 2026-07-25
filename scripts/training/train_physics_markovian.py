@@ -429,6 +429,7 @@ def train_one_epoch(
     total_present = 0
     num_batches = 0
     total_batches = len(loader) if max_batches is None else min(len(loader), max_batches)
+    reset_runtime_diagnostics(runtime_context)
     for batch in loader:
         batch = move_batch_to_device(batch, device)
         optimizer.zero_grad(set_to_none=True)
@@ -458,6 +459,7 @@ def train_one_epoch(
         "supervised_samples": float(total_supervised),
         "present_samples": float(total_present),
         "cfd_valid_target_fraction": total_supervised / max(total_present, 1),
+        "physics_runtime_diagnostics": snapshot_runtime_diagnostics(runtime_context),
     }
 
 
@@ -479,6 +481,7 @@ def evaluate(
     num_batches = 0
     total_batches = len(loader) if max_batches is None else min(len(loader), max_batches)
     accumulators = create_accumulators(int(weights.numel()))
+    reset_runtime_diagnostics(runtime_context)
 
     with torch.no_grad():
         for batch in loader:
@@ -510,6 +513,7 @@ def evaluate(
         metrics_from_accumulator(accumulator)["rmse_position"]
         for accumulator in accumulators["steps"]
     ]
+    summary["physics_runtime_diagnostics"] = snapshot_runtime_diagnostics(runtime_context)
     return summary
 
 
@@ -824,6 +828,41 @@ def print_epoch_summary(epoch, train_summary, val_summary):
         f"val_rmse_position={val_summary['rmse_position']:.6f}"
     )
     print(f"  stepwise_val_rmse_position {step_text}")
+    print_runtime_diagnostics("train", train_summary.get("physics_runtime_diagnostics", {}))
+    print_runtime_diagnostics("val", val_summary.get("physics_runtime_diagnostics", {}))
+
+
+def print_runtime_diagnostics(label: str, diagnostics: dict[str, int]) -> None:
+    if not diagnostics:
+        return
+    runtime_calls = max(int(diagnostics.get("runtime_calls", 0)), 1)
+    active_updates = max(int(diagnostics.get("active_droplet_updates", 0)), 1)
+    split_clamps = int(diagnostics.get("cfd_split_clamped_low", 0)) + int(diagnostics.get("cfd_split_clamped_high", 0))
+    ellipse_events = int(diagnostics.get("ellipse_outside_image", 0)) + int(diagnostics.get("ellipse_zero_raster_pixels", 0))
+    cfd_projections = int(diagnostics.get("cfd_query_projected", 0)) + int(diagnostics.get("cfd_fem_retry_projected", 0))
+    parts = [
+        f"runtime_calls={diagnostics.get('runtime_calls', 0)}",
+        f"active_updates={diagnostics.get('active_droplet_updates', 0)}",
+        f"split_clamps={split_clamps} ({split_clamps / runtime_calls:.3g}/step)",
+        f"ellipse_fallbacks={ellipse_events} ({ellipse_events / active_updates:.3g}/droplet)",
+        f"occupancy_not_computable={diagnostics.get('occupancy_not_computable', 0)}",
+        f"cfd_projections={cfd_projections} ({cfd_projections / active_updates:.3g}/droplet)",
+        f"cfd_nonfinite_after_retry={diagnostics.get('cfd_nonfinite_after_retry', 0)}",
+    ]
+    print(f"  {label}_physics_runtime_diagnostics " + " ".join(parts))
+
+
+def reset_runtime_diagnostics(runtime_context) -> None:
+    diagnostics = getattr(runtime_context, "diagnostics", None)
+    if diagnostics is not None:
+        diagnostics.reset()
+
+
+def snapshot_runtime_diagnostics(runtime_context) -> dict[str, int]:
+    diagnostics = getattr(runtime_context, "diagnostics", None)
+    if diagnostics is None:
+        return {}
+    return diagnostics.snapshot()
 
 
 def initialize_curves_csv(path):

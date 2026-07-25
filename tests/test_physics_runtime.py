@@ -9,6 +9,7 @@ from src.physics.runtime import (
     CANONICAL_RUNTIME_FEATURE_NAMES,
     MODEL_PREDICTION_FEATURE_NAMES,
     PhysicsRuntimeContext,
+    PhysicsRuntimeDiagnostics,
     compute_occupancy,
     construct_ellipses,
     sample_cfd,
@@ -27,6 +28,8 @@ class _FakeField:
         return SimpleNamespace(
             cfd_u_norm=np.full(len(points), self.left_fraction),
             cfd_v_norm=np.full(len(points), -self.left_fraction),
+            original_valid=np.ones(len(points), dtype=bool),
+            projection_distance_um=np.zeros(len(points), dtype=float),
         )
 
 
@@ -124,6 +127,7 @@ def test_out_of_image_predicted_ellipse_has_zero_occupancy_instead_of_crashing()
     occupancy = compute_occupancy(ellipses, context, active)
     assert ellipses[0] is None
     assert occupancy[0].sum() == pytest.approx(0.0)
+    assert context.diagnostics.snapshot()["ellipse_outside_image"] == 1
 
 
 def test_zero_pixel_predicted_ellipse_has_zero_occupancy_instead_of_crashing() -> None:
@@ -139,6 +143,7 @@ def test_zero_pixel_predicted_ellipse_has_zero_occupancy_instead_of_crashing() -
     occupancy = compute_occupancy(ellipses, context, active)
     assert ellipses[0] is None
     assert occupancy[0].sum() == pytest.approx(0.0)
+    assert context.diagnostics.snapshot()["ellipse_zero_raster_pixels"] == 1
 
 
 def test_update_hydraulics_recomputes_flow_split_from_occupancy() -> None:
@@ -171,6 +176,16 @@ def test_sample_cfd_clamps_lookup_split_to_library_bounds_without_changing_hydra
     assert context.cfd_library.requested == [pytest.approx(0.0)]
     assert sampled["cfd_u_norm"][0] == pytest.approx(0.0)
     assert sampled["cfd_v_norm"][0] == pytest.approx(0.0)
+    assert context.diagnostics.snapshot()["cfd_split_clamped_low"] == 1
+
+
+def test_runtime_diagnostics_reset_and_snapshot() -> None:
+    diagnostics = PhysicsRuntimeDiagnostics()
+    diagnostics.increment("example")
+    diagnostics.increment("example", 2)
+    assert diagnostics.snapshot() == {"example": 3}
+    diagnostics.reset()
+    assert diagnostics.snapshot() == {}
 
 
 def test_step_executes_full_prediction_to_next_state_pipeline() -> None:
@@ -188,6 +203,9 @@ def test_step_executes_full_prediction_to_next_state_pipeline() -> None:
     assert next_state[0, idx["cfd_u_norm"]] == pytest.approx(expected_split)
     assert next_state[0, idx["cfd_v_norm"]] == pytest.approx(-expected_split)
     assert next_state[1].sum() == pytest.approx(0.0)
+    diagnostics = context.diagnostics.snapshot()
+    assert diagnostics["runtime_calls"] == 1
+    assert diagnostics["active_droplet_updates"] == 1
 
 
 def test_step_is_functionally_pure_and_does_not_mutate_inputs() -> None:
