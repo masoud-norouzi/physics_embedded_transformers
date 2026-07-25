@@ -126,6 +126,21 @@ def test_out_of_image_predicted_ellipse_has_zero_occupancy_instead_of_crashing()
     assert occupancy[0].sum() == pytest.approx(0.0)
 
 
+def test_zero_pixel_predicted_ellipse_has_zero_occupancy_instead_of_crashing() -> None:
+    context = _context()
+    state = _state(context)
+    idx = context.feature_index
+    state[0, idx["x"]] = 20.5
+    state[0, idx["y"]] = 20.5
+    state[0, idx["bbox_w"]] = 1.0e-6
+    state[0, idx["bbox_h"]] = 1.0e-6
+    active = np.array([True, False])
+    ellipses = construct_ellipses(state, context, active)
+    occupancy = compute_occupancy(ellipses, context, active)
+    assert ellipses[0] is None
+    assert occupancy[0].sum() == pytest.approx(0.0)
+
+
 def test_update_hydraulics_recomputes_flow_split_from_occupancy() -> None:
     context = _context()
     occupancy = np.zeros((2, 6), dtype=float)

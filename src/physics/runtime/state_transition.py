@@ -165,7 +165,11 @@ def construct_ellipses(
                 context.region_labels.shape,
             )
         except ValueError as exc:
-            if "does not intersect the image" not in str(exc):
+            recoverable = (
+                "does not intersect the image" in str(exc)
+                or "contains zero raster pixels" in str(exc)
+            )
+            if not recoverable:
                 raise
     return ellipses
 
