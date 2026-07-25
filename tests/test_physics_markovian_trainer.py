@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -35,11 +36,11 @@ def test_cuda_auto_selection_without_requiring_cuda(monkeypatch) -> None:
 
 
 def test_model_accepts_16_dimensional_markovian_state() -> None:
-    model = _small_model(input_dim=16, horizon=1, max_droplets=4)
+    model = _small_model(input_dim=16, horizon=1, max_droplets=4, target_dim=4)
     history_x = torch.randn(2, 1, 4, 16)
     history_mask = torch.ones(2, 1, 4, dtype=torch.bool)
     output = model(history_x, history_mask)
-    assert output.shape == (2, 4, 2)
+    assert output.shape == (2, 4, 4)
 
 
 def test_batch_unpacking_and_cfd_loss_mask_from_loader(tmp_path: Path) -> None:
@@ -82,14 +83,14 @@ def test_no_valid_cfd_targets_do_not_produce_nan() -> None:
 
 
 def test_checkpoint_save_load_with_map_location(tmp_path: Path) -> None:
-    model = _small_model(input_dim=16, horizon=1, max_droplets=4)
+    model = _small_model(input_dim=16, horizon=1, max_droplets=4, target_dim=4)
     optimizer = AdamW(model.parameters(), lr=1e-4)
     checkpoint = {
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "model_config": {
             "input_dim": 16,
-            "target_dim": 2,
+            "target_dim": 4,
             "T_history": 1,
             "max_droplets": 4,
             "d_model": 16,
@@ -138,10 +139,111 @@ def test_original_5_feature_dataset_remains_practical(tmp_path: Path) -> None:
     assert torch.equal(batch["cfd_loss_mask"], batch["future_mask"])
 
 
-def _small_model(input_dim: int, horizon: int, max_droplets: int) -> CanonicalRolloutTransformer:
+def test_closed_loop_runtime_is_called_for_every_predicted_step(tmp_path: Path, monkeypatch) -> None:
+    dataset, batch = _v2_four_target_batch(tmp_path)
+    model = _ConstantPredictionModel([1.0, 2.0, 21.0, 13.0])
+    stats = _identity_stats(16, target_dim=4)
+    weights = trainer.rollout_weights(3, 2.0, torch.device("cpu"))
+    recorder = _RuntimeRecorder(dataset.feature_indices)
+    monkeypatch.setattr(trainer, "physics_runtime_step", recorder)
+
+    trainer.boundary_conditioned_rollout(
+        model,
+        batch,
+        dataset,
+        stats,
+        weights,
+        runtime_context=_runtime_context(dataset),
+    )
+
+    assert len(recorder.calls) == 3
+    assert [len(call["active_mask"]) for call in recorder.calls] == [2, 2, 2]
+    assert [int(call["active_mask"].sum()) for call in recorder.calls] == [2, 2, 2]
+
+
+def test_closed_loop_runtime_state_becomes_next_model_input(tmp_path: Path, monkeypatch) -> None:
+    dataset, batch = _v2_four_target_batch(tmp_path)
+    model = _ConstantPredictionModel([1.0, 2.0, 21.0, 13.0])
+    stats = _identity_stats(16, target_dim=4)
+    weights = trainer.rollout_weights(2, 2.0, torch.device("cpu"))
+    recorder = _RuntimeRecorder(dataset.feature_indices)
+    monkeypatch.setattr(trainer, "physics_runtime_step", recorder)
+
+    rollout = trainer.boundary_conditioned_rollout(
+        model,
+        batch,
+        dataset,
+        stats,
+        weights,
+        runtime_context=_runtime_context(dataset),
+    )
+
+    cfd_index = dataset.feature_indices["cfd_u_norm"]
+    x_index = dataset.feature_indices["x"]
+    assert rollout["pred_state"][0, 0, 0, cfd_index].item() == pytest.approx(7.0)
+    assert model.seen_history[1][0, -1, 0, cfd_index].item() == pytest.approx(7.0)
+    assert model.seen_history[1][0, -1, 0, x_index].item() == pytest.approx(100.0)
+
+
+def test_closed_loop_does_not_refresh_stale_physics_from_future_truth(tmp_path: Path, monkeypatch) -> None:
+    dataset, batch = _v2_four_target_batch(tmp_path)
+    model = _ConstantPredictionModel([1.0, 2.0, 21.0, 13.0])
+    stats = _identity_stats(16, target_dim=4)
+    weights = trainer.rollout_weights(1, 2.0, torch.device("cpu"))
+    recorder = _RuntimeRecorder(dataset.feature_indices)
+    monkeypatch.setattr(trainer, "physics_runtime_step", recorder)
+
+    def fail_refresh(*args, **kwargs):
+        raise AssertionError("refresh_observed_non_target_features should not run for closed-loop continuing slots")
+
+    monkeypatch.setattr(trainer, "refresh_observed_non_target_features", fail_refresh)
+    rollout = trainer.boundary_conditioned_rollout(
+        model,
+        batch,
+        dataset,
+        stats,
+        weights,
+        runtime_context=_runtime_context(dataset),
+    )
+
+    cfd_index = dataset.feature_indices["cfd_u_norm"]
+    assert rollout["pred_state"][0, 0, 0, cfd_index].item() == pytest.approx(7.0)
+    assert rollout["pred_state"][0, 0, 0, cfd_index].item() != pytest.approx(0.1)
+
+
+def test_closed_loop_preserves_entering_truth_and_inactive_zero_padding(tmp_path: Path, monkeypatch) -> None:
+    dataset, batch = _v2_four_target_batch(tmp_path)
+    batch["history_mask"][0, :, 1] = False
+    model = _ConstantPredictionModel([1.0, 2.0, 21.0, 13.0])
+    stats = _identity_stats(16, target_dim=4)
+    weights = trainer.rollout_weights(1, 2.0, torch.device("cpu"))
+    recorder = _RuntimeRecorder(dataset.feature_indices)
+    monkeypatch.setattr(trainer, "physics_runtime_step", recorder)
+
+    rollout = trainer.boundary_conditioned_rollout(
+        model,
+        batch,
+        dataset,
+        stats,
+        weights,
+        runtime_context=_runtime_context(dataset),
+    )
+
+    expected_entering = torch.as_tensor(dataset.Z[1, 1, :], dtype=torch.float32)
+    assert recorder.calls[0]["active_mask"].tolist() == [True]
+    assert torch.allclose(rollout["pred_state"][0, 0, 1], expected_entering)
+    assert torch.allclose(rollout["pred_state"][0, 0, 3], torch.zeros(16))
+
+
+def _small_model(
+    input_dim: int,
+    horizon: int,
+    max_droplets: int,
+    target_dim: int = 2,
+) -> CanonicalRolloutTransformer:
     return CanonicalRolloutTransformer(
         input_dim=input_dim,
-        target_dim=2,
+        target_dim=target_dim,
         T_history=horizon,
         max_droplets=max_droplets,
         d_model=16,
@@ -152,13 +254,77 @@ def _small_model(input_dim: int, horizon: int, max_droplets: int) -> CanonicalRo
     )
 
 
-def _identity_stats(feature_dim: int) -> dict[str, np.ndarray]:
+def _identity_stats(feature_dim: int, target_dim: int = 2) -> dict[str, np.ndarray]:
     return {
         "input_mean": np.zeros(feature_dim, dtype=np.float32),
         "input_std": np.ones(feature_dim, dtype=np.float32),
-        "target_mean": np.zeros(2, dtype=np.float32),
-        "target_std": np.ones(2, dtype=np.float32),
+        "target_mean": np.zeros(target_dim, dtype=np.float32),
+        "target_std": np.ones(target_dim, dtype=np.float32),
     }
+
+
+def _v2_four_target_batch(tmp_path: Path):
+    npz = _write_npz(tmp_path / "v2_four_target.npz", V2_FEATURES)
+    dataset = CanonicalWindowDataset(
+        npz,
+        start_frames=[0],
+        T_history=1,
+        T_future=3,
+        max_droplets=4,
+        target_features=trainer.RUNTIME_TARGET_FEATURES,
+    )
+    batch = trainer.move_batch_to_device(next(iter(DataLoader(dataset, batch_size=1))), torch.device("cpu"))
+    return dataset, batch
+
+
+def _runtime_context(dataset: CanonicalWindowDataset):
+    return SimpleNamespace(feature_index=dataset.feature_indices)
+
+
+class _ConstantPredictionModel(torch.nn.Module):
+    def __init__(self, prediction) -> None:
+        super().__init__()
+        self.register_buffer("prediction", torch.as_tensor(prediction, dtype=torch.float32))
+        self.seen_history = []
+
+    def forward(self, history_x, history_mask):
+        self.seen_history.append(history_x.detach().clone())
+        B, _, M, _ = history_x.shape
+        return self.prediction.view(1, 1, -1).expand(B, M, -1).clone()
+
+
+class _RuntimeRecorder:
+    def __init__(self, feature_index: dict[str, int]) -> None:
+        self.feature_index = feature_index
+        self.calls = []
+
+    def __call__(self, current_state, model_prediction, context, active_mask=None):
+        active = np.asarray(active_mask, dtype=bool)
+        self.calls.append(
+            {
+                "current_state": np.asarray(current_state).copy(),
+                "model_prediction": np.asarray(model_prediction).copy(),
+                "active_mask": active.copy(),
+            }
+        )
+        out = np.zeros_like(current_state, dtype=np.float32)
+        idx = self.feature_index
+        if np.any(active):
+            out[active] = current_state[active]
+            out[active, idx["x"]] = 100.0 + len(self.calls) - 1
+            out[active, idx["y"]] = 200.0 + len(self.calls) - 1
+            out[active, idx["vx"]] = model_prediction[active, 0]
+            out[active, idx["vy"]] = model_prediction[active, 1]
+            out[active, idx["bbox_w"]] = model_prediction[active, 2]
+            out[active, idx["bbox_h"]] = model_prediction[active, 3]
+            out[active, idx["cfd_u_norm"]] = 7.0
+            out[active, idx["cfd_v_norm"]] = -7.0
+            out[active, idx["superficial_velocity"]] = 56.0
+            out[active, idx["left_flow_fraction"]] = 0.42
+            for name in V2_FEATURES:
+                if name.startswith("occupancy_"):
+                    out[active, idx[name]] = 1.0 / 6.0
+        return out
 
 
 def _write_npz(path: Path, feature_names: list[str]) -> Path:

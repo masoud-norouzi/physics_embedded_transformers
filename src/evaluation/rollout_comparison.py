@@ -15,11 +15,23 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from src.config.velocity import DEFAULT_EXPERIMENT_CONFIG, load_velocity_conversion_from_experiment
+from src.physics.runtime import (
+    CANONICAL_RUNTIME_FEATURE_NAMES,
+    MODEL_PREDICTION_FEATURE_NAMES,
+    load_physics_runtime_context,
+)
 
 
 try:
     from .canonical_rollout_transformer import CanonicalRolloutTransformer
     from . import rollout_functions as markovian_rollout
+except ImportError:
+    if __package__:
+        raise
+    from canonical_rollout_transformer import CanonicalRolloutTransformer
+    import rollout_functions as markovian_rollout
+
+try:
     from .channel_mask import read_centerline_csv
     from .geometry_loss import (
         compute_ellipse_outside_fraction,
@@ -28,16 +40,17 @@ try:
     )
 except ImportError:
     if __package__:
-        raise
-    from canonical_rollout_transformer import CanonicalRolloutTransformer
-    import rollout_functions as markovian_rollout
-    from channel_mask import read_centerline_csv
-    from geometry_loss import (
-        compute_ellipse_outside_fraction,
-        compute_ellipse_outside_fraction_torch,
-        run_sanity_tests as run_geometry_loss_sanity_tests,
-    )
-
+        read_centerline_csv = None
+        compute_ellipse_outside_fraction = None
+        compute_ellipse_outside_fraction_torch = None
+        run_geometry_loss_sanity_tests = None
+    else:
+        from channel_mask import read_centerline_csv
+        from geometry_loss import (
+            compute_ellipse_outside_fraction,
+            compute_ellipse_outside_fraction_torch,
+            run_sanity_tests as run_geometry_loss_sanity_tests,
+        )
 
 EVALUATION_ROOT = Path(__file__).resolve().parent
 
@@ -86,9 +99,11 @@ PHYSICS_FEATURES = (
     "y",
     "vx",
     "vy",
-    "circularity",
-    "cfd_u",
-    "cfd_v",
+    "bbox_w",
+    "bbox_h",
+    "cfd_u_norm",
+    "cfd_v_norm",
+    "superficial_velocity",
     "left_flow_fraction",
     "occupancy_inlet_channel",
     "occupancy_inlet_junction",
@@ -96,13 +111,25 @@ PHYSICS_FEATURES = (
     "occupancy_right_branch",
     "occupancy_outlet_junction",
     "occupancy_outlet_channel",
-    "cfd_valid",
 )
 
 ROLLOUT_HORIZON = 50
 MAX_DROPLETS = 64
 STRIDE = 5
 SOURCE_HISTORY_LENGTH = 20
+
+
+def require_geometry_diagnostics(context: str) -> None:
+    if (
+        read_centerline_csv is None
+        or compute_ellipse_outside_fraction is None
+        or compute_ellipse_outside_fraction_torch is None
+        or run_geometry_loss_sanity_tests is None
+    ):
+        raise ModuleNotFoundError(
+            f"Optional geometry dependencies are required for {context}. "
+            "Install scikit-image or rerun with the corresponding --skip-* diagnostic flag."
+        )
 
 
 @dataclass
@@ -318,7 +345,7 @@ class AlignedRolloutWindowDataset(Dataset):
         max_droplets: int,
         normalization_stats,
         input_feature_names: tuple[str, ...] | None = None,
-        target_features: tuple[str, str] = ("vx", "vy"),
+        target_features: tuple[str, ...] = ("vx", "vy"),
         experiment_config: Path = DEFAULT_EXPERIMENT_CONFIG,
     ) -> None:
         self.npz_path = Path(npz_path)
@@ -430,7 +457,7 @@ class AlignedRolloutWindowDataset(Dataset):
 
     def _feature_indices(self, feature_names: list[str]) -> dict[str, int]:
         feature_indices = {name: index for index, name in enumerate(feature_names)}
-        for required_name in ["x", "y", "vx", "vy", "circularity"]:
+        for required_name in ["x", "y", "vx", "vy"]:
             if required_name not in feature_indices:
                 raise KeyError(f"Missing required feature: {required_name}")
         for target_name in self.target_features:
@@ -505,18 +532,22 @@ class RolloutModelAdapter:
         rollout_fn: Callable,
         device: torch.device,
         input_feature_names: tuple[str, ...],
+        experiment_config: Path = DEFAULT_EXPERIMENT_CONFIG,
+        cfd_library_path: Path = Path("outputs/physics/full_device_cfd/library"),
     ) -> None:
         self.name = name
         self.checkpoint_path = Path(checkpoint_path)
         self.rollout_fn = rollout_fn
         self.device = device
-        self.input_feature_names = tuple(input_feature_names)
         self.checkpoint = torch.load(self.checkpoint_path, map_location=device, weights_only=False)
         self.model_config = dict(self.checkpoint["model_config"])
+        self.input_feature_names = self._resolve_input_feature_names(input_feature_names)
+        self.target_features = self._resolve_target_features()
         self.history_length = int(self.model_config["T_history"])
         self.horizon = int(self.checkpoint.get("rollout_horizon", ROLLOUT_HORIZON))
         self.loss_alpha = float(self.checkpoint.get("loss_alpha", 2.0))
         self.normalization_stats = self.checkpoint["normalization_stats"]
+        self.runtime_context = self._build_runtime_context_if_needed(experiment_config, cfd_library_path)
         self.model = CanonicalRolloutTransformer(**self.model_config).to(device)
         self.model.load_state_dict(self.checkpoint["model_state_dict"])
         self.model.eval()
@@ -541,6 +572,7 @@ class RolloutModelAdapter:
                 dataset=self.dataset,
                 normalization_stats=self.normalization_stats,
                 weights=self.weights,
+                runtime_context=self.runtime_context,
             )
         return RolloutPrediction(
             model_name=self.name,
@@ -563,6 +595,36 @@ class RolloutModelAdapter:
         step_ids = torch.arange(horizon, dtype=torch.float32, device=device)
         return 1.0 + float(alpha) * step_ids / float(horizon - 1)
 
+    def _resolve_input_feature_names(self, fallback: tuple[str, ...]) -> tuple[str, ...]:
+        names = self.checkpoint.get("input_feature_names")
+        if names is None:
+            if int(self.model_config["input_dim"]) == len(CANONICAL_RUNTIME_FEATURE_NAMES):
+                return tuple(CANONICAL_RUNTIME_FEATURE_NAMES)
+            return tuple(fallback)
+        return tuple(str(name) for name in names)
+
+    def _resolve_target_features(self) -> tuple[str, ...]:
+        names = self.checkpoint.get("target_features")
+        if names is not None:
+            return tuple(str(name) for name in names)
+        if int(self.model_config.get("target_dim", 2)) == len(MODEL_PREDICTION_FEATURE_NAMES):
+            return tuple(MODEL_PREDICTION_FEATURE_NAMES)
+        return ("vx", "vy")
+
+    def _build_runtime_context_if_needed(self, experiment_config: Path, cfd_library_path: Path):
+        if self.target_features != tuple(MODEL_PREDICTION_FEATURE_NAMES):
+            return None
+        if self.input_feature_names != tuple(CANONICAL_RUNTIME_FEATURE_NAMES):
+            raise ValueError(
+                f"{self.name}: closed-loop runtime requires canonical feature order "
+                f"{tuple(CANONICAL_RUNTIME_FEATURE_NAMES)}, got {self.input_feature_names}."
+            )
+        return load_physics_runtime_context(
+            experiment_config_path=experiment_config,
+            cfd_library_path=cfd_library_path,
+            feature_names=self.input_feature_names,
+        )
+
 
 class MarkovianRolloutModelAdapter(RolloutModelAdapter):
     def __init__(
@@ -571,8 +633,18 @@ class MarkovianRolloutModelAdapter(RolloutModelAdapter):
         checkpoint_path: Path,
         device: torch.device,
         input_feature_names: tuple[str, ...],
+        experiment_config: Path = DEFAULT_EXPERIMENT_CONFIG,
+        cfd_library_path: Path = Path("outputs/physics/full_device_cfd/library"),
     ) -> None:
-        super().__init__(name, checkpoint_path, markovian_rollout.boundary_conditioned_rollout, device, input_feature_names)
+        super().__init__(
+            name,
+            checkpoint_path,
+            markovian_rollout.boundary_conditioned_rollout,
+            device,
+            input_feature_names,
+            experiment_config=experiment_config,
+            cfd_library_path=cfd_library_path,
+        )
 
 
 class RolloutModelComparator:
@@ -650,6 +722,7 @@ class RolloutModelComparator:
                 max_droplets=MAX_DROPLETS,
                 normalization_stats=adapter.normalization_stats,
                 input_feature_names=adapter.input_feature_names,
+                target_features=adapter.target_features,
             )
             adapter.attach_dataset(dataset)
             loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False, num_workers=0)
@@ -1541,6 +1614,7 @@ class CenterlineTangentEstimator:
         min_branch_distance_margin: float | None,
         min_branch_relative_margin: float | None,
     ) -> None:
+        require_geometry_diagnostics("directional and junction-decision diagnostics")
         branches, metadata = read_centerline_csv(centerline_csv)
         self.metadata = metadata
         self.pca_half_window = int(pca_half_window)
@@ -2689,6 +2763,7 @@ def validate_common_channel_masks(
 
 
 def validate_channel_sanity_checks(context: ChannelAdmissibilityContext) -> None:
+    require_geometry_diagnostics("channel-admissibility diagnostics")
     sanity = run_geometry_loss_sanity_tests()
     inside = sanity["all_true_overlap"]
     outside = sanity["all_false_overlap"]
@@ -2704,6 +2779,7 @@ def validate_channel_sanity_checks(context: ChannelAdmissibilityContext) -> None
 
 
 def compare_vectorized_scalar_geometry(context: ChannelAdmissibilityContext, max_samples: int) -> None:
+    require_geometry_diagnostics("channel-admissibility diagnostics")
     indices = list(zip(*np.nonzero(context.geometry_valid_mask)))[:max_samples]
     if not indices:
         return
@@ -2726,6 +2802,7 @@ def compare_vectorized_scalar_geometry(context: ChannelAdmissibilityContext, max
 
 
 def compare_numpy_torch_geometry(context: ChannelAdmissibilityContext, max_samples: int) -> None:
+    require_geometry_diagnostics("channel-admissibility diagnostics")
     indices = list(zip(*np.nonzero(context.geometry_valid_mask)))[:max_samples]
     if not indices:
         return
@@ -3045,6 +3122,8 @@ def build_default_adapters(args, device: torch.device) -> dict[str, RolloutModel
             Path(args.markovian_checkpoint),
             device,
             FIVE_FEATURES,
+            experiment_config=args.experiment_config,
+            cfd_library_path=args.cfd_library_path,
         )
     if args.geometry_aware_checkpoint:
         adapters["Geometry-aware Markovian"] = MarkovianRolloutModelAdapter(
@@ -3052,6 +3131,8 @@ def build_default_adapters(args, device: torch.device) -> dict[str, RolloutModel
             Path(args.geometry_aware_checkpoint),
             device,
             FIVE_FEATURES,
+            experiment_config=args.experiment_config,
+            cfd_library_path=args.cfd_library_path,
         )
     if args.physics_checkpoint:
         adapters["Physics-embedded Markovian"] = MarkovianRolloutModelAdapter(
@@ -3059,6 +3140,8 @@ def build_default_adapters(args, device: torch.device) -> dict[str, RolloutModel
             Path(args.physics_checkpoint),
             device,
             PHYSICS_FEATURES,
+            experiment_config=args.experiment_config,
+            cfd_library_path=args.cfd_library_path,
         )
     if not adapters:
         raise ValueError("At least one checkpoint must be provided.")
@@ -3088,6 +3171,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-orientation-speed", type=float, default=1.0e-3)
     parser.add_argument("--channel-mask", type=Path, default=DEFAULT_CHANNEL_MASK_PATH)
     parser.add_argument("--detections-csv", type=Path, default=DEFAULT_DETECTIONS_CSV_PATH)
+    parser.add_argument("--experiment-config", type=Path, default=DEFAULT_EXPERIMENT_CONFIG)
+    parser.add_argument("--cfd-library-path", type=Path, default=Path("outputs/physics/full_device_cfd/library"))
     parser.add_argument("--geometry-tolerance", type=float, default=GEOMETRY_TOLERANCE)
     parser.add_argument(
         "--min-branch-distance-margin",

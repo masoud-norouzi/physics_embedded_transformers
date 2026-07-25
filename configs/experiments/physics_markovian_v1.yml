@@ -12,6 +12,8 @@ model:
   target_features:
     - vx
     - vy
+    - bbox_w
+    - bbox_h
   input_feature_names:
     - x
     - y

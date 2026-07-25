@@ -173,11 +173,29 @@ class _ValidPointProjectionLookup:
         candidates = np.vstack([nodes, edge_midpoints, centroids, barycentric_samples])
         candidates = np.unique(np.round(candidates, decimals=9), axis=0)
         inside = _inside_fluid_domain(candidates, field.mesh.geometry)
-        return cls(candidates[inside])
+        interpolation_valid = np.zeros(len(candidates), dtype=bool)
+        if np.any(inside):
+            interpolation_valid[np.flatnonzero(inside)] = _finite_interpolation_support(field, candidates[inside])
+        return cls(candidates[inside & interpolation_valid])
 
     def nearest_valid_points(self, points_um: np.ndarray) -> np.ndarray:
         _, indices = self.tree.query(np.asarray(points_um, dtype=float), k=1)
         return self.valid_points_um[np.asarray(indices, dtype=np.int64)]
+
+
+def _finite_interpolation_support(
+    field: InterpolatedVelocityField,
+    candidates_um: np.ndarray,
+    chunk_size: int = 5000,
+) -> np.ndarray:
+    basis = velocity_basis(field.nodes_um, field.elements)
+    coefficients = np.zeros(basis.N, dtype=float)
+    valid = np.zeros(len(candidates_um), dtype=bool)
+    for start in range(0, len(candidates_um), int(chunk_size)):
+        stop = min(start + int(chunk_size), len(candidates_um))
+        evaluated = _evaluate_basis_interpolator(basis, coefficients, candidates_um[start:stop].T * UM_TO_M)
+        valid[start:stop] = np.isfinite(evaluated).all(axis=1)
+    return valid
 
 
 def velocity_basis(nodes_um: np.ndarray, elements: np.ndarray) -> Basis:

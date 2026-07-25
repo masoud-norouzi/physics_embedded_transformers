@@ -25,6 +25,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - exercised by environmen
 
 from src.datasets.canonical_window_dataset import create_train_val_test_datasets
 from src.models.canonical_rollout_transformer import CanonicalRolloutTransformer
+from src.physics.runtime import load_physics_runtime_context, step as physics_runtime_step
 
 
 FEATURE_NAMES = [
@@ -47,6 +48,7 @@ FEATURE_NAMES = [
 ]
 
 DIAGNOSTIC_STEPS = (1, 5, 10, 20, 30, 40, 50)
+RUNTIME_TARGET_FEATURES = ("vx", "vy", "bbox_w", "bbox_h")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -119,8 +121,13 @@ def main(argv: list[str] | None = None) -> None:
         float(config["training"]["loss_alpha"]),
         device,
     )
+    runtime_context = load_physics_runtime_context(
+        experiment_config_path=config["dataset"].get("experiment_config", "configs/experiments/video_2.yml"),
+        cfd_library_path=config["dataset"].get("cfd_library_path", "outputs/physics/full_device_cfd/library"),
+        feature_names=tuple(config["model"]["input_feature_names"]),
+    )
 
-    run_shape_test(model, train_loader, train_ds, normalization_stats, weights, device)
+    run_shape_test(model, train_loader, train_ds, normalization_stats, weights, device, runtime_context)
 
     start_time = time.perf_counter()
     if args.smoke_test:
@@ -134,6 +141,7 @@ def main(argv: list[str] | None = None) -> None:
             weights=weights,
             device=device,
             config=config,
+            runtime_context=runtime_context,
             model_config=model_config,
             output_dir=output_dir,
         )
@@ -152,6 +160,7 @@ def main(argv: list[str] | None = None) -> None:
         weights=weights,
         device=device,
         config=config,
+        runtime_context=runtime_context,
         model_config=model_config,
         output_dir=output_dir,
     )
@@ -217,6 +226,12 @@ def validate_feature_contract(dataset, config: dict[str, Any]) -> None:
         raise ValueError("Dataset feature order does not match the physics Markovian config.")
     if len(dataset.feature_names) != int(config["model"]["input_dim"]):
         raise ValueError("Dataset feature count does not match configured input_dim.")
+    target_features = tuple(config["model"]["target_features"])
+    if dataset.feature_names == FEATURE_NAMES and target_features != RUNTIME_TARGET_FEATURES:
+        raise ValueError(
+            "Closed-loop physics rollout requires target_features to be exactly "
+            f"{RUNTIME_TARGET_FEATURES}, got {target_features}."
+        )
 
 
 class SubsetByIndex:
@@ -244,7 +259,7 @@ def rollout_weights(horizon: int, alpha: float, device) -> torch.Tensor:
     return 1.0 + float(alpha) * step_ids / float(horizon - 1)
 
 
-def run_shape_test(model, train_loader, dataset, normalization_stats, weights, device) -> None:
+def run_shape_test(model, train_loader, dataset, normalization_stats, weights, device, runtime_context=None) -> None:
     model.eval()
     batch = move_batch_to_device(next(iter(train_loader)), device)
     with torch.no_grad():
@@ -254,15 +269,16 @@ def run_shape_test(model, train_loader, dataset, normalization_stats, weights, d
             dataset=dataset,
             normalization_stats=normalization_stats,
             weights=weights,
+            runtime_context=runtime_context,
         )
     print(f"history_x:       {tuple(batch['history_x'].shape)}")
     print(f"history_mask:    {tuple(batch['history_mask'].shape)}")
     print(f"future_y:        {tuple(batch['future_y'].shape)}")
     print(f"future_mask:     {tuple(batch['future_mask'].shape)}")
     print(f"cfd_loss_mask:   {tuple(batch['cfd_loss_mask'].shape)}")
-    print(f"pred_velocity:   {tuple(rollout['pred_velocity'].shape)}")
+    print(f"pred_target:     {tuple(rollout['pred_target'].shape)}")
     print(f"weighted_loss_internal_only: {float(rollout['weighted_loss_internal_only']):.6f}")
-    assert rollout["pred_velocity"].shape == batch["future_y"].shape
+    assert rollout["pred_target"].shape == batch["future_y"].shape
     assert rollout["mask"].shape == batch["future_mask"].shape
     assert rollout["supervision_mask"].shape == batch["cfd_loss_mask"].shape
 
@@ -277,6 +293,7 @@ def run_smoke_test(
     weights,
     device,
     config,
+    runtime_context,
     model_config,
     output_dir: Path,
 ) -> dict[str, Any]:
@@ -291,6 +308,7 @@ def run_smoke_test(
         grad_clip=float(config["training"]["grad_clip"]),
         log_every=int(config["training"]["log_every_n_batches"]),
         max_batches=int(config["smoke_test"]["optimization_steps"]),
+        runtime_context=runtime_context,
     )
     val_summary = evaluate(
         model=model,
@@ -301,6 +319,7 @@ def run_smoke_test(
         device=device,
         log_every=0,
         max_batches=1,
+        runtime_context=runtime_context,
     )
     checkpoint_path = output_dir / "latest_checkpoint.pt"
     checkpoint = build_checkpoint(
@@ -319,7 +338,14 @@ def run_smoke_test(
     reloaded_model.eval()
     batch = move_batch_to_device(next(iter(val_loader)), device)
     with torch.no_grad():
-        rollout = boundary_conditioned_rollout(reloaded_model, batch, dataset, normalization_stats, weights)
+        rollout = boundary_conditioned_rollout(
+            reloaded_model,
+            batch,
+            dataset,
+            normalization_stats,
+            weights,
+            runtime_context=runtime_context,
+        )
     assert torch.isfinite(rollout["weighted_loss_internal_only"])
     return {
         "train_loss": train_summary["weighted_loss_internal_only"],
@@ -327,7 +353,7 @@ def run_smoke_test(
         "checkpoint": str(checkpoint_path),
         "checkpoint_reload": "ok",
         "finite_losses": True,
-        "rollout_shape": list(rollout["pred_velocity"].shape),
+        "rollout_shape": list(rollout["pred_target"].shape),
     }
 
 
@@ -341,6 +367,7 @@ def train_full(
     weights,
     device,
     config,
+    runtime_context,
     model_config,
     output_dir: Path,
 ) -> None:
@@ -359,6 +386,7 @@ def train_full(
             device=device,
             grad_clip=float(config["training"]["grad_clip"]),
             log_every=int(config["training"]["log_every_n_batches"]),
+            runtime_context=runtime_context,
         )
         val_summary = evaluate(
             model=model,
@@ -368,6 +396,7 @@ def train_full(
             weights=weights,
             device=device,
             log_every=int(config["training"]["log_every_n_batches"]),
+            runtime_context=runtime_context,
         )
         print_epoch_summary(epoch, train_summary, val_summary)
         append_curves_csv(curves_csv_path, epoch, train_summary, val_summary)
@@ -392,6 +421,7 @@ def train_one_epoch(
     grad_clip: float,
     log_every: int,
     max_batches: int | None = None,
+    runtime_context=None,
 ) -> dict[str, float]:
     model.train()
     total_loss = 0.0
@@ -402,7 +432,14 @@ def train_one_epoch(
     for batch in loader:
         batch = move_batch_to_device(batch, device)
         optimizer.zero_grad(set_to_none=True)
-        rollout = boundary_conditioned_rollout(model, batch, dataset, normalization_stats, weights)
+        rollout = boundary_conditioned_rollout(
+            model,
+            batch,
+            dataset,
+            normalization_stats,
+            weights,
+            runtime_context=runtime_context,
+        )
         loss = rollout["weighted_loss_internal_only"]
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -433,6 +470,7 @@ def evaluate(
     device,
     log_every: int = 0,
     max_batches: int | None = None,
+    runtime_context=None,
 ) -> dict[str, Any]:
     model.eval()
     total_loss = 0.0
@@ -445,7 +483,14 @@ def evaluate(
     with torch.no_grad():
         for batch in loader:
             batch = move_batch_to_device(batch, device)
-            rollout = boundary_conditioned_rollout(model, batch, dataset, normalization_stats, weights)
+            rollout = boundary_conditioned_rollout(
+                model,
+                batch,
+                dataset,
+                normalization_stats,
+                weights,
+                runtime_context=runtime_context,
+            )
             total_loss += float(rollout["weighted_loss_internal_only"].detach().cpu())
             total_supervised += int(rollout["supervision_mask"].sum().detach().cpu())
             total_present += int(rollout["mask"].sum().detach().cpu())
@@ -468,17 +513,18 @@ def evaluate(
     return summary
 
 
-def boundary_conditioned_rollout(model, batch, dataset, normalization_stats, weights):
+def boundary_conditioned_rollout(model, batch, dataset, normalization_stats, weights, runtime_context=None):
     device = batch["history_x"].device
     rollout_history = batch["history_x"].clone()
     history_mask = batch["history_mask"].clone()
 
-    pred_velocities_norm = []
-    true_velocities_norm = []
-    pred_velocities_phys = []
-    true_velocities_phys = []
+    pred_targets_norm = []
+    true_targets_norm = []
+    pred_targets_phys = []
+    true_targets_phys = []
     pred_positions = []
     true_positions = []
+    pred_states = []
     step_masks = []
     supervision_masks = []
     boundary_masks = []
@@ -506,24 +552,30 @@ def boundary_conditioned_rollout(model, batch, dataset, normalization_stats, wei
 
         history_phys = denormalize_features(rollout_history, normalization_stats, device)
         last_frame = history_phys[:, -1, :, :]
-        velocity_to_px_frame = velocity_mm_s_to_px_frame_scale(dataset, device)
-        x_next = last_frame[:, :, feature_index["x"]] + pred_step_phys_raw[:, :, 0] * velocity_to_px_frame
-        y_next = last_frame[:, :, feature_index["y"]] + pred_step_phys_raw[:, :, 1] * velocity_to_px_frame
-
-        new_frame_phys = last_frame.clone()
-        new_frame_phys[:, :, feature_index["x"]] = x_next
-        new_frame_phys[:, :, feature_index["y"]] = y_next
-        new_frame_phys[:, :, feature_index["vx"]] = pred_step_phys_raw[:, :, 0]
-        new_frame_phys[:, :, feature_index["vy"]] = pred_step_phys_raw[:, :, 1]
-
         new_mask = batch["future_mask"][:, step_index, :]
+        continuing_mask = new_mask & previous_last_mask
         entering_mask = new_mask & ~previous_last_mask
         true_step_features = true_future_features[:, step_index, :, :]
         true_step_features_finite = torch.isfinite(true_step_features).all(dim=-1)
         boundary_mask = entering_mask & true_step_features_finite
-        new_frame_phys[boundary_mask] = true_step_features[boundary_mask]
 
-        refresh_observed_non_target_features(new_frame_phys, true_step_features, new_mask, feature_index)
+        if runtime_context is None:
+            velocity_to_px_frame = velocity_mm_s_to_px_frame_scale(dataset, device)
+            x_next = last_frame[:, :, feature_index["x"]] + pred_step_phys_raw[:, :, 0] * velocity_to_px_frame
+            y_next = last_frame[:, :, feature_index["y"]] + pred_step_phys_raw[:, :, 1] * velocity_to_px_frame
+
+            new_frame_phys = last_frame.clone()
+            new_frame_phys[:, :, feature_index["x"]] = x_next
+            new_frame_phys[:, :, feature_index["y"]] = y_next
+            new_frame_phys[:, :, feature_index["vx"]] = pred_step_phys_raw[:, :, 0]
+            new_frame_phys[:, :, feature_index["vy"]] = pred_step_phys_raw[:, :, 1]
+            new_frame_phys[boundary_mask] = true_step_features[boundary_mask]
+            refresh_observed_non_target_features(new_frame_phys, true_step_features, new_mask, feature_index)
+        else:
+            new_frame_phys = torch.zeros_like(last_frame)
+            refreshed_phys = runtime_step_batch(last_frame, pred_step_phys_raw, continuing_mask, runtime_context)
+            new_frame_phys = torch.where(continuing_mask[:, :, None], refreshed_phys, new_frame_phys)
+            new_frame_phys[boundary_mask] = true_step_features[boundary_mask]
 
         pred_step_norm = pred_step_norm_raw.clone()
         pred_step_phys = pred_step_phys_raw.clone()
@@ -540,10 +592,11 @@ def boundary_conditioned_rollout(model, batch, dataset, normalization_stats, wei
         rollout_history = torch.cat([rollout_history[:, 1:, :, :], new_frame_norm[:, None, :, :]], dim=1)
         history_mask = torch.cat([history_mask[:, 1:, :], new_mask[:, None, :]], dim=1)
 
-        pred_velocities_norm.append(pred_step_norm)
-        true_velocities_norm.append(true_step_norm)
-        pred_velocities_phys.append(pred_step_phys)
-        true_velocities_phys.append(true_step_phys)
+        pred_targets_norm.append(pred_step_norm)
+        true_targets_norm.append(true_step_norm)
+        pred_targets_phys.append(pred_step_phys)
+        true_targets_phys.append(true_step_phys)
+        pred_states.append(new_frame_phys)
         pred_positions.append(new_frame_phys[:, :, [feature_index["x"], feature_index["y"]]])
         true_positions.append(true_future_xy[:, step_index, :, :])
         step_masks.append(new_mask)
@@ -554,14 +607,23 @@ def boundary_conditioned_rollout(model, batch, dataset, normalization_stats, wei
     weighted_loss_internal_only = (step_loss_tensor * weights).sum() / weights.sum()
     mask_tensor = torch.stack(step_masks, dim=1)
     supervision_mask_tensor = torch.stack(supervision_masks, dim=1)
+    pred_target_norm = torch.stack(pred_targets_norm, dim=1)
+    true_target_norm = torch.stack(true_targets_norm, dim=1)
+    pred_target = torch.stack(pred_targets_phys, dim=1)
+    true_target = torch.stack(true_targets_phys, dim=1)
     return {
         "weighted_loss": weighted_loss_internal_only,
         "weighted_loss_internal_only": weighted_loss_internal_only,
         "step_losses": step_loss_tensor,
-        "pred_velocity_norm": torch.stack(pred_velocities_norm, dim=1),
-        "true_velocity_norm": torch.stack(true_velocities_norm, dim=1),
-        "pred_velocity": torch.stack(pred_velocities_phys, dim=1),
-        "true_velocity": torch.stack(true_velocities_phys, dim=1),
+        "pred_target_norm": pred_target_norm,
+        "true_target_norm": true_target_norm,
+        "pred_target": pred_target,
+        "true_target": true_target,
+        "pred_velocity_norm": pred_target_norm[..., :2],
+        "true_velocity_norm": true_target_norm[..., :2],
+        "pred_velocity": pred_target[..., :2],
+        "true_velocity": true_target[..., :2],
+        "pred_state": torch.stack(pred_states, dim=1),
         "pred_position": torch.stack(pred_positions, dim=1),
         "true_position": torch.stack(true_positions, dim=1),
         "mask": mask_tensor,
@@ -579,6 +641,29 @@ def refresh_observed_non_target_features(new_frame_phys, true_step_features, new
         values = true_step_features[:, :, index]
         valid = new_mask & torch.isfinite(values)
         new_frame_phys[:, :, index] = torch.where(valid, values, new_frame_phys[:, :, index])
+
+
+def runtime_step_batch(current_state_phys, model_prediction_phys, active_mask, runtime_context):
+    device = current_state_phys.device
+    dtype = current_state_phys.dtype
+    current_np = current_state_phys.detach().cpu().numpy().astype(np.float32, copy=True)
+    prediction_np = model_prediction_phys.detach().cpu().numpy().astype(np.float32, copy=True)
+    active_np = active_mask.detach().cpu().numpy().astype(bool, copy=True)
+    next_np = np.zeros_like(current_np, dtype=np.float32)
+
+    for batch_index in range(current_np.shape[0]):
+        active_slots = active_np[batch_index]
+        if not np.any(active_slots):
+            continue
+        next_active = physics_runtime_step(
+            current_np[batch_index, active_slots],
+            prediction_np[batch_index, active_slots],
+            runtime_context,
+            active_mask=np.ones(int(np.count_nonzero(active_slots)), dtype=bool),
+        )
+        next_np[batch_index, active_slots] = next_active
+
+    return torch.as_tensor(next_np, dtype=dtype, device=device)
 
 
 def masked_velocity_mse(prediction, target, mask):
