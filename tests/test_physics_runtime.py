@@ -150,3 +150,18 @@ def test_step_executes_full_prediction_to_next_state_pipeline() -> None:
     assert next_state[0, idx["cfd_u_norm"]] == pytest.approx(expected_split)
     assert next_state[0, idx["cfd_v_norm"]] == pytest.approx(-expected_split)
     assert next_state[1].sum() == pytest.approx(0.0)
+
+
+def test_step_is_functionally_pure_and_does_not_mutate_inputs() -> None:
+    context = _context()
+    state = _state(context)
+    prediction = np.array([[10.416, 0.0, 10.0, 8.0], [0.0, 0.0, 0.0, 0.0]], dtype=np.float32)
+    state_before = state.copy()
+    prediction_before = prediction.copy()
+
+    next_state = step(state, prediction, context)
+
+    assert np.array_equal(state, state_before)
+    assert np.array_equal(prediction, prediction_before)
+    assert not np.shares_memory(next_state, state)
+    assert not np.array_equal(next_state, state)
