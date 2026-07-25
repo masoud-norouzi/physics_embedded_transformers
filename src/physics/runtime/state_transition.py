@@ -156,13 +156,17 @@ def construct_ellipses(
     idx = context.feature_index
     ellipses: list[EllipseRaster | None] = [None] * len(state)
     for row in np.flatnonzero(active_mask):
-        ellipses[row] = rasterize_bbox_ellipse(
-            float(state[row, idx["x"]]),
-            float(state[row, idx["y"]]),
-            float(state[row, idx["bbox_w"]]),
-            float(state[row, idx["bbox_h"]]),
-            context.region_labels.shape,
-        )
+        try:
+            ellipses[row] = rasterize_bbox_ellipse(
+                float(state[row, idx["x"]]),
+                float(state[row, idx["y"]]),
+                float(state[row, idx["bbox_w"]]),
+                float(state[row, idx["bbox_h"]]),
+                context.region_labels.shape,
+            )
+        except ValueError as exc:
+            if "does not intersect the image" not in str(exc):
+                raise
     return ellipses
 
 
@@ -176,7 +180,7 @@ def compute_occupancy(
     for row in np.flatnonzero(active_mask):
         raster = ellipses[row]
         if raster is None:
-            raise ValueError(f"Missing ellipse raster for active row {row}")
+            continue
         result = calculate_raster_occupancy(
             context.region_labels,
             raster,
