@@ -135,6 +135,16 @@ def test_sample_cfd_uses_updated_split_and_returns_normalized_components() -> No
     assert sampled["cfd_u_norm"][1] == pytest.approx(0.0)
 
 
+def test_sample_cfd_clamps_lookup_split_to_library_bounds_without_changing_hydraulic_state() -> None:
+    context = _context()
+    state = _state(context)
+    active = np.array([True, False])
+    sampled = sample_cfd(state, -0.01, context, active)
+    assert context.cfd_library.requested == [pytest.approx(0.0)]
+    assert sampled["cfd_u_norm"][0] == pytest.approx(0.0)
+    assert sampled["cfd_v_norm"][0] == pytest.approx(0.0)
+
+
 def test_step_executes_full_prediction_to_next_state_pipeline() -> None:
     context = _context()
     state = _state(context)

@@ -231,11 +231,6 @@ def sample_cfd(
         return {"cfd_u_norm": cfd_u, "cfd_v_norm": cfd_v}
 
     split_min, split_max = context.cfd_split_bounds
-    if left_flow_fraction < split_min - 1e-12 or left_flow_fraction > split_max + 1e-12:
-        raise ValueError(
-            f"left_flow_fraction={left_flow_fraction:.12g} is outside CFD library range "
-            f"[{split_min:.12g}, {split_max:.12g}]"
-        )
     sample_split = float(np.clip(left_flow_fraction, split_min, split_max))
     idx = context.feature_index
     points_px = state[active_mask][:, [idx["x"], idx["y"]]]
