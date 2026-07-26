@@ -9,7 +9,6 @@ from src.physics.runtime import (
     CANONICAL_RUNTIME_FEATURE_NAMES,
     MODEL_PREDICTION_FEATURE_NAMES,
     PhysicsRuntimeContext,
-    PhysicsRuntimeDiagnostics,
     compute_occupancy,
     construct_ellipses,
     sample_cfd,
@@ -123,11 +122,8 @@ def test_out_of_image_predicted_ellipse_has_zero_occupancy_instead_of_crashing()
     state[0, idx["x"]] = 10000.0
     state[0, idx["y"]] = 10000.0
     active = np.array([True, False])
-    ellipses = construct_ellipses(state, context, active)
-    occupancy = compute_occupancy(ellipses, context, active)
-    assert ellipses[0] is None
-    assert occupancy[0].sum() == pytest.approx(0.0)
-    assert context.diagnostics.snapshot()["ellipse_outside_image"] == 1
+    with pytest.raises(ValueError, match="does not intersect the image"):
+        construct_ellipses(state, context, active)
 
 
 def test_zero_pixel_predicted_ellipse_has_zero_occupancy_instead_of_crashing() -> None:
@@ -139,11 +135,8 @@ def test_zero_pixel_predicted_ellipse_has_zero_occupancy_instead_of_crashing() -
     state[0, idx["bbox_w"]] = 1.0e-6
     state[0, idx["bbox_h"]] = 1.0e-6
     active = np.array([True, False])
-    ellipses = construct_ellipses(state, context, active)
-    occupancy = compute_occupancy(ellipses, context, active)
-    assert ellipses[0] is None
-    assert occupancy[0].sum() == pytest.approx(0.0)
-    assert context.diagnostics.snapshot()["ellipse_zero_raster_pixels"] == 1
+    with pytest.raises(ValueError, match="zero raster pixels"):
+        construct_ellipses(state, context, active)
 
 
 def test_update_hydraulics_recomputes_flow_split_from_occupancy() -> None:
@@ -168,24 +161,12 @@ def test_sample_cfd_uses_updated_split_and_returns_normalized_components() -> No
     assert sampled["cfd_u_norm"][1] == pytest.approx(0.0)
 
 
-def test_sample_cfd_clamps_lookup_split_to_library_bounds_without_changing_hydraulic_state() -> None:
+def test_sample_cfd_rejects_split_outside_library_bounds() -> None:
     context = _context()
     state = _state(context)
     active = np.array([True, False])
-    sampled = sample_cfd(state, -0.01, context, active)
-    assert context.cfd_library.requested == [pytest.approx(0.0)]
-    assert sampled["cfd_u_norm"][0] == pytest.approx(0.0)
-    assert sampled["cfd_v_norm"][0] == pytest.approx(0.0)
-    assert context.diagnostics.snapshot()["cfd_split_clamped_low"] == 1
-
-
-def test_runtime_diagnostics_reset_and_snapshot() -> None:
-    diagnostics = PhysicsRuntimeDiagnostics()
-    diagnostics.increment("example")
-    diagnostics.increment("example", 2)
-    assert diagnostics.snapshot() == {"example": 3}
-    diagnostics.reset()
-    assert diagnostics.snapshot() == {}
+    with pytest.raises(ValueError, match="outside CFD library range"):
+        sample_cfd(state, -0.01, context, active)
 
 
 def test_step_executes_full_prediction_to_next_state_pipeline() -> None:
@@ -203,9 +184,6 @@ def test_step_executes_full_prediction_to_next_state_pipeline() -> None:
     assert next_state[0, idx["cfd_u_norm"]] == pytest.approx(expected_split)
     assert next_state[0, idx["cfd_v_norm"]] == pytest.approx(-expected_split)
     assert next_state[1].sum() == pytest.approx(0.0)
-    diagnostics = context.diagnostics.snapshot()
-    assert diagnostics["runtime_calls"] == 1
-    assert diagnostics["active_droplet_updates"] == 1
 
 
 def test_step_is_functionally_pure_and_does_not_mutate_inputs() -> None:

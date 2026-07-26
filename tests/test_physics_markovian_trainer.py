@@ -235,6 +235,71 @@ def test_closed_loop_preserves_entering_truth_and_inactive_zero_padding(tmp_path
     assert torch.allclose(rollout["pred_state"][0, 0, 3], torch.zeros(16))
 
 
+def test_runtime_failure_falls_back_to_stale_physics_for_that_step(tmp_path: Path, monkeypatch) -> None:
+    dataset, batch = _v2_four_target_batch(tmp_path)
+    model = _ConstantPredictionModel([1.0, 2.0, 31.0, 17.0])
+    stats = _identity_stats(16, target_dim=4)
+    weights = trainer.rollout_weights(1, 2.0, torch.device("cpu"))
+
+    def fail_runtime(*args, **kwargs):
+        raise ValueError("synthetic runtime failure")
+
+    monkeypatch.setattr(trainer, "physics_runtime_step", fail_runtime)
+    rollout = trainer.boundary_conditioned_rollout(
+        model,
+        batch,
+        dataset,
+        stats,
+        weights,
+        runtime_context=_runtime_context(dataset),
+    )
+
+    idx = dataset.feature_indices
+    assert rollout["runtime_step_attempts"] == 1
+    assert rollout["runtime_step_fallbacks"] == 1
+    assert rollout["pred_state"][0, 0, 0, idx["bbox_w"]].item() == pytest.approx(31.0)
+    assert rollout["pred_state"][0, 0, 0, idx["bbox_h"]].item() == pytest.approx(17.0)
+    assert rollout["pred_state"][0, 0, 0, idx["cfd_u_norm"]].item() == pytest.approx(
+        dataset.Z[0, 1, idx["cfd_u_norm"]]
+    )
+
+
+def test_physics_refresh_epoch_schedule_switches_from_stale_to_runtime() -> None:
+    config = {"training": {"physics_refresh": {"runtime_start_epoch": 3}}}
+    runtime_context = object()
+    assert trainer.runtime_context_for_epoch(config, 1, runtime_context) is None
+    assert trainer.runtime_context_for_epoch(config, 2, runtime_context) is None
+    assert trainer.runtime_context_for_epoch(config, 3, runtime_context) is runtime_context
+    assert trainer.physics_refresh_mode(None) == "stale"
+    assert trainer.physics_refresh_mode(runtime_context) == "runtime"
+
+
+def test_stale_refresh_uses_predicted_bbox_and_observed_non_target_physics(tmp_path: Path) -> None:
+    dataset, batch = _v2_four_target_batch(tmp_path)
+    model = _ConstantPredictionModel([1.0, 2.0, 31.0, 17.0])
+    stats = _identity_stats(16, target_dim=4)
+    weights = trainer.rollout_weights(1, 2.0, torch.device("cpu"))
+
+    rollout = trainer.boundary_conditioned_rollout(
+        model,
+        batch,
+        dataset,
+        stats,
+        weights,
+        runtime_context=None,
+    )
+
+    idx = dataset.feature_indices
+    assert rollout["pred_state"][0, 0, 0, idx["bbox_w"]].item() == pytest.approx(31.0)
+    assert rollout["pred_state"][0, 0, 0, idx["bbox_h"]].item() == pytest.approx(17.0)
+    assert rollout["pred_state"][0, 0, 0, idx["cfd_u_norm"]].item() == pytest.approx(
+        dataset.Z[0, 1, idx["cfd_u_norm"]]
+    )
+    assert rollout["pred_state"][0, 0, 0, idx["left_flow_fraction"]].item() == pytest.approx(
+        dataset.Z[0, 1, idx["left_flow_fraction"]]
+    )
+
+
 def _small_model(
     input_dim: int,
     horizon: int,

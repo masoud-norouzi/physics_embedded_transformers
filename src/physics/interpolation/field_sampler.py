@@ -33,21 +33,6 @@ def sample_velocity_field_cfd(field: InterpolatedVelocityField, points_cfd_um: n
         coefficients = paired_velocity_to_basis_coefficients(basis, field.velocity_dof_m_per_s)
         inside_points_m = sample_points[inside].T * UM_TO_M
         velocity[inside] = _evaluate_basis_interpolator(basis, coefficients, inside_points_m)
-        finite = np.isfinite(velocity).all(axis=1)
-        retry = inside & ~finite
-        if np.any(retry) and hasattr(field.mesh.geometry, "outer_ring_um") and hasattr(field.mesh.geometry, "inner_ring_um"):
-            lookup = _projection_lookup(field)
-            sample_points[retry] = lookup.nearest_valid_points(sample_points[retry])
-            retried_inside = _inside_fluid_domain(sample_points[retry], field.mesh.geometry)
-            retry_rows = np.flatnonzero(retry)
-            if np.any(retried_inside):
-                retried_points_m = sample_points[retry_rows[retried_inside]].T * UM_TO_M
-                velocity[retry_rows[retried_inside]] = _evaluate_basis_interpolator(
-                    basis,
-                    coefficients,
-                    retried_points_m,
-                )
-            inside[retry_rows] = retried_inside
 
     speed = np.linalg.norm(velocity, axis=1)
     projection_distance = np.linalg.norm(sample_points - points, axis=1)

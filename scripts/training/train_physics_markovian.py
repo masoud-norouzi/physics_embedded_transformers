@@ -127,7 +127,9 @@ def main(argv: list[str] | None = None) -> None:
         feature_names=tuple(config["model"]["input_feature_names"]),
     )
 
-    run_shape_test(model, train_loader, train_ds, normalization_stats, weights, device, runtime_context)
+    initial_runtime_context = runtime_context_for_epoch(config, 1, runtime_context)
+    print(f"shape_test physics_refresh={physics_refresh_mode(initial_runtime_context)}")
+    run_shape_test(model, train_loader, train_ds, normalization_stats, weights, device, initial_runtime_context)
 
     start_time = time.perf_counter()
     if args.smoke_test:
@@ -376,6 +378,8 @@ def train_full(
     best_val_loss = float("inf")
 
     for epoch in range(1, int(config["training"]["epochs"]) + 1):
+        active_runtime_context = runtime_context_for_epoch(config, epoch, runtime_context)
+        print(f"epoch {epoch:03d} physics_refresh={physics_refresh_mode(active_runtime_context)}")
         train_summary = train_one_epoch(
             model=model,
             loader=train_loader,
@@ -386,7 +390,7 @@ def train_full(
             device=device,
             grad_clip=float(config["training"]["grad_clip"]),
             log_every=int(config["training"]["log_every_n_batches"]),
-            runtime_context=runtime_context,
+            runtime_context=active_runtime_context,
         )
         val_summary = evaluate(
             model=model,
@@ -396,7 +400,7 @@ def train_full(
             weights=weights,
             device=device,
             log_every=int(config["training"]["log_every_n_batches"]),
-            runtime_context=runtime_context,
+            runtime_context=active_runtime_context,
         )
         print_epoch_summary(epoch, train_summary, val_summary)
         append_curves_csv(curves_csv_path, epoch, train_summary, val_summary)
@@ -427,9 +431,10 @@ def train_one_epoch(
     total_loss = 0.0
     total_supervised = 0
     total_present = 0
+    total_runtime_attempts = 0
+    total_runtime_fallbacks = 0
     num_batches = 0
     total_batches = len(loader) if max_batches is None else min(len(loader), max_batches)
-    reset_runtime_diagnostics(runtime_context)
     for batch in loader:
         batch = move_batch_to_device(batch, device)
         optimizer.zero_grad(set_to_none=True)
@@ -449,6 +454,8 @@ def train_one_epoch(
         total_loss += float(loss.detach().cpu())
         total_supervised += int(rollout["supervision_mask"].sum().detach().cpu())
         total_present += int(rollout["mask"].sum().detach().cpu())
+        total_runtime_attempts += int(rollout["runtime_step_attempts"])
+        total_runtime_fallbacks += int(rollout["runtime_step_fallbacks"])
         num_batches += 1
         if log_every > 0 and (num_batches % log_every == 0 or num_batches == total_batches):
             print_progress("train", num_batches, total_batches, total_loss / max(num_batches, 1))
@@ -459,7 +466,9 @@ def train_one_epoch(
         "supervised_samples": float(total_supervised),
         "present_samples": float(total_present),
         "cfd_valid_target_fraction": total_supervised / max(total_present, 1),
-        "physics_runtime_diagnostics": snapshot_runtime_diagnostics(runtime_context),
+        "runtime_step_attempts": float(total_runtime_attempts),
+        "runtime_step_fallbacks": float(total_runtime_fallbacks),
+        "runtime_step_fallback_fraction": total_runtime_fallbacks / max(total_runtime_attempts, 1),
     }
 
 
@@ -478,10 +487,11 @@ def evaluate(
     total_loss = 0.0
     total_supervised = 0
     total_present = 0
+    total_runtime_attempts = 0
+    total_runtime_fallbacks = 0
     num_batches = 0
     total_batches = len(loader) if max_batches is None else min(len(loader), max_batches)
     accumulators = create_accumulators(int(weights.numel()))
-    reset_runtime_diagnostics(runtime_context)
 
     with torch.no_grad():
         for batch in loader:
@@ -497,6 +507,8 @@ def evaluate(
             total_loss += float(rollout["weighted_loss_internal_only"].detach().cpu())
             total_supervised += int(rollout["supervision_mask"].sum().detach().cpu())
             total_present += int(rollout["mask"].sum().detach().cpu())
+            total_runtime_attempts += int(rollout["runtime_step_attempts"])
+            total_runtime_fallbacks += int(rollout["runtime_step_fallbacks"])
             update_metric_accumulators(accumulators, rollout)
             num_batches += 1
             if log_every > 0 and (num_batches % log_every == 0 or num_batches == total_batches):
@@ -509,11 +521,13 @@ def evaluate(
     summary["supervised_samples"] = float(total_supervised)
     summary["present_samples"] = float(total_present)
     summary["cfd_valid_target_fraction"] = total_supervised / max(total_present, 1)
+    summary["runtime_step_attempts"] = float(total_runtime_attempts)
+    summary["runtime_step_fallbacks"] = float(total_runtime_fallbacks)
+    summary["runtime_step_fallback_fraction"] = total_runtime_fallbacks / max(total_runtime_attempts, 1)
     summary["step_rmse_position"] = [
         metrics_from_accumulator(accumulator)["rmse_position"]
         for accumulator in accumulators["steps"]
     ]
-    summary["physics_runtime_diagnostics"] = snapshot_runtime_diagnostics(runtime_context)
     return summary
 
 
@@ -533,6 +547,8 @@ def boundary_conditioned_rollout(model, batch, dataset, normalization_stats, wei
     supervision_masks = []
     boundary_masks = []
     step_losses = []
+    runtime_step_attempts = 0
+    runtime_step_fallbacks = 0
 
     feature_index = dataset.feature_indices
     true_future_features = get_true_future_features(batch, dataset, device, weights.numel())
@@ -564,21 +580,44 @@ def boundary_conditioned_rollout(model, batch, dataset, normalization_stats, wei
         boundary_mask = entering_mask & true_step_features_finite
 
         if runtime_context is None:
-            velocity_to_px_frame = velocity_mm_s_to_px_frame_scale(dataset, device)
-            x_next = last_frame[:, :, feature_index["x"]] + pred_step_phys_raw[:, :, 0] * velocity_to_px_frame
-            y_next = last_frame[:, :, feature_index["y"]] + pred_step_phys_raw[:, :, 1] * velocity_to_px_frame
-
-            new_frame_phys = last_frame.clone()
-            new_frame_phys[:, :, feature_index["x"]] = x_next
-            new_frame_phys[:, :, feature_index["y"]] = y_next
-            new_frame_phys[:, :, feature_index["vx"]] = pred_step_phys_raw[:, :, 0]
-            new_frame_phys[:, :, feature_index["vy"]] = pred_step_phys_raw[:, :, 1]
-            new_frame_phys[boundary_mask] = true_step_features[boundary_mask]
-            refresh_observed_non_target_features(new_frame_phys, true_step_features, new_mask, feature_index)
+            new_frame_phys = build_stale_refresh_frame(
+                last_frame,
+                pred_step_phys_raw,
+                true_step_features,
+                new_mask,
+                boundary_mask,
+                feature_index,
+                dataset,
+                device,
+            )
         else:
             new_frame_phys = torch.zeros_like(last_frame)
-            refreshed_phys = runtime_step_batch(last_frame, pred_step_phys_raw, continuing_mask, runtime_context)
-            new_frame_phys = torch.where(continuing_mask[:, :, None], refreshed_phys, new_frame_phys)
+            refreshed_phys, runtime_success = runtime_step_batch(
+                last_frame,
+                pred_step_phys_raw,
+                continuing_mask,
+                runtime_context,
+            )
+            runtime_attempt_rows = continuing_mask.any(dim=1)
+            runtime_fallback_rows = runtime_attempt_rows & ~runtime_success
+            runtime_step_attempts += int(runtime_attempt_rows.sum().detach().cpu())
+            runtime_step_fallbacks += int(runtime_fallback_rows.sum().detach().cpu())
+
+            runtime_mask = continuing_mask & runtime_success[:, None]
+            new_frame_phys = torch.where(runtime_mask[:, :, None], refreshed_phys, new_frame_phys)
+            if runtime_fallback_rows.any():
+                stale_frame_phys = build_stale_refresh_frame(
+                    last_frame,
+                    pred_step_phys_raw,
+                    true_step_features,
+                    new_mask,
+                    boundary_mask,
+                    feature_index,
+                    dataset,
+                    device,
+                )
+                fallback_mask = new_mask & runtime_fallback_rows[:, None]
+                new_frame_phys = torch.where(fallback_mask[:, :, None], stale_frame_phys, new_frame_phys)
             new_frame_phys[boundary_mask] = true_step_features[boundary_mask]
 
         pred_step_norm = pred_step_norm_raw.clone()
@@ -634,11 +673,40 @@ def boundary_conditioned_rollout(model, batch, dataset, normalization_stats, wei
         "supervision_mask": supervision_mask_tensor,
         "boundary_mask": torch.stack(boundary_masks, dim=1),
         "internal_loss_mask": supervision_mask_tensor,
+        "runtime_step_attempts": runtime_step_attempts,
+        "runtime_step_fallbacks": runtime_step_fallbacks,
     }
 
 
+def build_stale_refresh_frame(
+    last_frame,
+    pred_step_phys_raw,
+    true_step_features,
+    new_mask,
+    boundary_mask,
+    feature_index,
+    dataset,
+    device,
+):
+    velocity_to_px_frame = velocity_mm_s_to_px_frame_scale(dataset, device)
+    x_next = last_frame[:, :, feature_index["x"]] + pred_step_phys_raw[:, :, 0] * velocity_to_px_frame
+    y_next = last_frame[:, :, feature_index["y"]] + pred_step_phys_raw[:, :, 1] * velocity_to_px_frame
+
+    new_frame_phys = last_frame.clone()
+    new_frame_phys[:, :, feature_index["x"]] = x_next
+    new_frame_phys[:, :, feature_index["y"]] = y_next
+    new_frame_phys[:, :, feature_index["vx"]] = pred_step_phys_raw[:, :, 0]
+    new_frame_phys[:, :, feature_index["vy"]] = pred_step_phys_raw[:, :, 1]
+    if pred_step_phys_raw.shape[-1] >= 4 and "bbox_w" in feature_index and "bbox_h" in feature_index:
+        new_frame_phys[:, :, feature_index["bbox_w"]] = pred_step_phys_raw[:, :, 2]
+        new_frame_phys[:, :, feature_index["bbox_h"]] = pred_step_phys_raw[:, :, 3]
+    new_frame_phys[boundary_mask] = true_step_features[boundary_mask]
+    refresh_observed_non_target_features(new_frame_phys, true_step_features, new_mask, feature_index)
+    return new_frame_phys
+
+
 def refresh_observed_non_target_features(new_frame_phys, true_step_features, new_mask, feature_index) -> None:
-    predicted_names = {"x", "y", "vx", "vy"}
+    predicted_names = {"x", "y", "vx", "vy", "bbox_w", "bbox_h"}
     for name, index in feature_index.items():
         if name in predicted_names:
             continue
@@ -654,20 +722,26 @@ def runtime_step_batch(current_state_phys, model_prediction_phys, active_mask, r
     prediction_np = model_prediction_phys.detach().cpu().numpy().astype(np.float32, copy=True)
     active_np = active_mask.detach().cpu().numpy().astype(bool, copy=True)
     next_np = np.zeros_like(current_np, dtype=np.float32)
+    success_np = np.ones(current_np.shape[0], dtype=bool)
 
     for batch_index in range(current_np.shape[0]):
         active_slots = active_np[batch_index]
         if not np.any(active_slots):
             continue
-        next_active = physics_runtime_step(
-            current_np[batch_index, active_slots],
-            prediction_np[batch_index, active_slots],
-            runtime_context,
-            active_mask=np.ones(int(np.count_nonzero(active_slots)), dtype=bool),
-        )
+        try:
+            next_active = physics_runtime_step(
+                current_np[batch_index, active_slots],
+                prediction_np[batch_index, active_slots],
+                runtime_context,
+                active_mask=np.ones(int(np.count_nonzero(active_slots)), dtype=bool),
+            )
+        except Exception:
+            success_np[batch_index] = False
+            continue
         next_np[batch_index, active_slots] = next_active
 
-    return torch.as_tensor(next_np, dtype=dtype, device=device)
+    success = torch.as_tensor(success_np, dtype=torch.bool, device=device)
+    return torch.as_tensor(next_np, dtype=dtype, device=device), success
 
 
 def masked_velocity_mse(prediction, target, mask):
@@ -825,44 +899,21 @@ def print_epoch_summary(epoch, train_summary, val_summary):
         f"val_rmse_vx={val_summary['rmse_vx']:.6f} "
         f"val_rmse_vy={val_summary['rmse_vy']:.6f} "
         f"val_rmse_speed={val_summary['rmse_speed']:.6f} "
-        f"val_rmse_position={val_summary['rmse_position']:.6f}"
+        f"val_rmse_position={val_summary['rmse_position']:.6f} "
+        f"train_runtime_fallback={train_summary.get('runtime_step_fallback_fraction', 0.0):.6f} "
+        f"val_runtime_fallback={val_summary.get('runtime_step_fallback_fraction', 0.0):.6f}"
     )
     print(f"  stepwise_val_rmse_position {step_text}")
-    print_runtime_diagnostics("train", train_summary.get("physics_runtime_diagnostics", {}))
-    print_runtime_diagnostics("val", val_summary.get("physics_runtime_diagnostics", {}))
 
 
-def print_runtime_diagnostics(label: str, diagnostics: dict[str, int]) -> None:
-    if not diagnostics:
-        return
-    runtime_calls = max(int(diagnostics.get("runtime_calls", 0)), 1)
-    active_updates = max(int(diagnostics.get("active_droplet_updates", 0)), 1)
-    split_clamps = int(diagnostics.get("cfd_split_clamped_low", 0)) + int(diagnostics.get("cfd_split_clamped_high", 0))
-    ellipse_events = int(diagnostics.get("ellipse_outside_image", 0)) + int(diagnostics.get("ellipse_zero_raster_pixels", 0))
-    cfd_projections = int(diagnostics.get("cfd_query_projected", 0)) + int(diagnostics.get("cfd_fem_retry_projected", 0))
-    parts = [
-        f"runtime_calls={diagnostics.get('runtime_calls', 0)}",
-        f"active_updates={diagnostics.get('active_droplet_updates', 0)}",
-        f"split_clamps={split_clamps} ({split_clamps / runtime_calls:.3g}/step)",
-        f"ellipse_fallbacks={ellipse_events} ({ellipse_events / active_updates:.3g}/droplet)",
-        f"occupancy_not_computable={diagnostics.get('occupancy_not_computable', 0)}",
-        f"cfd_projections={cfd_projections} ({cfd_projections / active_updates:.3g}/droplet)",
-        f"cfd_nonfinite_after_retry={diagnostics.get('cfd_nonfinite_after_retry', 0)}",
-    ]
-    print(f"  {label}_physics_runtime_diagnostics " + " ".join(parts))
+def runtime_context_for_epoch(config: dict[str, Any], epoch: int, runtime_context):
+    refresh = config.get("training", {}).get("physics_refresh", {})
+    runtime_start = int(refresh.get("runtime_start_epoch", 1))
+    return runtime_context if int(epoch) >= runtime_start else None
 
 
-def reset_runtime_diagnostics(runtime_context) -> None:
-    diagnostics = getattr(runtime_context, "diagnostics", None)
-    if diagnostics is not None:
-        diagnostics.reset()
-
-
-def snapshot_runtime_diagnostics(runtime_context) -> dict[str, int]:
-    diagnostics = getattr(runtime_context, "diagnostics", None)
-    if diagnostics is None:
-        return {}
-    return diagnostics.snapshot()
+def physics_refresh_mode(runtime_context) -> str:
+    return "runtime" if runtime_context is not None else "stale"
 
 
 def initialize_curves_csv(path):
@@ -881,6 +932,12 @@ def initialize_curves_csv(path):
                 "val_rmse_vy",
                 "val_rmse_speed",
                 "val_rmse_position",
+                "train_runtime_step_attempts",
+                "train_runtime_step_fallbacks",
+                "train_runtime_step_fallback_fraction",
+                "val_runtime_step_attempts",
+                "val_runtime_step_fallbacks",
+                "val_runtime_step_fallback_fraction",
             ]
         )
 
@@ -899,6 +956,12 @@ def append_curves_csv(path, epoch, train_summary, val_summary):
                 val_summary["rmse_vy"],
                 val_summary["rmse_speed"],
                 val_summary["rmse_position"],
+                train_summary.get("runtime_step_attempts", 0.0),
+                train_summary.get("runtime_step_fallbacks", 0.0),
+                train_summary.get("runtime_step_fallback_fraction", 0.0),
+                val_summary.get("runtime_step_attempts", 0.0),
+                val_summary.get("runtime_step_fallbacks", 0.0),
+                val_summary.get("runtime_step_fallback_fraction", 0.0),
             ]
         )
 

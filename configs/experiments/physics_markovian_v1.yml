@@ -52,6 +52,8 @@ training:
   loss_alpha: 2.0
   log_every_n_batches: 25
   output_dir: outputs/models/physics_markovian_v1
+  physics_refresh:
+    runtime_start_epoch: 2
 
 device:
   mode: auto
