@@ -265,11 +265,11 @@ def test_runtime_failure_falls_back_to_stale_physics_for_that_step(tmp_path: Pat
 
 
 def test_physics_refresh_epoch_schedule_switches_from_stale_to_runtime() -> None:
-    config = {"training": {"physics_refresh": {"runtime_start_epoch": 3}}}
+    config = {"training": {"physics_refresh": {"runtime_start_epoch": 6}}}
     runtime_context = object()
     assert trainer.runtime_context_for_epoch(config, 1, runtime_context) is None
-    assert trainer.runtime_context_for_epoch(config, 2, runtime_context) is None
-    assert trainer.runtime_context_for_epoch(config, 3, runtime_context) is runtime_context
+    assert trainer.runtime_context_for_epoch(config, 5, runtime_context) is None
+    assert trainer.runtime_context_for_epoch(config, 6, runtime_context) is runtime_context
     assert trainer.physics_refresh_mode(None) == "stale"
     assert trainer.physics_refresh_mode(runtime_context) == "runtime"
 

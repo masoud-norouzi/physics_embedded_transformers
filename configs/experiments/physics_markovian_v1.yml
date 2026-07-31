@@ -53,7 +53,7 @@ training:
   log_every_n_batches: 25
   output_dir: outputs/models/physics_markovian_v1
   physics_refresh:
-    runtime_start_epoch: 2
+    runtime_start_epoch: 6
 
 device:
   mode: auto
