@@ -66,7 +66,21 @@ CURVES_COLUMNS = [
     "val_runtime_step_fallbacks",
     "val_runtime_step_fallback_fraction",
     *[f"val_rmse_position_s{step}" for step in DIAGNOSTIC_STEPS],
+    "val_pure_weighted_loss_internal_only",
+    "val_pure_rmse_vx",
+    "val_pure_rmse_vy",
+    "val_pure_rmse_speed",
+    "val_pure_rmse_position",
+    "val_pure_runtime_step_attempts",
+    "val_pure_runtime_step_fallbacks",
+    "val_pure_runtime_step_fallback_fraction",
+    *[f"val_pure_rmse_position_s{step}" for step in DIAGNOSTIC_STEPS],
     *[f"adaptive_fusion_alpha_s{step}" for step in DIAGNOSTIC_STEPS],
+    *[
+        f"adaptive_fusion_alpha_{feature}_s{step}"
+        for feature in RUNTIME_TARGET_FEATURES
+        for step in DIAGNOSTIC_STEPS
+    ],
     "adaptive_fusion_alpha_mean",
 ]
 
@@ -129,6 +143,16 @@ class AdaptiveTargetFusion:
             "alpha_by_step_mean": alpha.mean(axis=1).tolist(),
             "alpha_mean": float(alpha.mean()),
         }
+
+
+class ZeroAdaptiveTargetFusion:
+    enabled = True
+
+    def __init__(self, horizon: int, target_dim: int, device) -> None:
+        self._alpha = torch.zeros((int(horizon), int(target_dim)), dtype=torch.float32, device=device)
+
+    def alpha_tensor(self) -> torch.Tensor:
+        return self._alpha
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -461,6 +485,7 @@ def train_full(
     initialize_curves_csv(curves_csv_path)
     best_val_loss = float("inf")
     adaptive_fusion = create_adaptive_target_fusion(config, weights, model_config, device)
+    pure_validation_fusion = ZeroAdaptiveTargetFusion(weights.numel(), model_config["target_dim"], device)
     alpha_history: list[dict[str, Any]] = []
 
     for epoch in range(1, int(config["training"]["epochs"]) + 1):
@@ -491,18 +516,30 @@ def train_full(
             runtime_context=active_runtime_context,
             adaptive_fusion=active_fusion,
         )
+        val_pure_summary = evaluate(
+            model=model,
+            loader=val_loader,
+            dataset=dataset,
+            normalization_stats=normalization_stats,
+            weights=weights,
+            device=device,
+            log_every=0,
+            runtime_context=active_runtime_context,
+            adaptive_fusion=pure_validation_fusion if active_runtime_context is not None else None,
+        )
         fusion_summary = adaptive_fusion.summary() if active_fusion is not None else inactive_adaptive_fusion_summary(adaptive_fusion)
         train_summary["adaptive_fusion"] = fusion_summary
+        val_summary["pure"] = val_pure_summary
         alpha_history.append({"epoch": epoch, **fusion_summary})
         print_epoch_summary(epoch, train_summary, val_summary)
         append_curves_csv(curves_csv_path, epoch, train_summary, val_summary)
         save_adaptive_fusion_alpha_plot(alpha_history, output_dir / "adaptive_fusion_alpha_by_epoch.png")
 
-        checkpoint = build_checkpoint(model, optimizer, epoch, val_summary, normalization_stats, config, model_config)
+        checkpoint = build_checkpoint(model, optimizer, epoch, val_pure_summary, normalization_stats, config, model_config)
         latest_path = output_dir / "latest_checkpoint.pt"
         torch.save(checkpoint, latest_path)
-        if val_summary["weighted_loss_internal_only"] < best_val_loss:
-            best_val_loss = val_summary["weighted_loss_internal_only"]
+        if val_pure_summary["weighted_loss_internal_only"] < best_val_loss:
+            best_val_loss = val_pure_summary["weighted_loss_internal_only"]
             torch.save(checkpoint, output_dir / "best_checkpoint.pt")
             print(f"Saved best checkpoint: {output_dir / 'best_checkpoint.pt'}")
 
@@ -1095,6 +1132,21 @@ def print_epoch_summary(epoch, train_summary, val_summary):
         f"val_runtime_fallback={val_summary.get('runtime_step_fallback_fraction', 0.0):.6f}"
     )
     print(f"  stepwise_val_rmse_position {step_text}")
+    pure = val_summary.get("pure")
+    if pure is not None:
+        pure_available_steps = min(len(pure["step_rmse_position"]), max(DIAGNOSTIC_STEPS))
+        pure_step_text = " ".join(
+            f"s{step}={pure['step_rmse_position'][step - 1]:.6f}"
+            for step in DIAGNOSTIC_STEPS
+            if step <= pure_available_steps
+        )
+        print(
+            f"  pure_alpha0_val "
+            f"weighted_loss_internal_only={pure['weighted_loss_internal_only']:.6f} "
+            f"rmse_position={pure['rmse_position']:.6f} "
+            f"runtime_fallback={pure.get('runtime_step_fallback_fraction', 0.0):.6f}"
+        )
+        print(f"  pure_alpha0_stepwise_val_rmse_position {pure_step_text}")
     fusion = train_summary.get("adaptive_fusion", {})
     if fusion.get("enabled"):
         alpha_values = fusion.get("alpha_by_step_mean", [])
@@ -1142,6 +1194,24 @@ def diagnostic_alpha_value(summary: dict[str, Any], step: int) -> float:
     return float(values[step - 1]) if step <= len(values) else 0.0
 
 
+def diagnostic_alpha_feature_value(summary: dict[str, Any], feature_index: int, step: int) -> float:
+    fusion = summary.get("adaptive_fusion", {})
+    values = fusion.get("alpha_by_step_feature", [])
+    if step > len(values):
+        return 0.0
+    step_values = values[step - 1]
+    return float(step_values[feature_index]) if feature_index < len(step_values) else 0.0
+
+
+def pure_summary_value(summary: dict[str, Any], key: str) -> float:
+    return float(summary.get("pure", {}).get(key, summary.get(key, np.nan)))
+
+
+def pure_diagnostic_step_value(summary: dict[str, Any], step: int) -> float:
+    pure = summary.get("pure", summary)
+    return diagnostic_step_value(pure, step)
+
+
 def save_adaptive_fusion_alpha_plot(alpha_history: list[dict[str, Any]], path: Path) -> None:
     if not alpha_history:
         return
@@ -1187,7 +1257,21 @@ def append_curves_csv(path, epoch, train_summary, val_summary):
                 val_summary.get("runtime_step_fallbacks", 0.0),
                 val_summary.get("runtime_step_fallback_fraction", 0.0),
                 *[diagnostic_step_value(val_summary, step) for step in DIAGNOSTIC_STEPS],
+                pure_summary_value(val_summary, "weighted_loss_internal_only"),
+                pure_summary_value(val_summary, "rmse_vx"),
+                pure_summary_value(val_summary, "rmse_vy"),
+                pure_summary_value(val_summary, "rmse_speed"),
+                pure_summary_value(val_summary, "rmse_position"),
+                pure_summary_value(val_summary, "runtime_step_attempts"),
+                pure_summary_value(val_summary, "runtime_step_fallbacks"),
+                pure_summary_value(val_summary, "runtime_step_fallback_fraction"),
+                *[pure_diagnostic_step_value(val_summary, step) for step in DIAGNOSTIC_STEPS],
                 *[diagnostic_alpha_value(train_summary, step) for step in DIAGNOSTIC_STEPS],
+                *[
+                    diagnostic_alpha_feature_value(train_summary, feature_index, step)
+                    for feature_index, _feature in enumerate(RUNTIME_TARGET_FEATURES)
+                    for step in DIAGNOSTIC_STEPS
+                ],
                 train_summary.get("adaptive_fusion", {}).get("alpha_mean", 0.0),
             ]
         )

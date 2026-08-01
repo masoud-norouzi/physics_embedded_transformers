@@ -346,6 +346,12 @@ def test_adaptive_fusion_alpha_decreases_with_lower_prediction_variance() -> Non
     assert fusion.alpha_tensor()[0, 0].item() == pytest.approx(0.0)
 
 
+def test_zero_adaptive_fusion_forces_pure_prediction_rollout() -> None:
+    fusion = trainer.ZeroAdaptiveTargetFusion(horizon=3, target_dim=4, device=torch.device("cpu"))
+    assert fusion.enabled is True
+    assert torch.equal(fusion.alpha_tensor(), torch.zeros(3, 4))
+
+
 def test_training_curves_include_step_rmse_and_adaptive_alpha(tmp_path: Path) -> None:
     path = tmp_path / "training_curves.csv"
     train_summary = {
@@ -355,6 +361,7 @@ def test_training_curves_include_step_rmse_and_adaptive_alpha(tmp_path: Path) ->
         "runtime_step_fallbacks": 0.0,
         "runtime_step_fallback_fraction": 0.0,
         "adaptive_fusion": {
+            "alpha_by_step_feature": [[0.1, 0.2, 0.3, 0.4] for _ in range(50)],
             "alpha_by_step_mean": [0.1] * 50,
             "alpha_mean": 0.1,
         },
@@ -370,6 +377,17 @@ def test_training_curves_include_step_rmse_and_adaptive_alpha(tmp_path: Path) ->
         "runtime_step_fallbacks": 0.0,
         "runtime_step_fallback_fraction": 0.0,
         "step_rmse_position": [float(step) for step in range(1, 51)],
+        "pure": {
+            "weighted_loss_internal_only": 3.0,
+            "rmse_vx": 4.0,
+            "rmse_vy": 5.0,
+            "rmse_speed": 6.0,
+            "rmse_position": 7.0,
+            "runtime_step_attempts": 8.0,
+            "runtime_step_fallbacks": 1.0,
+            "runtime_step_fallback_fraction": 0.125,
+            "step_rmse_position": [float(step * 10) for step in range(1, 51)],
+        },
     }
 
     trainer.initialize_curves_csv(path)
@@ -377,17 +395,20 @@ def test_training_curves_include_step_rmse_and_adaptive_alpha(tmp_path: Path) ->
 
     lines = path.read_text().splitlines()
     assert "val_rmse_position_s50" in lines[0]
+    assert "val_pure_rmse_position_s50" in lines[0]
     assert "adaptive_fusion_alpha_s50" in lines[0]
+    assert "adaptive_fusion_alpha_bbox_h_s50" in lines[0]
     assert lines[1].split(",")[trainer.CURVES_COLUMNS.index("val_rmse_position_s50")] == "50.0"
+    assert lines[1].split(",")[trainer.CURVES_COLUMNS.index("val_pure_rmse_position_s50")] == "500.0"
     assert lines[1].split(",")[trainer.CURVES_COLUMNS.index("adaptive_fusion_alpha_s50")] == "0.1"
+    assert lines[1].split(",")[trainer.CURVES_COLUMNS.index("adaptive_fusion_alpha_bbox_h_s50")] == "0.4"
 
 
 def test_physics_refresh_epoch_schedule_switches_from_stale_to_runtime() -> None:
-    config = {"training": {"physics_refresh": {"runtime_start_epoch": 6}}}
+    config = {"training": {"physics_refresh": {"runtime_start_epoch": 2}}}
     runtime_context = object()
     assert trainer.runtime_context_for_epoch(config, 1, runtime_context) is None
-    assert trainer.runtime_context_for_epoch(config, 5, runtime_context) is None
-    assert trainer.runtime_context_for_epoch(config, 6, runtime_context) is runtime_context
+    assert trainer.runtime_context_for_epoch(config, 2, runtime_context) is runtime_context
     assert trainer.physics_refresh_mode(None) == "stale"
     assert trainer.physics_refresh_mode(runtime_context) == "runtime"
 
