@@ -143,16 +143,17 @@ def runtime_step_batch(current_state_phys, model_prediction_phys, active_mask, r
     prediction_np = model_prediction_phys.detach().cpu().numpy().astype(np.float32, copy=True)
     active_np = active_mask.detach().cpu().numpy().astype(bool, copy=True)
     next_np = np.zeros_like(current_np, dtype=np.float32)
+    active_mask_cache: dict[int, np.ndarray] = {}
 
-    for batch_index in range(current_np.shape[0]):
+    for batch_index in np.flatnonzero(active_np.any(axis=1)):
         active_slots = active_np[batch_index]
-        if not np.any(active_slots):
-            continue
+        active_count = int(np.count_nonzero(active_slots))
+        runtime_active_mask = active_mask_cache.setdefault(active_count, np.ones(active_count, dtype=bool))
         next_active = physics_runtime_step(
             current_np[batch_index, active_slots],
             prediction_np[batch_index, active_slots],
             runtime_context,
-            active_mask=np.ones(int(np.count_nonzero(active_slots)), dtype=bool),
+            active_mask=runtime_active_mask,
         )
         next_np[batch_index, active_slots] = next_active
 

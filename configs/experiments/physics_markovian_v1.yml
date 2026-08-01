@@ -54,6 +54,13 @@ training:
   output_dir: outputs/models/physics_markovian_v1
   physics_refresh:
     runtime_start_epoch: 6
+  adaptive_target_fusion:
+    enabled: true
+    ema_beta: 0.95
+    initial_prediction_variance: 1.0
+    measurement_variance: 4.0
+    min_alpha: 0.0
+    max_alpha: 0.8
 
 device:
   mode: auto

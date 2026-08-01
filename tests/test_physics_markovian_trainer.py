@@ -161,6 +161,32 @@ def test_closed_loop_runtime_is_called_for_every_predicted_step(tmp_path: Path, 
     assert [int(call["active_mask"].sum()) for call in recorder.calls] == [2, 2, 2]
 
 
+def test_runtime_batch_preserves_independent_batch_rows(tmp_path: Path, monkeypatch) -> None:
+    dataset, batch = _v2_four_target_batch(tmp_path)
+    batch = {key: value.repeat(2, *([1] * (value.ndim - 1))) for key, value in batch.items()}
+    batch["history_x"][1, :, :, dataset.feature_indices["x"]] += 10.0
+    model = _ConstantPredictionModel([1.0, 2.0, 21.0, 13.0])
+    stats = _identity_stats(16, target_dim=4)
+    weights = trainer.rollout_weights(1, 2.0, torch.device("cpu"))
+    recorder = _RuntimeRecorder(dataset.feature_indices)
+    monkeypatch.setattr(trainer, "physics_runtime_step", recorder)
+
+    rollout = trainer.boundary_conditioned_rollout(
+        model,
+        batch,
+        dataset,
+        stats,
+        weights,
+        runtime_context=_runtime_context(dataset),
+    )
+
+    x_index = dataset.feature_indices["x"]
+    assert len(recorder.calls) == 2
+    assert [call["current_state"].shape[0] for call in recorder.calls] == [2, 2]
+    assert rollout["pred_state"][0, 0, 0, x_index].item() == pytest.approx(100.0)
+    assert rollout["pred_state"][1, 0, 0, x_index].item() == pytest.approx(101.0)
+
+
 def test_closed_loop_runtime_state_becomes_next_model_input(tmp_path: Path, monkeypatch) -> None:
     dataset, batch = _v2_four_target_batch(tmp_path)
     model = _ConstantPredictionModel([1.0, 2.0, 21.0, 13.0])
@@ -260,8 +286,100 @@ def test_runtime_failure_falls_back_to_stale_physics_for_that_step(tmp_path: Pat
     assert rollout["pred_state"][0, 0, 0, idx["bbox_w"]].item() == pytest.approx(31.0)
     assert rollout["pred_state"][0, 0, 0, idx["bbox_h"]].item() == pytest.approx(17.0)
     assert rollout["pred_state"][0, 0, 0, idx["cfd_u_norm"]].item() == pytest.approx(
-        dataset.Z[0, 1, idx["cfd_u_norm"]]
+        dataset.Z[0, 0, idx["cfd_u_norm"]]
     )
+
+
+def test_adaptive_fusion_uses_truth_for_rollout_but_loss_uses_raw_prediction(tmp_path: Path) -> None:
+    dataset, batch = _v2_four_target_batch(tmp_path)
+    model = _ConstantPredictionModel([10.0, 20.0, 31.0, 17.0])
+    stats = _identity_stats(16, target_dim=4)
+    weights = trainer.rollout_weights(1, 2.0, torch.device("cpu"))
+    fusion = trainer.AdaptiveTargetFusion(
+        horizon=1,
+        target_dim=4,
+        enabled=True,
+        ema_beta=0.0,
+        initial_prediction_variance=100.0,
+        measurement_variance=1.0e-9,
+        min_alpha=0.0,
+        max_alpha=1.0,
+        device=torch.device("cpu"),
+    )
+
+    rollout = trainer.boundary_conditioned_rollout(
+        model,
+        batch,
+        dataset,
+        stats,
+        weights,
+        runtime_context=None,
+        adaptive_fusion=fusion,
+    )
+
+    idx = dataset.feature_indices
+    assert rollout["pred_target"][0, 0, 0, 0].item() == pytest.approx(10.0)
+    assert rollout["true_target"][0, 0, 0, 0].item() == pytest.approx(1.0)
+    assert rollout["weighted_loss_internal_only"].item() > 0.0
+    assert rollout["pred_state"][0, 0, 0, idx["vx"]].item() == pytest.approx(1.0)
+    assert rollout["pred_state"][0, 0, 0, idx["bbox_w"]].item() == pytest.approx(20.0)
+
+
+def test_adaptive_fusion_alpha_decreases_with_lower_prediction_variance() -> None:
+    fusion = trainer.AdaptiveTargetFusion(
+        horizon=2,
+        target_dim=4,
+        enabled=True,
+        ema_beta=0.0,
+        initial_prediction_variance=4.0,
+        measurement_variance=4.0,
+        min_alpha=0.0,
+        max_alpha=0.8,
+        device=torch.device("cpu"),
+    )
+    assert fusion.alpha_tensor()[0, 0].item() == pytest.approx(0.5)
+
+    mse = torch.zeros(2, 4)
+    counts = torch.ones(2, 4)
+    fusion.update(mse, counts)
+
+    assert fusion.alpha_tensor()[0, 0].item() == pytest.approx(0.0)
+
+
+def test_training_curves_include_step_rmse_and_adaptive_alpha(tmp_path: Path) -> None:
+    path = tmp_path / "training_curves.csv"
+    train_summary = {
+        "weighted_loss_internal_only": 1.0,
+        "cfd_valid_target_fraction": 0.5,
+        "runtime_step_attempts": 2.0,
+        "runtime_step_fallbacks": 0.0,
+        "runtime_step_fallback_fraction": 0.0,
+        "adaptive_fusion": {
+            "alpha_by_step_mean": [0.1] * 50,
+            "alpha_mean": 0.1,
+        },
+    }
+    val_summary = {
+        "weighted_loss_internal_only": 2.0,
+        "cfd_valid_target_fraction": 0.6,
+        "rmse_vx": 1.0,
+        "rmse_vy": 2.0,
+        "rmse_speed": 3.0,
+        "rmse_position": 4.0,
+        "runtime_step_attempts": 3.0,
+        "runtime_step_fallbacks": 0.0,
+        "runtime_step_fallback_fraction": 0.0,
+        "step_rmse_position": [float(step) for step in range(1, 51)],
+    }
+
+    trainer.initialize_curves_csv(path)
+    trainer.append_curves_csv(path, 1, train_summary, val_summary)
+
+    lines = path.read_text().splitlines()
+    assert "val_rmse_position_s50" in lines[0]
+    assert "adaptive_fusion_alpha_s50" in lines[0]
+    assert lines[1].split(",")[trainer.CURVES_COLUMNS.index("val_rmse_position_s50")] == "50.0"
+    assert lines[1].split(",")[trainer.CURVES_COLUMNS.index("adaptive_fusion_alpha_s50")] == "0.1"
 
 
 def test_physics_refresh_epoch_schedule_switches_from_stale_to_runtime() -> None:

@@ -49,6 +49,86 @@ FEATURE_NAMES = [
 
 DIAGNOSTIC_STEPS = (1, 5, 10, 20, 30, 40, 50)
 RUNTIME_TARGET_FEATURES = ("vx", "vy", "bbox_w", "bbox_h")
+CURVES_COLUMNS = [
+    "epoch",
+    "train_weighted_loss_internal_only",
+    "val_weighted_loss_internal_only",
+    "train_cfd_valid_target_fraction",
+    "val_cfd_valid_target_fraction",
+    "val_rmse_vx",
+    "val_rmse_vy",
+    "val_rmse_speed",
+    "val_rmse_position",
+    "train_runtime_step_attempts",
+    "train_runtime_step_fallbacks",
+    "train_runtime_step_fallback_fraction",
+    "val_runtime_step_attempts",
+    "val_runtime_step_fallbacks",
+    "val_runtime_step_fallback_fraction",
+    *[f"val_rmse_position_s{step}" for step in DIAGNOSTIC_STEPS],
+    *[f"adaptive_fusion_alpha_s{step}" for step in DIAGNOSTIC_STEPS],
+    "adaptive_fusion_alpha_mean",
+]
+
+
+class AdaptiveTargetFusion:
+    """EMA-driven measurement-weighted target fusion for recurrent rollout inputs."""
+
+    def __init__(
+        self,
+        *,
+        horizon: int,
+        target_dim: int,
+        enabled: bool,
+        ema_beta: float,
+        initial_prediction_variance: float,
+        measurement_variance: float,
+        min_alpha: float,
+        max_alpha: float,
+        device,
+    ) -> None:
+        self.enabled = bool(enabled)
+        self.ema_beta = float(ema_beta)
+        self.measurement_variance = float(measurement_variance)
+        self.min_alpha = float(min_alpha)
+        self.max_alpha = float(max_alpha)
+        self.prediction_variance = torch.full(
+            (int(horizon), int(target_dim)),
+            float(initial_prediction_variance),
+            dtype=torch.float32,
+            device=device,
+        )
+        self.last_alpha = self.alpha_tensor().detach().cpu().numpy()
+
+    def alpha_tensor(self) -> torch.Tensor:
+        if not self.enabled:
+            return torch.zeros_like(self.prediction_variance)
+        denominator = self.prediction_variance + self.measurement_variance
+        alpha = self.prediction_variance / torch.clamp_min(denominator, 1.0e-12)
+        return torch.clamp(alpha, self.min_alpha, self.max_alpha)
+
+    def update(self, mse_by_step_feature: torch.Tensor, count_by_step_feature: torch.Tensor) -> None:
+        if not self.enabled:
+            return
+        valid = count_by_step_feature > 0
+        if not bool(valid.any().item()):
+            return
+        mse = torch.where(valid, mse_by_step_feature, self.prediction_variance)
+        self.prediction_variance = torch.where(
+            valid,
+            self.ema_beta * self.prediction_variance + (1.0 - self.ema_beta) * mse,
+            self.prediction_variance,
+        )
+        self.last_alpha = self.alpha_tensor().detach().cpu().numpy()
+
+    def summary(self) -> dict[str, Any]:
+        alpha = self.last_alpha if self.enabled else np.zeros_like(self.last_alpha)
+        return {
+            "enabled": self.enabled,
+            "alpha_by_step_feature": alpha.tolist(),
+            "alpha_by_step_mean": alpha.mean(axis=1).tolist(),
+            "alpha_mean": float(alpha.mean()),
+        }
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -299,6 +379,7 @@ def run_smoke_test(
     model_config,
     output_dir: Path,
 ) -> dict[str, Any]:
+    adaptive_fusion = create_adaptive_target_fusion(config, weights, model_config, device)
     train_summary = train_one_epoch(
         model=model,
         loader=train_loader,
@@ -311,6 +392,7 @@ def run_smoke_test(
         log_every=int(config["training"]["log_every_n_batches"]),
         max_batches=int(config["smoke_test"]["optimization_steps"]),
         runtime_context=runtime_context,
+        adaptive_fusion=adaptive_fusion,
     )
     val_summary = evaluate(
         model=model,
@@ -322,6 +404,7 @@ def run_smoke_test(
         log_every=0,
         max_batches=1,
         runtime_context=runtime_context,
+        adaptive_fusion=adaptive_fusion,
     )
     checkpoint_path = output_dir / "latest_checkpoint.pt"
     checkpoint = build_checkpoint(
@@ -347,6 +430,7 @@ def run_smoke_test(
             normalization_stats,
             weights,
             runtime_context=runtime_context,
+            adaptive_fusion=adaptive_fusion,
         )
     assert torch.isfinite(rollout["weighted_loss_internal_only"])
     return {
@@ -376,9 +460,12 @@ def train_full(
     curves_csv_path = output_dir / "training_curves.csv"
     initialize_curves_csv(curves_csv_path)
     best_val_loss = float("inf")
+    adaptive_fusion = create_adaptive_target_fusion(config, weights, model_config, device)
+    alpha_history: list[dict[str, Any]] = []
 
     for epoch in range(1, int(config["training"]["epochs"]) + 1):
         active_runtime_context = runtime_context_for_epoch(config, epoch, runtime_context)
+        active_fusion = adaptive_fusion if active_runtime_context is not None else None
         print(f"epoch {epoch:03d} physics_refresh={physics_refresh_mode(active_runtime_context)}")
         train_summary = train_one_epoch(
             model=model,
@@ -391,6 +478,7 @@ def train_full(
             grad_clip=float(config["training"]["grad_clip"]),
             log_every=int(config["training"]["log_every_n_batches"]),
             runtime_context=active_runtime_context,
+            adaptive_fusion=active_fusion,
         )
         val_summary = evaluate(
             model=model,
@@ -401,9 +489,14 @@ def train_full(
             device=device,
             log_every=int(config["training"]["log_every_n_batches"]),
             runtime_context=active_runtime_context,
+            adaptive_fusion=active_fusion,
         )
+        fusion_summary = adaptive_fusion.summary() if active_fusion is not None else inactive_adaptive_fusion_summary(adaptive_fusion)
+        train_summary["adaptive_fusion"] = fusion_summary
+        alpha_history.append({"epoch": epoch, **fusion_summary})
         print_epoch_summary(epoch, train_summary, val_summary)
         append_curves_csv(curves_csv_path, epoch, train_summary, val_summary)
+        save_adaptive_fusion_alpha_plot(alpha_history, output_dir / "adaptive_fusion_alpha_by_epoch.png")
 
         checkpoint = build_checkpoint(model, optimizer, epoch, val_summary, normalization_stats, config, model_config)
         latest_path = output_dir / "latest_checkpoint.pt"
@@ -426,6 +519,7 @@ def train_one_epoch(
     log_every: int,
     max_batches: int | None = None,
     runtime_context=None,
+    adaptive_fusion: AdaptiveTargetFusion | None = None,
 ) -> dict[str, float]:
     model.train()
     total_loss = 0.0
@@ -445,6 +539,7 @@ def train_one_epoch(
             normalization_stats,
             weights,
             runtime_context=runtime_context,
+            adaptive_fusion=adaptive_fusion,
         )
         loss = rollout["weighted_loss_internal_only"]
         loss.backward()
@@ -456,6 +551,11 @@ def train_one_epoch(
         total_present += int(rollout["mask"].sum().detach().cpu())
         total_runtime_attempts += int(rollout["runtime_step_attempts"])
         total_runtime_fallbacks += int(rollout["runtime_step_fallbacks"])
+        if adaptive_fusion is not None:
+            adaptive_fusion.update(
+                rollout["target_error_mse_by_step_feature"],
+                rollout["target_error_count_by_step_feature"],
+            )
         num_batches += 1
         if log_every > 0 and (num_batches % log_every == 0 or num_batches == total_batches):
             print_progress("train", num_batches, total_batches, total_loss / max(num_batches, 1))
@@ -482,6 +582,7 @@ def evaluate(
     log_every: int = 0,
     max_batches: int | None = None,
     runtime_context=None,
+    adaptive_fusion: AdaptiveTargetFusion | None = None,
 ) -> dict[str, Any]:
     model.eval()
     total_loss = 0.0
@@ -503,6 +604,7 @@ def evaluate(
                 normalization_stats,
                 weights,
                 runtime_context=runtime_context,
+                adaptive_fusion=adaptive_fusion,
             )
             total_loss += float(rollout["weighted_loss_internal_only"].detach().cpu())
             total_supervised += int(rollout["supervision_mask"].sum().detach().cpu())
@@ -531,7 +633,40 @@ def evaluate(
     return summary
 
 
-def boundary_conditioned_rollout(model, batch, dataset, normalization_stats, weights, runtime_context=None):
+def create_adaptive_target_fusion(config: dict[str, Any], weights, model_config: dict[str, Any], device):
+    fusion = config.get("training", {}).get("adaptive_target_fusion", {})
+    return AdaptiveTargetFusion(
+        horizon=int(weights.numel()),
+        target_dim=int(model_config["target_dim"]),
+        enabled=bool(fusion.get("enabled", False)),
+        ema_beta=float(fusion.get("ema_beta", 0.95)),
+        initial_prediction_variance=float(fusion.get("initial_prediction_variance", 1.0)),
+        measurement_variance=float(fusion.get("measurement_variance", 4.0)),
+        min_alpha=float(fusion.get("min_alpha", 0.0)),
+        max_alpha=float(fusion.get("max_alpha", 0.8)),
+        device=device,
+    )
+
+
+def inactive_adaptive_fusion_summary(adaptive_fusion: AdaptiveTargetFusion) -> dict[str, Any]:
+    alpha = np.zeros_like(adaptive_fusion.last_alpha)
+    return {
+        "enabled": False,
+        "alpha_by_step_feature": alpha.tolist(),
+        "alpha_by_step_mean": alpha.mean(axis=1).tolist(),
+        "alpha_mean": 0.0,
+    }
+
+
+def boundary_conditioned_rollout(
+    model,
+    batch,
+    dataset,
+    normalization_stats,
+    weights,
+    runtime_context=None,
+    adaptive_fusion: AdaptiveTargetFusion | None = None,
+):
     device = batch["history_x"].device
     rollout_history = batch["history_x"].clone()
     history_mask = batch["history_mask"].clone()
@@ -549,6 +684,9 @@ def boundary_conditioned_rollout(model, batch, dataset, normalization_stats, wei
     step_losses = []
     runtime_step_attempts = 0
     runtime_step_fallbacks = 0
+    target_dim = int(len(normalization_stats["target_mean"]))
+    target_error_sse_by_step_feature = torch.zeros((int(weights.numel()), target_dim), device=device)
+    target_error_count_by_step_feature = torch.zeros_like(target_error_sse_by_step_feature)
 
     feature_index = dataset.feature_indices
     true_future_features = get_true_future_features(batch, dataset, device, weights.numel())
@@ -578,11 +716,18 @@ def boundary_conditioned_rollout(model, batch, dataset, normalization_stats, wei
         true_step_features = true_future_features[:, step_index, :, :]
         true_step_features_finite = torch.isfinite(true_step_features).all(dim=-1)
         boundary_mask = entering_mask & true_step_features_finite
+        target_for_rollout_phys = fuse_rollout_targets(
+            pred_step_phys_raw,
+            true_step_phys,
+            continuing_mask,
+            step_index,
+            adaptive_fusion,
+        )
 
         if runtime_context is None:
             new_frame_phys = build_stale_refresh_frame(
                 last_frame,
-                pred_step_phys_raw,
+                target_for_rollout_phys,
                 true_step_features,
                 new_mask,
                 boundary_mask,
@@ -594,7 +739,7 @@ def boundary_conditioned_rollout(model, batch, dataset, normalization_stats, wei
             new_frame_phys = torch.zeros_like(last_frame)
             refreshed_phys, runtime_success = runtime_step_batch(
                 last_frame,
-                pred_step_phys_raw,
+                target_for_rollout_phys,
                 continuing_mask,
                 runtime_context,
             )
@@ -608,13 +753,14 @@ def boundary_conditioned_rollout(model, batch, dataset, normalization_stats, wei
             if runtime_fallback_rows.any():
                 stale_frame_phys = build_stale_refresh_frame(
                     last_frame,
-                    pred_step_phys_raw,
+                    target_for_rollout_phys,
                     true_step_features,
                     new_mask,
                     boundary_mask,
                     feature_index,
                     dataset,
                     device,
+                    refresh_observed_non_target=False,
                 )
                 fallback_mask = new_mask & runtime_fallback_rows[:, None]
                 new_frame_phys = torch.where(fallback_mask[:, :, None], stale_frame_phys, new_frame_phys)
@@ -629,6 +775,14 @@ def boundary_conditioned_rollout(model, batch, dataset, normalization_stats, wei
         supervision_mask = target_cfd_mask & ~boundary_mask
         step_loss = masked_velocity_mse(pred_step_norm, true_step_norm, supervision_mask)
         step_losses.append(step_loss)
+        update_target_error_stats(
+            target_error_sse_by_step_feature,
+            target_error_count_by_step_feature,
+            step_index,
+            pred_step_norm_raw,
+            true_step_norm,
+            supervision_mask,
+        )
 
         new_frame_norm = normalize_features(new_frame_phys, normalization_stats, device)
         new_frame_norm = torch.where(new_mask[:, :, None], new_frame_norm, torch.zeros_like(new_frame_norm))
@@ -675,7 +829,41 @@ def boundary_conditioned_rollout(model, batch, dataset, normalization_stats, wei
         "internal_loss_mask": supervision_mask_tensor,
         "runtime_step_attempts": runtime_step_attempts,
         "runtime_step_fallbacks": runtime_step_fallbacks,
+        "target_error_mse_by_step_feature": safe_divide_tensor(
+            target_error_sse_by_step_feature,
+            target_error_count_by_step_feature,
+        ).detach(),
+        "target_error_count_by_step_feature": target_error_count_by_step_feature.detach(),
     }
+
+
+def fuse_rollout_targets(pred_step_phys_raw, true_step_phys, continuing_mask, step_index: int, adaptive_fusion):
+    if adaptive_fusion is None or not adaptive_fusion.enabled:
+        return pred_step_phys_raw
+    alpha = adaptive_fusion.alpha_tensor()[int(step_index)].to(pred_step_phys_raw.device)
+    true_finite = torch.isfinite(true_step_phys).all(dim=-1)
+    fusion_mask = continuing_mask & true_finite
+    fused = (1.0 - alpha.view(1, 1, -1)) * pred_step_phys_raw + alpha.view(1, 1, -1) * true_step_phys
+    return torch.where(fusion_mask[:, :, None], fused, pred_step_phys_raw)
+
+
+def update_target_error_stats(
+    sse_by_step_feature,
+    count_by_step_feature,
+    step_index: int,
+    prediction,
+    target,
+    mask,
+) -> None:
+    finite = torch.isfinite(prediction) & torch.isfinite(target)
+    expanded_mask = mask[:, :, None] & finite
+    squared = (prediction - target) ** 2
+    sse_by_step_feature[step_index] += torch.where(expanded_mask, squared, torch.zeros_like(squared)).sum(dim=(0, 1))
+    count_by_step_feature[step_index] += expanded_mask.sum(dim=(0, 1)).to(sse_by_step_feature.dtype)
+
+
+def safe_divide_tensor(numerator, denominator):
+    return torch.where(denominator > 0, numerator / torch.clamp_min(denominator, 1.0), torch.zeros_like(numerator))
 
 
 def build_stale_refresh_frame(
@@ -687,6 +875,7 @@ def build_stale_refresh_frame(
     feature_index,
     dataset,
     device,
+    refresh_observed_non_target: bool = True,
 ):
     velocity_to_px_frame = velocity_mm_s_to_px_frame_scale(dataset, device)
     x_next = last_frame[:, :, feature_index["x"]] + pred_step_phys_raw[:, :, 0] * velocity_to_px_frame
@@ -701,7 +890,8 @@ def build_stale_refresh_frame(
         new_frame_phys[:, :, feature_index["bbox_w"]] = pred_step_phys_raw[:, :, 2]
         new_frame_phys[:, :, feature_index["bbox_h"]] = pred_step_phys_raw[:, :, 3]
     new_frame_phys[boundary_mask] = true_step_features[boundary_mask]
-    refresh_observed_non_target_features(new_frame_phys, true_step_features, new_mask, feature_index)
+    if refresh_observed_non_target:
+        refresh_observed_non_target_features(new_frame_phys, true_step_features, new_mask, feature_index)
     return new_frame_phys
 
 
@@ -723,17 +913,18 @@ def runtime_step_batch(current_state_phys, model_prediction_phys, active_mask, r
     active_np = active_mask.detach().cpu().numpy().astype(bool, copy=True)
     next_np = np.zeros_like(current_np, dtype=np.float32)
     success_np = np.ones(current_np.shape[0], dtype=bool)
+    active_mask_cache: dict[int, np.ndarray] = {}
 
-    for batch_index in range(current_np.shape[0]):
+    for batch_index in np.flatnonzero(active_np.any(axis=1)):
         active_slots = active_np[batch_index]
-        if not np.any(active_slots):
-            continue
+        active_count = int(np.count_nonzero(active_slots))
+        runtime_active_mask = active_mask_cache.setdefault(active_count, np.ones(active_count, dtype=bool))
         try:
             next_active = physics_runtime_step(
                 current_np[batch_index, active_slots],
                 prediction_np[batch_index, active_slots],
                 runtime_context,
-                active_mask=np.ones(int(np.count_nonzero(active_slots)), dtype=bool),
+                active_mask=runtime_active_mask,
             )
         except Exception:
             success_np[batch_index] = False
@@ -904,6 +1095,15 @@ def print_epoch_summary(epoch, train_summary, val_summary):
         f"val_runtime_fallback={val_summary.get('runtime_step_fallback_fraction', 0.0):.6f}"
     )
     print(f"  stepwise_val_rmse_position {step_text}")
+    fusion = train_summary.get("adaptive_fusion", {})
+    if fusion.get("enabled"):
+        alpha_values = fusion.get("alpha_by_step_mean", [])
+        alpha_text = " ".join(
+            f"a{step}={alpha_values[step - 1]:.6f}"
+            for step in DIAGNOSTIC_STEPS
+            if step <= len(alpha_values)
+        )
+        print(f"  adaptive_fusion_alpha_measurement_weight {alpha_text}")
 
 
 def runtime_context_for_epoch(config: dict[str, Any], epoch: int, runtime_context):
@@ -918,28 +1118,52 @@ def physics_refresh_mode(runtime_context) -> str:
 
 def initialize_curves_csv(path):
     if path.exists():
-        return
+        with path.open("r", newline="") as handle:
+            reader = csv.reader(handle)
+            existing_header = next(reader, None)
+        if existing_header == CURVES_COLUMNS:
+            return
+        archive = path.with_name(f"{path.stem}_legacy_{time.strftime('%Y%m%d_%H%M%S')}{path.suffix}")
+        path.replace(archive)
+        print(f"Archived incompatible training curves CSV: {archive}")
     with path.open("w", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(
-            [
-                "epoch",
-                "train_weighted_loss_internal_only",
-                "val_weighted_loss_internal_only",
-                "train_cfd_valid_target_fraction",
-                "val_cfd_valid_target_fraction",
-                "val_rmse_vx",
-                "val_rmse_vy",
-                "val_rmse_speed",
-                "val_rmse_position",
-                "train_runtime_step_attempts",
-                "train_runtime_step_fallbacks",
-                "train_runtime_step_fallback_fraction",
-                "val_runtime_step_attempts",
-                "val_runtime_step_fallbacks",
-                "val_runtime_step_fallback_fraction",
-            ]
-        )
+        writer.writerow(CURVES_COLUMNS)
+
+
+def diagnostic_step_value(summary: dict[str, Any], step: int) -> float:
+    values = summary.get("step_rmse_position", [])
+    return float(values[step - 1]) if step <= len(values) else np.nan
+
+
+def diagnostic_alpha_value(summary: dict[str, Any], step: int) -> float:
+    fusion = summary.get("adaptive_fusion", {})
+    values = fusion.get("alpha_by_step_mean", [])
+    return float(values[step - 1]) if step <= len(values) else 0.0
+
+
+def save_adaptive_fusion_alpha_plot(alpha_history: list[dict[str, Any]], path: Path) -> None:
+    if not alpha_history:
+        return
+    try:
+        import matplotlib.pyplot as plt
+    except ModuleNotFoundError:
+        return
+    plt.figure(figsize=(8, 5))
+    for item in alpha_history:
+        values = item.get("alpha_by_step_mean", [])
+        if not values:
+            continue
+        steps = np.arange(1, len(values) + 1)
+        plt.plot(steps, values, alpha=0.35, linewidth=1.0, label=f"epoch {item['epoch']}")
+    plt.xlabel("rollout step")
+    plt.ylabel("alpha (measurement weight)")
+    plt.ylim(0.0, 1.0)
+    if len(alpha_history) <= 8:
+        plt.legend(loc="best", fontsize=8)
+    plt.tight_layout()
+    plt.savefig(path, dpi=160)
+    plt.close()
 
 
 def append_curves_csv(path, epoch, train_summary, val_summary):
@@ -962,6 +1186,9 @@ def append_curves_csv(path, epoch, train_summary, val_summary):
                 val_summary.get("runtime_step_attempts", 0.0),
                 val_summary.get("runtime_step_fallbacks", 0.0),
                 val_summary.get("runtime_step_fallback_fraction", 0.0),
+                *[diagnostic_step_value(val_summary, step) for step in DIAGNOSTIC_STEPS],
+                *[diagnostic_alpha_value(train_summary, step) for step in DIAGNOSTIC_STEPS],
+                train_summary.get("adaptive_fusion", {}).get("alpha_mean", 0.0),
             ]
         )
 
