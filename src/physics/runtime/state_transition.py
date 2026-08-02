@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -108,20 +109,64 @@ def step(
     model_prediction: np.ndarray,
     context: PhysicsRuntimeContext,
     active_mask: np.ndarray | None = None,
+    profile: dict[str, float] | None = None,
 ) -> np.ndarray:
     """Advance one deterministic physics state from learned kinematic predictions."""
+    if profile is None:
+        state = _state_matrix(current_state, context)
+        prediction = _prediction_matrix(model_prediction, len(state))
+        active = infer_active_mask(state, context) if active_mask is None else _mask(active_mask, len(state))
+
+        updated = state.copy()
+        update_positions(updated, prediction, context, active)
+        ellipses = construct_ellipses(updated, context, active)
+        occupancy = compute_occupancy(ellipses, context, active)
+        hydraulics = update_hydraulics(occupancy, active, context)
+        cfd = sample_cfd(updated, hydraulics["left_flow_fraction"], context, active)
+        assemble_state(updated, prediction, occupancy, hydraulics, cfd, context, active)
+        return _restore_shape(current_state, updated)
+
+    total_start = time.perf_counter()
+    section_start = time.perf_counter()
     state = _state_matrix(current_state, context)
     prediction = _prediction_matrix(model_prediction, len(state))
     active = infer_active_mask(state, context) if active_mask is None else _mask(active_mask, len(state))
+    _profile_add(profile, "runtime_prepare_inputs_seconds", time.perf_counter() - section_start)
+    _profile_add(profile, "runtime_active_droplets", float(np.count_nonzero(active)))
 
+    section_start = time.perf_counter()
     updated = state.copy()
+    _profile_add(profile, "runtime_state_copy_seconds", time.perf_counter() - section_start)
+
+    section_start = time.perf_counter()
     update_positions(updated, prediction, context, active)
+    _profile_add(profile, "runtime_update_positions_seconds", time.perf_counter() - section_start)
+
+    section_start = time.perf_counter()
     ellipses = construct_ellipses(updated, context, active)
+    _profile_add(profile, "runtime_construct_ellipses_seconds", time.perf_counter() - section_start)
+
+    section_start = time.perf_counter()
     occupancy = compute_occupancy(ellipses, context, active)
+    _profile_add(profile, "runtime_compute_occupancy_seconds", time.perf_counter() - section_start)
+
+    section_start = time.perf_counter()
     hydraulics = update_hydraulics(occupancy, active, context)
-    cfd = sample_cfd(updated, hydraulics["left_flow_fraction"], context, active)
+    _profile_add(profile, "runtime_update_hydraulics_seconds", time.perf_counter() - section_start)
+
+    section_start = time.perf_counter()
+    cfd = sample_cfd(updated, hydraulics["left_flow_fraction"], context, active, profile=profile)
+    _profile_add(profile, "runtime_sample_cfd_seconds", time.perf_counter() - section_start)
+
+    section_start = time.perf_counter()
     assemble_state(updated, prediction, occupancy, hydraulics, cfd, context, active)
-    return _restore_shape(current_state, updated)
+    _profile_add(profile, "runtime_assemble_state_seconds", time.perf_counter() - section_start)
+
+    section_start = time.perf_counter()
+    restored = _restore_shape(current_state, updated)
+    _profile_add(profile, "runtime_restore_shape_seconds", time.perf_counter() - section_start)
+    _profile_add(profile, "runtime_step_total_seconds", time.perf_counter() - total_start)
+    return restored
 
 
 def update_positions(
@@ -223,13 +268,24 @@ def sample_cfd(
     left_flow_fraction: float,
     context: PhysicsRuntimeContext,
     active_mask: np.ndarray,
+    profile: dict[str, float] | None = None,
 ) -> dict[str, np.ndarray]:
     """Sample normalized full-device CFD at updated active centroids."""
+    section_start = time.perf_counter() if profile is not None else None
     cfd_u = np.zeros(len(state), dtype=float)
     cfd_v = np.zeros(len(state), dtype=float)
-    if not np.any(active_mask):
-        return {"cfd_u_norm": cfd_u, "cfd_v_norm": cfd_v}
+    if profile is not None:
+        _profile_add(profile, "runtime_cfd_output_allocation_seconds", time.perf_counter() - section_start)
 
+    section_start = time.perf_counter() if profile is not None else None
+    if not np.any(active_mask):
+        if profile is not None:
+            _profile_add(profile, "runtime_cfd_active_check_seconds", time.perf_counter() - section_start)
+        return {"cfd_u_norm": cfd_u, "cfd_v_norm": cfd_v}
+    if profile is not None:
+        _profile_add(profile, "runtime_cfd_active_check_seconds", time.perf_counter() - section_start)
+
+    section_start = time.perf_counter() if profile is not None else None
     split_min, split_max = context.cfd_split_bounds
     if left_flow_fraction < split_min - 1e-12 or left_flow_fraction > split_max + 1e-12:
         raise ValueError(
@@ -237,16 +293,39 @@ def sample_cfd(
             f"[{split_min:.12g}, {split_max:.12g}]"
         )
     sample_split = float(np.clip(left_flow_fraction, split_min, split_max))
+    if profile is not None:
+        _profile_add(profile, "runtime_cfd_split_prepare_seconds", time.perf_counter() - section_start)
+
+    section_start = time.perf_counter() if profile is not None else None
     idx = context.feature_index
     points_px = state[active_mask][:, [idx["x"], idx["y"]]]
+    if profile is not None:
+        _profile_add(profile, "runtime_cfd_point_extract_seconds", time.perf_counter() - section_start)
+
+    section_start = time.perf_counter() if profile is not None else None
     points_um = _image_points_to_library_frame(points_px, context)
-    samples = context.cfd_library.interpolate(sample_split).sample_cfd(points_um)
+    if profile is not None:
+        _profile_add(profile, "runtime_cfd_coordinate_transform_seconds", time.perf_counter() - section_start)
+
+    section_start = time.perf_counter() if profile is not None else None
+    interpolated = context.cfd_library.interpolate(sample_split)
+    if profile is not None:
+        _profile_add(profile, "runtime_cfd_interpolate_seconds", time.perf_counter() - section_start)
+
+    section_start = time.perf_counter() if profile is not None else None
+    samples = interpolated.sample_cfd(points_um)
+    if profile is not None:
+        _profile_add(profile, "runtime_cfd_sample_points_seconds", time.perf_counter() - section_start)
+
+    section_start = time.perf_counter() if profile is not None else None
     finite = np.isfinite(samples.cfd_u_norm) & np.isfinite(samples.cfd_v_norm)
     if not np.all(finite):
         raise ValueError("CFD sampling returned non-finite normalized velocity for an active droplet")
     active_rows = np.flatnonzero(active_mask)
     cfd_u[active_rows] = samples.cfd_u_norm
     cfd_v[active_rows] = samples.cfd_v_norm
+    if profile is not None:
+        _profile_add(profile, "runtime_cfd_validate_assign_seconds", time.perf_counter() - section_start)
     return {"cfd_u_norm": cfd_u, "cfd_v_norm": cfd_v}
 
 
@@ -376,3 +455,7 @@ def _validate_next_state(state: np.ndarray, context: PhysicsRuntimeContext, acti
     split = state[active_mask, idx["left_flow_fraction"]]
     if np.any((split < -1e-12) | (split > 1.0 + 1e-12)):
         raise ValueError("left_flow_fraction must remain in [0, 1]")
+
+
+def _profile_add(profile: dict[str, float], key: str, value: float) -> None:
+    profile[key] = float(profile.get(key, 0.0) + value)

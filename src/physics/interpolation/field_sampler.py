@@ -14,6 +14,7 @@ from .types import InterpolatedVelocityField, SampledVelocityField
 
 ZERO_SPEED_DIRECTION_THRESHOLD_M_PER_S = 1.0e-14
 _PROJECTION_LOOKUP_CACHE: dict[tuple[int, int, int], "_ValidPointProjectionLookup"] = {}
+_VELOCITY_BASIS_CACHE: dict[tuple[int, int, int], tuple[Basis, np.ndarray, np.ndarray]] = {}
 
 
 def sample_velocity_field_cfd(field: InterpolatedVelocityField, points_cfd_um: np.ndarray) -> SampledVelocityField:
@@ -29,8 +30,13 @@ def sample_velocity_field_cfd(field: InterpolatedVelocityField, points_cfd_um: n
     inside = _inside_fluid_domain(sample_points, field.mesh.geometry)
     velocity = np.full((len(points), 2), np.nan, dtype=float)
     if np.any(inside):
-        basis = velocity_basis(field.nodes_um, field.elements)
-        coefficients = paired_velocity_to_basis_coefficients(basis, field.velocity_dof_m_per_s)
+        basis, component_x, component_y = velocity_basis_components(field)
+        coefficients = paired_velocity_to_basis_coefficients(
+            basis,
+            field.velocity_dof_m_per_s,
+            component_x=component_x,
+            component_y=component_y,
+        )
         inside_points_m = sample_points[inside].T * UM_TO_M
         velocity[inside] = _evaluate_basis_interpolator(basis, coefficients, inside_points_m)
 
@@ -188,7 +194,7 @@ def _finite_interpolation_support(
     candidates_um: np.ndarray,
     chunk_size: int = 5000,
 ) -> np.ndarray:
-    basis = velocity_basis(field.nodes_um, field.elements)
+    basis, _, _ = velocity_basis_components(field)
     coefficients = np.zeros(basis.N, dtype=float)
     valid = np.zeros(len(candidates_um), dtype=bool)
     for start in range(0, len(candidates_um), int(chunk_size)):
@@ -205,9 +211,27 @@ def velocity_basis(nodes_um: np.ndarray, elements: np.ndarray) -> Basis:
     return Basis(skmesh, ElementVector(ElementTriP2()), intorder=4)
 
 
-def paired_velocity_to_basis_coefficients(basis: Basis, velocity_dof_m_per_s: np.ndarray) -> np.ndarray:
+def velocity_basis_components(field: InterpolatedVelocityField) -> tuple[Basis, np.ndarray, np.ndarray]:
+    key = (id(field.mesh), len(field.nodes_um), len(field.elements))
+    cached = _VELOCITY_BASIS_CACHE.get(key)
+    if cached is None:
+        basis = velocity_basis(field.nodes_um, field.elements)
+        component_x, component_y = basis.split_indices()
+        cached = (basis, component_x, component_y)
+        _VELOCITY_BASIS_CACHE[key] = cached
+    return cached
+
+
+def paired_velocity_to_basis_coefficients(
+    basis: Basis,
+    velocity_dof_m_per_s: np.ndarray,
+    *,
+    component_x: np.ndarray | None = None,
+    component_y: np.ndarray | None = None,
+) -> np.ndarray:
     values = np.asarray(velocity_dof_m_per_s, dtype=float)
-    component_x, component_y = basis.split_indices()
+    if component_x is None or component_y is None:
+        component_x, component_y = basis.split_indices()
     if values.shape != (len(component_x), 2):
         raise ValueError(f"velocity_dof_m_per_s has shape {values.shape}; expected {(len(component_x), 2)}")
     coefficients = np.zeros(basis.N, dtype=float)

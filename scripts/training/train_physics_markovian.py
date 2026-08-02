@@ -942,34 +942,70 @@ def refresh_observed_non_target_features(new_frame_phys, true_step_features, new
         new_frame_phys[:, :, index] = torch.where(valid, values, new_frame_phys[:, :, index])
 
 
-def runtime_step_batch(current_state_phys, model_prediction_phys, active_mask, runtime_context):
+def runtime_step_batch(current_state_phys, model_prediction_phys, active_mask, runtime_context, profile=None):
     device = current_state_phys.device
     dtype = current_state_phys.dtype
+    total_start = time.perf_counter() if profile is not None else None
+
+    section_start = time.perf_counter() if profile is not None else None
     current_np = current_state_phys.detach().cpu().numpy().astype(np.float32, copy=True)
+    if profile is not None:
+        add_profile_time(profile, "batch_current_to_cpu_numpy_seconds", time.perf_counter() - section_start)
+
+    section_start = time.perf_counter() if profile is not None else None
     prediction_np = model_prediction_phys.detach().cpu().numpy().astype(np.float32, copy=True)
+    if profile is not None:
+        add_profile_time(profile, "batch_prediction_to_cpu_numpy_seconds", time.perf_counter() - section_start)
+
+    section_start = time.perf_counter() if profile is not None else None
     active_np = active_mask.detach().cpu().numpy().astype(bool, copy=True)
+    if profile is not None:
+        add_profile_time(profile, "batch_active_mask_to_cpu_numpy_seconds", time.perf_counter() - section_start)
+
+    section_start = time.perf_counter() if profile is not None else None
     next_np = np.zeros_like(current_np, dtype=np.float32)
     success_np = np.ones(current_np.shape[0], dtype=bool)
     active_mask_cache: dict[int, np.ndarray] = {}
+    if profile is not None:
+        add_profile_time(profile, "batch_numpy_allocation_seconds", time.perf_counter() - section_start)
 
+    loop_start = time.perf_counter() if profile is not None else None
     for batch_index in np.flatnonzero(active_np.any(axis=1)):
         active_slots = active_np[batch_index]
         active_count = int(np.count_nonzero(active_slots))
         runtime_active_mask = active_mask_cache.setdefault(active_count, np.ones(active_count, dtype=bool))
         try:
+            step_kwargs = {"active_mask": runtime_active_mask}
+            if profile is not None:
+                step_kwargs["profile"] = profile
             next_active = physics_runtime_step(
                 current_np[batch_index, active_slots],
                 prediction_np[batch_index, active_slots],
                 runtime_context,
-                active_mask=runtime_active_mask,
+                **step_kwargs,
             )
         except Exception:
             success_np[batch_index] = False
             continue
         next_np[batch_index, active_slots] = next_active
+    if profile is not None:
+        add_profile_time(profile, "batch_runtime_loop_seconds", time.perf_counter() - loop_start)
 
+    section_start = time.perf_counter() if profile is not None else None
     success = torch.as_tensor(success_np, dtype=torch.bool, device=device)
-    return torch.as_tensor(next_np, dtype=dtype, device=device), success
+    if profile is not None:
+        add_profile_time(profile, "batch_success_to_device_seconds", time.perf_counter() - section_start)
+
+    section_start = time.perf_counter() if profile is not None else None
+    next_tensor = torch.as_tensor(next_np, dtype=dtype, device=device)
+    if profile is not None:
+        add_profile_time(profile, "batch_next_to_device_seconds", time.perf_counter() - section_start)
+        add_profile_time(profile, "batch_runtime_step_total_seconds", time.perf_counter() - total_start)
+    return next_tensor, success
+
+
+def add_profile_time(profile: dict[str, float], key: str, elapsed: float) -> None:
+    profile[key] = float(profile.get(key, 0.0) + elapsed)
 
 
 def masked_velocity_mse(prediction, target, mask):
