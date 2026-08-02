@@ -51,6 +51,7 @@ DIAGNOSTIC_STEPS = (1, 5, 10, 20, 30, 40, 50)
 RUNTIME_TARGET_FEATURES = ("vx", "vy", "bbox_w", "bbox_h")
 CURVES_COLUMNS = [
     "epoch",
+    "active_rollout_horizon",
     "train_weighted_loss_internal_only",
     "val_weighted_loss_internal_only",
     "train_cfd_valid_target_fraction",
@@ -58,6 +59,8 @@ CURVES_COLUMNS = [
     "val_rmse_vx",
     "val_rmse_vy",
     "val_rmse_speed",
+    "val_rmse_bbox_w",
+    "val_rmse_bbox_h",
     "val_rmse_position",
     "train_runtime_step_attempts",
     "train_runtime_step_fallbacks",
@@ -70,6 +73,8 @@ CURVES_COLUMNS = [
     "val_pure_rmse_vx",
     "val_pure_rmse_vy",
     "val_pure_rmse_speed",
+    "val_pure_rmse_bbox_w",
+    "val_pure_rmse_bbox_h",
     "val_pure_rmse_position",
     "val_pure_runtime_step_attempts",
     "val_pure_runtime_step_fallbacks",
@@ -103,6 +108,8 @@ class AdaptiveTargetFusion:
         device,
     ) -> None:
         self.enabled = bool(enabled)
+        self.horizon = int(horizon)
+        self.target_dim = int(target_dim)
         self.ema_beta = float(ema_beta)
         self.measurement_variance = torch.as_tensor(measurement_variance, dtype=torch.float32, device=device)
         self.min_alpha = float(min_alpha)
@@ -324,6 +331,9 @@ def apply_smoke_test_overrides(config: dict[str, Any]) -> None:
     config["training"]["epochs"] = int(smoke["epochs"])
     config["training"]["batch_size"] = int(smoke["batch_size"])
     config["model"]["rollout_horizon"] = int(smoke["rollout_horizon"])
+    config["training"]["rollout_horizon_schedule"] = [
+        {"start_epoch": 1, "horizon": int(smoke["rollout_horizon"])}
+    ]
     config["training"]["log_every_n_batches"] = 1
     config["training"]["output_dir"] = str(Path(config["training"]["output_dir"]) / "smoke_test")
 
@@ -514,49 +524,89 @@ def train_full(
     curves_csv_path = output_dir / "training_curves.csv"
     initialize_curves_csv(curves_csv_path)
     best_val_loss = float("inf")
-    adaptive_fusion = create_adaptive_target_fusion(config, weights, model_config, device, dataset, normalization_stats)
-    pure_validation_fusion = ZeroAdaptiveTargetFusion(weights.numel(), model_config["target_dim"], device)
+    full_rollout_horizon = int(weights.numel())
+    if rollout_horizon_schedule_enabled(config) and adaptive_target_fusion_enabled(config):
+        raise ValueError("rollout_horizon_schedule is a no-fusion ablation; set adaptive_target_fusion.enabled=false")
+    adaptive_fusion = create_adaptive_target_fusion(
+        config,
+        weights,
+        model_config,
+        device,
+        dataset,
+        normalization_stats,
+    )
     alpha_history: list[dict[str, Any]] = []
 
     for epoch in range(1, int(config["training"]["epochs"]) + 1):
+        active_rollout_horizon = rollout_horizon_for_epoch(config, epoch, full_rollout_horizon)
+        active_weights = rollout_weights(
+            active_rollout_horizon,
+            float(config["training"]["loss_alpha"]),
+            device,
+        )
         active_runtime_context = runtime_context_for_epoch(config, epoch, runtime_context)
-        active_fusion = adaptive_fusion if active_runtime_context is not None else None
-        print(f"epoch {epoch:03d} physics_refresh={physics_refresh_mode(active_runtime_context)}")
+        active_fusion = adaptive_fusion if active_runtime_context is not None and adaptive_fusion.enabled else None
+        if adaptive_fusion is not None and adaptive_fusion.horizon != active_rollout_horizon:
+            adaptive_fusion = create_adaptive_target_fusion(
+                config,
+                active_weights,
+                model_config,
+                device,
+                dataset,
+                normalization_stats,
+            )
+            active_fusion = adaptive_fusion if active_runtime_context is not None and adaptive_fusion.enabled else None
+        print(
+            f"epoch {epoch:03d} "
+            f"physics_refresh={physics_refresh_mode(active_runtime_context)} "
+            f"rollout_horizon={active_rollout_horizon}"
+        )
         train_summary = train_one_epoch(
             model=model,
             loader=train_loader,
             dataset=dataset,
             optimizer=optimizer,
             normalization_stats=normalization_stats,
-            weights=weights,
+            weights=active_weights,
             device=device,
             grad_clip=float(config["training"]["grad_clip"]),
             log_every=int(config["training"]["log_every_n_batches"]),
             runtime_context=active_runtime_context,
             adaptive_fusion=active_fusion,
         )
+        train_summary["active_rollout_horizon"] = float(active_rollout_horizon)
         val_summary = evaluate(
             model=model,
             loader=val_loader,
             dataset=dataset,
             normalization_stats=normalization_stats,
-            weights=weights,
+            weights=active_weights,
             device=device,
             log_every=int(config["training"]["log_every_n_batches"]),
             runtime_context=active_runtime_context,
             adaptive_fusion=active_fusion,
         )
-        val_pure_summary = evaluate(
-            model=model,
-            loader=val_loader,
-            dataset=dataset,
-            normalization_stats=normalization_stats,
-            weights=weights,
-            device=device,
-            log_every=0,
-            runtime_context=active_runtime_context,
-            adaptive_fusion=pure_validation_fusion if active_runtime_context is not None else None,
-        )
+        val_summary["active_rollout_horizon"] = float(active_rollout_horizon)
+        if active_fusion is None:
+            val_pure_summary = dict(val_summary)
+        else:
+            pure_validation_fusion = ZeroAdaptiveTargetFusion(
+                active_rollout_horizon,
+                model_config["target_dim"],
+                device,
+            )
+            val_pure_summary = evaluate(
+                model=model,
+                loader=val_loader,
+                dataset=dataset,
+                normalization_stats=normalization_stats,
+                weights=active_weights,
+                device=device,
+                log_every=0,
+                runtime_context=active_runtime_context,
+                adaptive_fusion=pure_validation_fusion,
+            )
+            val_pure_summary["active_rollout_horizon"] = float(active_rollout_horizon)
         fusion_summary = train_summary.get("adaptive_fusion")
         if fusion_summary is None:
             fusion_summary = adaptive_fusion.summary() if active_fusion is not None else inactive_adaptive_fusion_summary(adaptive_fusion)
@@ -570,7 +620,13 @@ def train_full(
         checkpoint = build_checkpoint(model, optimizer, epoch, val_pure_summary, normalization_stats, config, model_config)
         latest_path = output_dir / "latest_checkpoint.pt"
         torch.save(checkpoint, latest_path)
-        if should_update_best_checkpoint(active_runtime_context, val_pure_summary, best_val_loss):
+        if should_update_best_checkpoint(
+            active_runtime_context,
+            val_pure_summary,
+            best_val_loss,
+            active_rollout_horizon=active_rollout_horizon,
+            full_rollout_horizon=full_rollout_horizon,
+        ):
             best_val_loss = val_pure_summary["weighted_loss_internal_only"]
             torch.save(checkpoint, output_dir / "best_checkpoint.pt")
             print(f"Saved best checkpoint: {output_dir / 'best_checkpoint.pt'}")
@@ -1202,6 +1258,8 @@ def new_accumulator():
         "sum_sq_vx": 0.0,
         "sum_sq_vy": 0.0,
         "sum_sq_speed": 0.0,
+        "sum_sq_bbox_w": 0.0,
+        "sum_sq_bbox_h": 0.0,
         "position_count": 0,
         "sum_sq_position": 0.0,
     }
@@ -1209,6 +1267,7 @@ def new_accumulator():
 
 def update_metric_accumulators(accumulators, rollout):
     velocity_error = rollout["pred_velocity"] - rollout["true_velocity"]
+    bbox_error = rollout["pred_target"][..., 2:4] - rollout["true_target"][..., 2:4]
     speed_error = torch.sqrt(velocity_error[..., 0] ** 2 + velocity_error[..., 1] ** 2)
     position_error = rollout["pred_position"] - rollout["true_position"]
     position_error_norm = torch.sqrt(position_error[..., 0] ** 2 + position_error[..., 1] ** 2)
@@ -1216,6 +1275,7 @@ def update_metric_accumulators(accumulators, rollout):
     update_one_accumulator(
         accumulators["overall"],
         velocity_error,
+        bbox_error,
         speed_error,
         rollout["supervision_mask"],
         position_error_norm,
@@ -1225,6 +1285,7 @@ def update_metric_accumulators(accumulators, rollout):
         update_one_accumulator(
             accumulators["steps"][step_index],
             velocity_error[:, step_index, :, :],
+            bbox_error[:, step_index, :, :],
             speed_error[:, step_index, :],
             rollout["supervision_mask"][:, step_index, :],
             position_error_norm[:, step_index, :],
@@ -1232,16 +1293,20 @@ def update_metric_accumulators(accumulators, rollout):
         )
 
 
-def update_one_accumulator(accumulator, velocity_error, speed_error, velocity_mask, position_error_norm, position_mask):
+def update_one_accumulator(accumulator, velocity_error, bbox_error, speed_error, velocity_mask, position_error_norm, position_mask):
     valid = velocity_mask.bool()
     if valid.sum().item() > 0:
         vx_error = velocity_error[..., 0][valid]
         vy_error = velocity_error[..., 1][valid]
+        bbox_w_error = bbox_error[..., 0][valid]
+        bbox_h_error = bbox_error[..., 1][valid]
         speed = speed_error[valid]
         accumulator["count"] += int(valid.sum().item())
         accumulator["sum_sq_vx"] += float((vx_error**2).sum().detach().cpu())
         accumulator["sum_sq_vy"] += float((vy_error**2).sum().detach().cpu())
         accumulator["sum_sq_speed"] += float((speed**2).sum().detach().cpu())
+        accumulator["sum_sq_bbox_w"] += float((bbox_w_error**2).sum().detach().cpu())
+        accumulator["sum_sq_bbox_h"] += float((bbox_h_error**2).sum().detach().cpu())
     valid_position = position_mask.bool()
     if valid_position.sum().item() > 0:
         position = position_error_norm[valid_position]
@@ -1258,6 +1323,8 @@ def metrics_from_accumulator(accumulator):
         "rmse_vx": safe_rmse(accumulator["sum_sq_vx"], count),
         "rmse_vy": safe_rmse(accumulator["sum_sq_vy"], count),
         "rmse_speed": safe_rmse(accumulator["sum_sq_speed"], count),
+        "rmse_bbox_w": safe_rmse(accumulator["sum_sq_bbox_w"], count),
+        "rmse_bbox_h": safe_rmse(accumulator["sum_sq_bbox_h"], count),
         "rmse_position": safe_rmse(accumulator["sum_sq_position"], position_count),
     }
 
@@ -1272,6 +1339,7 @@ def print_progress(label, num_batches, total_batches, running_loss):
 
 
 def print_epoch_summary(epoch, train_summary, val_summary):
+    active_rollout_horizon = int(train_summary.get("active_rollout_horizon", len(val_summary["step_rmse_position"])))
     available_steps = min(len(val_summary["step_rmse_position"]), max(DIAGNOSTIC_STEPS))
     step_text = " ".join(
         f"s{step}={val_summary['step_rmse_position'][step - 1]:.6f}"
@@ -1280,11 +1348,14 @@ def print_epoch_summary(epoch, train_summary, val_summary):
     )
     print(
         f"epoch {epoch:03d} "
+        f"rollout_horizon={active_rollout_horizon} "
         f"train_weighted_loss_internal_only={train_summary['weighted_loss_internal_only']:.6f} "
         f"val_weighted_loss_internal_only={val_summary['weighted_loss_internal_only']:.6f} "
         f"val_rmse_vx={val_summary['rmse_vx']:.6f} "
         f"val_rmse_vy={val_summary['rmse_vy']:.6f} "
         f"val_rmse_speed={val_summary['rmse_speed']:.6f} "
+        f"val_rmse_bbox_w={val_summary['rmse_bbox_w']:.6f} "
+        f"val_rmse_bbox_h={val_summary['rmse_bbox_h']:.6f} "
         f"val_rmse_position={val_summary['rmse_position']:.6f} "
         f"train_runtime_fallback={train_summary.get('runtime_step_fallback_fraction', 0.0):.6f} "
         f"val_runtime_fallback={val_summary.get('runtime_step_fallback_fraction', 0.0):.6f}"
@@ -1322,12 +1393,55 @@ def runtime_context_for_epoch(config: dict[str, Any], epoch: int, runtime_contex
     return runtime_context if int(epoch) >= runtime_start else None
 
 
+def rollout_horizon_for_epoch(config: dict[str, Any], epoch: int, full_rollout_horizon: int) -> int:
+    schedule = config.get("training", {}).get("rollout_horizon_schedule", [])
+    if not schedule:
+        return int(full_rollout_horizon)
+    active_horizon = int(full_rollout_horizon)
+    active_start = -1
+    for item in schedule:
+        start_epoch = int(item["start_epoch"])
+        horizon = int(item["horizon"])
+        if horizon < 1:
+            raise ValueError(f"rollout_horizon_schedule horizon must be >= 1, got {horizon}")
+        if horizon > int(full_rollout_horizon):
+            raise ValueError(
+                f"rollout_horizon_schedule horizon {horizon} exceeds model rollout_horizon {full_rollout_horizon}"
+            )
+        if start_epoch <= int(epoch) and start_epoch >= active_start:
+            active_start = start_epoch
+            active_horizon = horizon
+    return active_horizon
+
+
+def rollout_horizon_schedule_enabled(config: dict[str, Any]) -> bool:
+    return bool(config.get("training", {}).get("rollout_horizon_schedule", []))
+
+
+def adaptive_target_fusion_enabled(config: dict[str, Any]) -> bool:
+    fusion = config.get("training", {}).get("adaptive_target_fusion", {})
+    return bool(fusion.get("enabled", False))
+
+
 def physics_refresh_mode(runtime_context) -> str:
     return "runtime" if runtime_context is not None else "stale"
 
 
-def should_update_best_checkpoint(runtime_context, val_summary: dict[str, Any], best_val_loss: float) -> bool:
+def should_update_best_checkpoint(
+    runtime_context,
+    val_summary: dict[str, Any],
+    best_val_loss: float,
+    *,
+    active_rollout_horizon: int | None = None,
+    full_rollout_horizon: int | None = None,
+) -> bool:
     if runtime_context is None:
+        return False
+    if (
+        active_rollout_horizon is not None
+        and full_rollout_horizon is not None
+        and int(active_rollout_horizon) != int(full_rollout_horizon)
+    ):
         return False
     return float(val_summary["weighted_loss_internal_only"]) < float(best_val_loss)
 
@@ -1406,6 +1520,7 @@ def append_curves_csv(path, epoch, train_summary, val_summary):
         writer.writerow(
             [
                 epoch,
+                train_summary.get("active_rollout_horizon", np.nan),
                 train_summary["weighted_loss_internal_only"],
                 val_summary["weighted_loss_internal_only"],
                 train_summary["cfd_valid_target_fraction"],
@@ -1413,6 +1528,8 @@ def append_curves_csv(path, epoch, train_summary, val_summary):
                 val_summary["rmse_vx"],
                 val_summary["rmse_vy"],
                 val_summary["rmse_speed"],
+                val_summary["rmse_bbox_w"],
+                val_summary["rmse_bbox_h"],
                 val_summary["rmse_position"],
                 train_summary.get("runtime_step_attempts", 0.0),
                 train_summary.get("runtime_step_fallbacks", 0.0),
@@ -1425,6 +1542,8 @@ def append_curves_csv(path, epoch, train_summary, val_summary):
                 pure_summary_value(val_summary, "rmse_vx"),
                 pure_summary_value(val_summary, "rmse_vy"),
                 pure_summary_value(val_summary, "rmse_speed"),
+                pure_summary_value(val_summary, "rmse_bbox_w"),
+                pure_summary_value(val_summary, "rmse_bbox_h"),
                 pure_summary_value(val_summary, "rmse_position"),
                 pure_summary_value(val_summary, "runtime_step_attempts"),
                 pure_summary_value(val_summary, "runtime_step_fallbacks"),

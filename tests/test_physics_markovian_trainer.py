@@ -415,6 +415,7 @@ def test_zero_adaptive_fusion_forces_pure_prediction_rollout() -> None:
 def test_training_curves_include_step_rmse_and_adaptive_alpha(tmp_path: Path) -> None:
     path = tmp_path / "training_curves.csv"
     train_summary = {
+        "active_rollout_horizon": 50.0,
         "weighted_loss_internal_only": 1.0,
         "cfd_valid_target_fraction": 0.5,
         "runtime_step_attempts": 2.0,
@@ -432,6 +433,8 @@ def test_training_curves_include_step_rmse_and_adaptive_alpha(tmp_path: Path) ->
         "rmse_vx": 1.0,
         "rmse_vy": 2.0,
         "rmse_speed": 3.0,
+        "rmse_bbox_w": 3.5,
+        "rmse_bbox_h": 3.6,
         "rmse_position": 4.0,
         "runtime_step_attempts": 3.0,
         "runtime_step_fallbacks": 0.0,
@@ -442,6 +445,8 @@ def test_training_curves_include_step_rmse_and_adaptive_alpha(tmp_path: Path) ->
             "rmse_vx": 4.0,
             "rmse_vy": 5.0,
             "rmse_speed": 6.0,
+            "rmse_bbox_w": 6.5,
+            "rmse_bbox_h": 6.6,
             "rmse_position": 7.0,
             "runtime_step_attempts": 8.0,
             "runtime_step_fallbacks": 1.0,
@@ -454,14 +459,37 @@ def test_training_curves_include_step_rmse_and_adaptive_alpha(tmp_path: Path) ->
     trainer.append_curves_csv(path, 1, train_summary, val_summary)
 
     lines = path.read_text().splitlines()
+    assert "active_rollout_horizon" in lines[0]
+    assert "val_rmse_bbox_w" in lines[0]
+    assert "val_pure_rmse_bbox_h" in lines[0]
     assert "val_rmse_position_s50" in lines[0]
     assert "val_pure_rmse_position_s50" in lines[0]
     assert "adaptive_fusion_alpha_s50" in lines[0]
     assert "adaptive_fusion_alpha_bbox_h_s50" in lines[0]
+    assert lines[1].split(",")[trainer.CURVES_COLUMNS.index("active_rollout_horizon")] == "50.0"
+    assert lines[1].split(",")[trainer.CURVES_COLUMNS.index("val_rmse_bbox_w")] == "3.5"
+    assert lines[1].split(",")[trainer.CURVES_COLUMNS.index("val_pure_rmse_bbox_h")] == "6.6"
     assert lines[1].split(",")[trainer.CURVES_COLUMNS.index("val_rmse_position_s50")] == "50.0"
     assert lines[1].split(",")[trainer.CURVES_COLUMNS.index("val_pure_rmse_position_s50")] == "500.0"
     assert lines[1].split(",")[trainer.CURVES_COLUMNS.index("adaptive_fusion_alpha_s50")] == "0.1"
     assert lines[1].split(",")[trainer.CURVES_COLUMNS.index("adaptive_fusion_alpha_bbox_h_s50")] == "0.4"
+
+
+def test_rollout_horizon_schedule_uses_latest_started_entry() -> None:
+    config = {
+        "training": {
+            "rollout_horizon_schedule": [
+                {"start_epoch": 1, "horizon": 10},
+                {"start_epoch": 4, "horizon": 20},
+                {"start_epoch": 9, "horizon": 50},
+            ]
+        }
+    }
+
+    assert trainer.rollout_horizon_for_epoch(config, 1, 50) == 10
+    assert trainer.rollout_horizon_for_epoch(config, 3, 50) == 10
+    assert trainer.rollout_horizon_for_epoch(config, 4, 50) == 20
+    assert trainer.rollout_horizon_for_epoch(config, 9, 50) == 50
 
 
 def test_physics_refresh_epoch_schedule_switches_from_stale_to_runtime() -> None:
@@ -482,6 +510,20 @@ def test_best_checkpoint_selection_ignores_stale_physics_epochs() -> None:
     assert not trainer.should_update_best_checkpoint(None, stale_summary, float("inf"))
     assert trainer.should_update_best_checkpoint(runtime_context, runtime_better_summary, float("inf"))
     assert not trainer.should_update_best_checkpoint(runtime_context, runtime_worse_summary, 0.2)
+    assert not trainer.should_update_best_checkpoint(
+        runtime_context,
+        runtime_better_summary,
+        float("inf"),
+        active_rollout_horizon=10,
+        full_rollout_horizon=50,
+    )
+    assert trainer.should_update_best_checkpoint(
+        runtime_context,
+        runtime_better_summary,
+        float("inf"),
+        active_rollout_horizon=50,
+        full_rollout_horizon=50,
+    )
 
 
 def test_stale_refresh_uses_predicted_bbox_and_observed_non_target_physics(tmp_path: Path) -> None:

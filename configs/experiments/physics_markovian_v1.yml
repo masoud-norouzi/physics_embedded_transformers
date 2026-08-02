@@ -50,12 +50,21 @@ training:
   random_seed: 123
   num_workers: 0
   loss_alpha: 2.0
+  rollout_horizon_schedule:
+    - start_epoch: 1
+      horizon: 10
+    - start_epoch: 4
+      horizon: 20
+    - start_epoch: 6
+      horizon: 30
+    - start_epoch: 9
+      horizon: 50
   log_every_n_batches: 25
   output_dir: outputs/models/physics_markovian_v1
   physics_refresh:
     runtime_start_epoch: 2
   adaptive_target_fusion:
-    enabled: true
+    enabled: false
     mode: causal_rollout
     ema_beta: 0.95
     initial_prediction_variance: 1.0
