@@ -304,6 +304,7 @@ def test_adaptive_fusion_uses_truth_for_rollout_but_loss_uses_raw_prediction(tmp
         measurement_variance=1.0e-9,
         min_alpha=0.0,
         max_alpha=1.0,
+        mode="global_ema",
         device=torch.device("cpu"),
     )
 
@@ -335,6 +336,7 @@ def test_adaptive_fusion_alpha_decreases_with_lower_prediction_variance() -> Non
         measurement_variance=4.0,
         min_alpha=0.0,
         max_alpha=0.8,
+        mode="global_ema",
         device=torch.device("cpu"),
     )
     assert fusion.alpha_tensor()[0, 0].item() == pytest.approx(0.5)
@@ -344,6 +346,40 @@ def test_adaptive_fusion_alpha_decreases_with_lower_prediction_variance() -> Non
     fusion.update(mse, counts)
 
     assert fusion.alpha_tensor()[0, 0].item() == pytest.approx(0.0)
+
+
+def test_causal_adaptive_fusion_uses_previous_step_error_for_next_alpha(tmp_path: Path) -> None:
+    dataset, batch = _v2_four_target_batch(tmp_path)
+    model = _ConstantPredictionModel([10.0, 10.0, 30.0, 30.0])
+    stats = _identity_stats(16, target_dim=4)
+    weights = trainer.rollout_weights(3, 2.0, torch.device("cpu"))
+    fusion = trainer.AdaptiveTargetFusion(
+        horizon=3,
+        target_dim=4,
+        enabled=True,
+        ema_beta=0.0,
+        initial_prediction_variance=0.0,
+        measurement_variance=1.0,
+        min_alpha=0.0,
+        max_alpha=1.0,
+        mode="causal_rollout",
+        device=torch.device("cpu"),
+    )
+
+    rollout = trainer.boundary_conditioned_rollout(
+        model,
+        batch,
+        dataset,
+        stats,
+        weights,
+        runtime_context=None,
+        adaptive_fusion=fusion,
+    )
+
+    alpha_used = rollout["adaptive_alpha_used"]
+    assert alpha_used[0, 0].item() == pytest.approx(0.0)
+    assert alpha_used[1, 0].item() > alpha_used[0, 0].item()
+    assert alpha_used[2, 0].item() > 0.0
 
 
 def test_zero_adaptive_fusion_forces_pure_prediction_rollout() -> None:

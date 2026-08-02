@@ -99,6 +99,7 @@ class AdaptiveTargetFusion:
         measurement_variance: float,
         min_alpha: float,
         max_alpha: float,
+        mode: str,
         device,
     ) -> None:
         self.enabled = bool(enabled)
@@ -106,6 +107,9 @@ class AdaptiveTargetFusion:
         self.measurement_variance = float(measurement_variance)
         self.min_alpha = float(min_alpha)
         self.max_alpha = float(max_alpha)
+        self.mode = str(mode)
+        if self.mode not in {"global_ema", "causal_rollout"}:
+            raise ValueError(f"Unsupported adaptive_target_fusion mode: {self.mode!r}")
         self.prediction_variance = torch.full(
             (int(horizon), int(target_dim)),
             float(initial_prediction_variance),
@@ -120,6 +124,30 @@ class AdaptiveTargetFusion:
         denominator = self.prediction_variance + self.measurement_variance
         alpha = self.prediction_variance / torch.clamp_min(denominator, 1.0e-12)
         return torch.clamp(alpha, self.min_alpha, self.max_alpha)
+
+    def alpha_from_variance(self, variance: torch.Tensor) -> torch.Tensor:
+        if not self.enabled:
+            return torch.zeros_like(variance)
+        denominator = variance + self.measurement_variance
+        alpha = variance / torch.clamp_min(denominator, 1.0e-12)
+        return torch.clamp(alpha, self.min_alpha, self.max_alpha)
+
+    def initial_rollout_variance(self, device) -> torch.Tensor:
+        return self.prediction_variance[0].detach().clone().to(device)
+
+    def update_rollout_variance(
+        self,
+        current_variance: torch.Tensor,
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if not self.enabled:
+            return current_variance
+        mse, count = target_error_mse_for_step(prediction, target, mask)
+        valid = count > 0
+        updated = self.ema_beta * current_variance + (1.0 - self.ema_beta) * mse
+        return torch.where(valid, updated, current_variance).detach()
 
     def update(self, mse_by_step_feature: torch.Tensor, count_by_step_feature: torch.Tensor) -> None:
         if not self.enabled:
@@ -139,6 +167,7 @@ class AdaptiveTargetFusion:
         alpha = self.last_alpha if self.enabled else np.zeros_like(self.last_alpha)
         return {
             "enabled": self.enabled,
+            "mode": self.mode,
             "alpha_by_step_feature": alpha.tolist(),
             "alpha_by_step_mean": alpha.mean(axis=1).tolist(),
             "alpha_mean": float(alpha.mean()),
@@ -147,6 +176,7 @@ class AdaptiveTargetFusion:
 
 class ZeroAdaptiveTargetFusion:
     enabled = True
+    mode = "zero"
 
     def __init__(self, horizon: int, target_dim: int, device) -> None:
         self._alpha = torch.zeros((int(horizon), int(target_dim)), dtype=torch.float32, device=device)
@@ -527,8 +557,10 @@ def train_full(
             runtime_context=active_runtime_context,
             adaptive_fusion=pure_validation_fusion if active_runtime_context is not None else None,
         )
-        fusion_summary = adaptive_fusion.summary() if active_fusion is not None else inactive_adaptive_fusion_summary(adaptive_fusion)
-        train_summary["adaptive_fusion"] = fusion_summary
+        fusion_summary = train_summary.get("adaptive_fusion")
+        if fusion_summary is None:
+            fusion_summary = adaptive_fusion.summary() if active_fusion is not None else inactive_adaptive_fusion_summary(adaptive_fusion)
+            train_summary["adaptive_fusion"] = fusion_summary
         val_summary["pure"] = val_pure_summary
         alpha_history.append({"epoch": epoch, **fusion_summary})
         print_epoch_summary(epoch, train_summary, val_summary)
@@ -564,6 +596,8 @@ def train_one_epoch(
     total_present = 0
     total_runtime_attempts = 0
     total_runtime_fallbacks = 0
+    alpha_sum = None
+    alpha_count = 0
     num_batches = 0
     total_batches = len(loader) if max_batches is None else min(len(loader), max_batches)
     for batch in loader:
@@ -593,12 +627,15 @@ def train_one_epoch(
                 rollout["target_error_mse_by_step_feature"],
                 rollout["target_error_count_by_step_feature"],
             )
+        if "adaptive_alpha_used" in rollout:
+            alpha_sum = accumulate_alpha_used(alpha_sum, rollout["adaptive_alpha_used"])
+            alpha_count += 1
         num_batches += 1
         if log_every > 0 and (num_batches % log_every == 0 or num_batches == total_batches):
             print_progress("train", num_batches, total_batches, total_loss / max(num_batches, 1))
         if max_batches is not None and num_batches >= max_batches:
             break
-    return {
+    summary = {
         "weighted_loss_internal_only": total_loss / max(num_batches, 1),
         "supervised_samples": float(total_supervised),
         "present_samples": float(total_present),
@@ -607,6 +644,9 @@ def train_one_epoch(
         "runtime_step_fallbacks": float(total_runtime_fallbacks),
         "runtime_step_fallback_fraction": total_runtime_fallbacks / max(total_runtime_attempts, 1),
     }
+    if adaptive_fusion is not None and alpha_sum is not None:
+        summary["adaptive_fusion"] = alpha_used_summary(alpha_sum, alpha_count, adaptive_fusion)
+    return summary
 
 
 def evaluate(
@@ -627,6 +667,8 @@ def evaluate(
     total_present = 0
     total_runtime_attempts = 0
     total_runtime_fallbacks = 0
+    alpha_sum = None
+    alpha_count = 0
     num_batches = 0
     total_batches = len(loader) if max_batches is None else min(len(loader), max_batches)
     accumulators = create_accumulators(int(weights.numel()))
@@ -648,6 +690,9 @@ def evaluate(
             total_present += int(rollout["mask"].sum().detach().cpu())
             total_runtime_attempts += int(rollout["runtime_step_attempts"])
             total_runtime_fallbacks += int(rollout["runtime_step_fallbacks"])
+            if "adaptive_alpha_used" in rollout:
+                alpha_sum = accumulate_alpha_used(alpha_sum, rollout["adaptive_alpha_used"])
+                alpha_count += 1
             update_metric_accumulators(accumulators, rollout)
             num_batches += 1
             if log_every > 0 and (num_batches % log_every == 0 or num_batches == total_batches):
@@ -667,6 +712,8 @@ def evaluate(
         metrics_from_accumulator(accumulator)["rmse_position"]
         for accumulator in accumulators["steps"]
     ]
+    if adaptive_fusion is not None and alpha_sum is not None:
+        summary["adaptive_fusion"] = alpha_used_summary(alpha_sum, alpha_count, adaptive_fusion)
     return summary
 
 
@@ -681,6 +728,7 @@ def create_adaptive_target_fusion(config: dict[str, Any], weights, model_config:
         measurement_variance=float(fusion.get("measurement_variance", 4.0)),
         min_alpha=float(fusion.get("min_alpha", 0.0)),
         max_alpha=float(fusion.get("max_alpha", 0.8)),
+        mode=str(fusion.get("mode", "causal_rollout")),
         device=device,
     )
 
@@ -689,9 +737,26 @@ def inactive_adaptive_fusion_summary(adaptive_fusion: AdaptiveTargetFusion) -> d
     alpha = np.zeros_like(adaptive_fusion.last_alpha)
     return {
         "enabled": False,
+        "mode": "inactive",
         "alpha_by_step_feature": alpha.tolist(),
         "alpha_by_step_mean": alpha.mean(axis=1).tolist(),
         "alpha_mean": 0.0,
+    }
+
+
+def accumulate_alpha_used(alpha_sum, alpha_used: torch.Tensor):
+    value = alpha_used.detach()
+    return value.clone() if alpha_sum is None else alpha_sum + value
+
+
+def alpha_used_summary(alpha_sum: torch.Tensor, alpha_count: int, adaptive_fusion) -> dict[str, Any]:
+    alpha = (alpha_sum / max(int(alpha_count), 1)).detach().cpu().numpy()
+    return {
+        "enabled": bool(getattr(adaptive_fusion, "enabled", False)),
+        "mode": str(getattr(adaptive_fusion, "mode", "unknown")),
+        "alpha_by_step_feature": alpha.tolist(),
+        "alpha_by_step_mean": alpha.mean(axis=1).tolist(),
+        "alpha_mean": float(alpha.mean()),
     }
 
 
@@ -724,6 +789,12 @@ def boundary_conditioned_rollout(
     target_dim = int(len(normalization_stats["target_mean"]))
     target_error_sse_by_step_feature = torch.zeros((int(weights.numel()), target_dim), device=device)
     target_error_count_by_step_feature = torch.zeros_like(target_error_sse_by_step_feature)
+    adaptive_alpha_used = torch.zeros_like(target_error_sse_by_step_feature)
+    rollout_variance = (
+        adaptive_fusion.initial_rollout_variance(device)
+        if adaptive_fusion is not None and adaptive_fusion.enabled and adaptive_fusion.mode == "causal_rollout"
+        else None
+    )
 
     feature_index = dataset.feature_indices
     true_future_features = get_true_future_features(batch, dataset, device, weights.numel())
@@ -753,12 +824,14 @@ def boundary_conditioned_rollout(
         true_step_features = true_future_features[:, step_index, :, :]
         true_step_features_finite = torch.isfinite(true_step_features).all(dim=-1)
         boundary_mask = entering_mask & true_step_features_finite
+        alpha_for_step = alpha_for_rollout_step(adaptive_fusion, step_index, pred_step_phys_raw.device, rollout_variance)
+        if alpha_for_step is not None:
+            adaptive_alpha_used[step_index] = alpha_for_step
         target_for_rollout_phys = fuse_rollout_targets(
             pred_step_phys_raw,
             true_step_phys,
             continuing_mask,
-            step_index,
-            adaptive_fusion,
+            alpha_for_step,
         )
 
         if runtime_context is None:
@@ -820,6 +893,13 @@ def boundary_conditioned_rollout(
             true_step_norm,
             supervision_mask,
         )
+        if rollout_variance is not None:
+            rollout_variance = adaptive_fusion.update_rollout_variance(
+                rollout_variance,
+                pred_step_norm_raw,
+                true_step_norm,
+                supervision_mask,
+            )
 
         new_frame_norm = normalize_features(new_frame_phys, normalization_stats, device)
         new_frame_norm = torch.where(new_mask[:, :, None], new_frame_norm, torch.zeros_like(new_frame_norm))
@@ -871,13 +951,21 @@ def boundary_conditioned_rollout(
             target_error_count_by_step_feature,
         ).detach(),
         "target_error_count_by_step_feature": target_error_count_by_step_feature.detach(),
+        "adaptive_alpha_used": adaptive_alpha_used.detach(),
     }
 
 
-def fuse_rollout_targets(pred_step_phys_raw, true_step_phys, continuing_mask, step_index: int, adaptive_fusion):
+def alpha_for_rollout_step(adaptive_fusion, step_index: int, device, rollout_variance=None):
     if adaptive_fusion is None or not adaptive_fusion.enabled:
+        return None
+    if getattr(adaptive_fusion, "mode", "global_ema") == "causal_rollout" and rollout_variance is not None:
+        return adaptive_fusion.alpha_from_variance(rollout_variance).to(device)
+    return adaptive_fusion.alpha_tensor()[int(step_index)].to(device)
+
+
+def fuse_rollout_targets(pred_step_phys_raw, true_step_phys, continuing_mask, alpha):
+    if alpha is None:
         return pred_step_phys_raw
-    alpha = adaptive_fusion.alpha_tensor()[int(step_index)].to(pred_step_phys_raw.device)
     true_finite = torch.isfinite(true_step_phys).all(dim=-1)
     fusion_mask = continuing_mask & true_finite
     fused = (1.0 - alpha.view(1, 1, -1)) * pred_step_phys_raw + alpha.view(1, 1, -1) * true_step_phys
@@ -897,6 +985,16 @@ def update_target_error_stats(
     squared = (prediction - target) ** 2
     sse_by_step_feature[step_index] += torch.where(expanded_mask, squared, torch.zeros_like(squared)).sum(dim=(0, 1))
     count_by_step_feature[step_index] += expanded_mask.sum(dim=(0, 1)).to(sse_by_step_feature.dtype)
+
+
+def target_error_mse_for_step(prediction, target, mask):
+    finite = torch.isfinite(prediction) & torch.isfinite(target)
+    expanded_mask = mask[:, :, None] & finite
+    squared = (prediction - target) ** 2
+    sse = torch.where(expanded_mask, squared, torch.zeros_like(squared)).sum(dim=(0, 1))
+    count = expanded_mask.sum(dim=(0, 1)).to(sse.dtype)
+    mse = torch.where(count > 0, sse / torch.clamp_min(count, 1.0), torch.zeros_like(sse))
+    return mse, count
 
 
 def safe_divide_tensor(numerator, denominator):
