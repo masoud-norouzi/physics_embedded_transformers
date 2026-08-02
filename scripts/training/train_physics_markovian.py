@@ -538,7 +538,7 @@ def train_full(
         checkpoint = build_checkpoint(model, optimizer, epoch, val_pure_summary, normalization_stats, config, model_config)
         latest_path = output_dir / "latest_checkpoint.pt"
         torch.save(checkpoint, latest_path)
-        if val_pure_summary["weighted_loss_internal_only"] < best_val_loss:
+        if should_update_best_checkpoint(active_runtime_context, val_pure_summary, best_val_loss):
             best_val_loss = val_pure_summary["weighted_loss_internal_only"]
             torch.save(checkpoint, output_dir / "best_checkpoint.pt")
             print(f"Saved best checkpoint: {output_dir / 'best_checkpoint.pt'}")
@@ -1202,6 +1202,12 @@ def runtime_context_for_epoch(config: dict[str, Any], epoch: int, runtime_contex
 
 def physics_refresh_mode(runtime_context) -> str:
     return "runtime" if runtime_context is not None else "stale"
+
+
+def should_update_best_checkpoint(runtime_context, val_summary: dict[str, Any], best_val_loss: float) -> bool:
+    if runtime_context is None:
+        return False
+    return float(val_summary["weighted_loss_internal_only"]) < float(best_val_loss)
 
 
 def initialize_curves_csv(path):

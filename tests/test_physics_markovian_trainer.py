@@ -413,6 +413,17 @@ def test_physics_refresh_epoch_schedule_switches_from_stale_to_runtime() -> None
     assert trainer.physics_refresh_mode(runtime_context) == "runtime"
 
 
+def test_best_checkpoint_selection_ignores_stale_physics_epochs() -> None:
+    runtime_context = object()
+    stale_summary = {"weighted_loss_internal_only": 0.1}
+    runtime_better_summary = {"weighted_loss_internal_only": 0.2}
+    runtime_worse_summary = {"weighted_loss_internal_only": 0.3}
+
+    assert not trainer.should_update_best_checkpoint(None, stale_summary, float("inf"))
+    assert trainer.should_update_best_checkpoint(runtime_context, runtime_better_summary, float("inf"))
+    assert not trainer.should_update_best_checkpoint(runtime_context, runtime_worse_summary, 0.2)
+
+
 def test_stale_refresh_uses_predicted_bbox_and_observed_non_target_physics(tmp_path: Path) -> None:
     dataset, batch = _v2_four_target_batch(tmp_path)
     model = _ConstantPredictionModel([1.0, 2.0, 31.0, 17.0])
