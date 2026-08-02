@@ -72,6 +72,15 @@ def calculate_raster_occupancy(
 ) -> dict[str, Any]:
     """Calculate raw and normalized physical-region occupancy for one ellipse raster."""
     labels = validate_label_map(region_labels)
+    return calculate_raster_occupancy_validated(labels, raster, minimum_physical_coverage)
+
+
+def calculate_raster_occupancy_validated(
+    labels: np.ndarray,
+    raster,
+    minimum_physical_coverage: float = 0.95,
+) -> dict[str, Any]:
+    """Calculate occupancy using a label map that has already been validated."""
     if not 0 <= minimum_physical_coverage <= 1:
         raise ValueError("minimum_physical_coverage must be in [0, 1]")
     local_labels = labels[raster.y0 : raster.y1, raster.x0 : raster.x1][raster.mask]

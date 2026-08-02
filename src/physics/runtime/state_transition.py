@@ -16,7 +16,7 @@ from src.physics.hydraulics import (
     compute_isolated_droplet_equivalent_length_um,
 )
 from src.physics.interpolation import VelocityFieldLibrary
-from src.physics.occupancy.calculator import calculate_raster_occupancy
+from src.physics.occupancy.calculator import calculate_raster_occupancy_validated, validate_label_map
 from src.physics.occupancy.ellipse import EllipseRaster, rasterize_bbox_ellipse
 
 
@@ -88,7 +88,7 @@ def load_physics_runtime_context(
     labels_path = Path(region_labels_path or device["geometry"]["region_labels_path"])
     if not labels_path.exists():
         raise FileNotFoundError(f"Region label map does not exist: {labels_path}")
-    region_labels = np.load(labels_path)
+    region_labels = validate_label_map(np.load(labels_path))
     velocity_conversion = load_velocity_conversion_from_experiment(experiment_path)
     transform = build_coordinate_transform(str(experiment_path))
     return PhysicsRuntimeContext(
@@ -177,7 +177,7 @@ def compute_occupancy(
         raster = ellipses[row]
         if raster is None:
             raise ValueError(f"Missing ellipse raster for active row {row}")
-        result = calculate_raster_occupancy(
+        result = calculate_raster_occupancy_validated(
             context.region_labels,
             raster,
             context.minimum_physical_coverage,
