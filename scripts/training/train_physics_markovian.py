@@ -96,7 +96,7 @@ class AdaptiveTargetFusion:
         enabled: bool,
         ema_beta: float,
         initial_prediction_variance: float,
-        measurement_variance: float,
+        measurement_variance,
         min_alpha: float,
         max_alpha: float,
         mode: str,
@@ -104,7 +104,7 @@ class AdaptiveTargetFusion:
     ) -> None:
         self.enabled = bool(enabled)
         self.ema_beta = float(ema_beta)
-        self.measurement_variance = float(measurement_variance)
+        self.measurement_variance = torch.as_tensor(measurement_variance, dtype=torch.float32, device=device)
         self.min_alpha = float(min_alpha)
         self.max_alpha = float(max_alpha)
         self.mode = str(mode)
@@ -433,7 +433,7 @@ def run_smoke_test(
     model_config,
     output_dir: Path,
 ) -> dict[str, Any]:
-    adaptive_fusion = create_adaptive_target_fusion(config, weights, model_config, device)
+    adaptive_fusion = create_adaptive_target_fusion(config, weights, model_config, device, dataset, normalization_stats)
     train_summary = train_one_epoch(
         model=model,
         loader=train_loader,
@@ -514,7 +514,7 @@ def train_full(
     curves_csv_path = output_dir / "training_curves.csv"
     initialize_curves_csv(curves_csv_path)
     best_val_loss = float("inf")
-    adaptive_fusion = create_adaptive_target_fusion(config, weights, model_config, device)
+    adaptive_fusion = create_adaptive_target_fusion(config, weights, model_config, device, dataset, normalization_stats)
     pure_validation_fusion = ZeroAdaptiveTargetFusion(weights.numel(), model_config["target_dim"], device)
     alpha_history: list[dict[str, Any]] = []
 
@@ -717,20 +717,44 @@ def evaluate(
     return summary
 
 
-def create_adaptive_target_fusion(config: dict[str, Any], weights, model_config: dict[str, Any], device):
+def create_adaptive_target_fusion(config: dict[str, Any], weights, model_config: dict[str, Any], device, dataset=None, normalization_stats=None):
     fusion = config.get("training", {}).get("adaptive_target_fusion", {})
+    measurement_variance = adaptive_measurement_variance(fusion, dataset, normalization_stats, device)
     return AdaptiveTargetFusion(
         horizon=int(weights.numel()),
         target_dim=int(model_config["target_dim"]),
         enabled=bool(fusion.get("enabled", False)),
         ema_beta=float(fusion.get("ema_beta", 0.95)),
         initial_prediction_variance=float(fusion.get("initial_prediction_variance", 1.0)),
-        measurement_variance=float(fusion.get("measurement_variance", 4.0)),
+        measurement_variance=measurement_variance,
         min_alpha=float(fusion.get("min_alpha", 0.0)),
         max_alpha=float(fusion.get("max_alpha", 0.8)),
         mode=str(fusion.get("mode", "causal_rollout")),
         device=device,
     )
+
+
+def adaptive_measurement_variance(fusion_config: dict[str, Any], dataset, normalization_stats, device):
+    if "detection_position_variance_px2" not in fusion_config:
+        return float(fusion_config.get("measurement_variance", 4.0))
+    if dataset is None or normalization_stats is None:
+        return float(fusion_config.get("measurement_variance", 4.0))
+
+    detection_variance_px2 = float(fusion_config["detection_position_variance_px2"])
+    if detection_variance_px2 < 0.0 or not np.isfinite(detection_variance_px2):
+        raise ValueError(f"detection_position_variance_px2 must be finite and non-negative, got {detection_variance_px2}")
+    target_std = torch.as_tensor(normalization_stats["target_std"], dtype=torch.float32, device=device)
+    if target_std.numel() != len(RUNTIME_TARGET_FEATURES):
+        raise ValueError(f"Expected {len(RUNTIME_TARGET_FEATURES)} target std values, got {target_std.numel()}")
+    velocity_std_px_frame = float(np.sqrt(2.0 * detection_variance_px2))
+    velocity_std = velocity_std_px_frame * float(getattr(dataset, "velocity_mm_s_per_px_frame", 1.0))
+    bbox_std = float(np.sqrt(2.0 * detection_variance_px2))
+    measurement_std = torch.as_tensor(
+        [velocity_std, velocity_std, bbox_std, bbox_std],
+        dtype=torch.float32,
+        device=device,
+    )
+    return (measurement_std / torch.clamp_min(target_std, 1.0e-12)) ** 2
 
 
 def inactive_adaptive_fusion_summary(adaptive_fusion: AdaptiveTargetFusion) -> dict[str, Any]:

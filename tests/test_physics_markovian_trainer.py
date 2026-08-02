@@ -348,6 +348,30 @@ def test_adaptive_fusion_alpha_decreases_with_lower_prediction_variance() -> Non
     assert fusion.alpha_tensor()[0, 0].item() == pytest.approx(0.0)
 
 
+def test_adaptive_measurement_variance_uses_detection_noise_and_target_scale() -> None:
+    dataset = SimpleNamespace(velocity_mm_s_per_px_frame=10.0)
+    stats = {
+        "target_std": np.asarray([5.0, 10.0, 2.0, 4.0], dtype=np.float32),
+    }
+    variance = trainer.adaptive_measurement_variance(
+        {"detection_position_variance_px2": 0.2},
+        dataset,
+        stats,
+        torch.device("cpu"),
+    )
+
+    expected = torch.tensor(
+        [
+            (np.sqrt(0.4) * 10.0 / 5.0) ** 2,
+            (np.sqrt(0.4) * 10.0 / 10.0) ** 2,
+            (np.sqrt(0.4) / 2.0) ** 2,
+            (np.sqrt(0.4) / 4.0) ** 2,
+        ],
+        dtype=torch.float32,
+    )
+    assert torch.allclose(variance, expected)
+
+
 def test_causal_adaptive_fusion_uses_previous_step_error_for_next_alpha(tmp_path: Path) -> None:
     dataset, batch = _v2_four_target_batch(tmp_path)
     model = _ConstantPredictionModel([10.0, 10.0, 30.0, 30.0])

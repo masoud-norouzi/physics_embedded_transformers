@@ -59,7 +59,7 @@ training:
     mode: causal_rollout
     ema_beta: 0.95
     initial_prediction_variance: 1.0
-    measurement_variance: 4.0
+    detection_position_variance_px2: 0.2
     min_alpha: 0.0
     max_alpha: 0.8
 
