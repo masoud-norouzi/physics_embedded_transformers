@@ -65,8 +65,8 @@ training:
     runtime_start_epoch: 2
   geometry_constraint:
     enabled: true
-    weight: 1.0
-    tolerance: 0.02
+    weight: 5.0
+    tolerance: 0.005
     num_samples_x: 48
     num_samples_y: 48
   adaptive_target_fusion:
