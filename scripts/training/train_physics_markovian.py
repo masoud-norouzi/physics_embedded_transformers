@@ -7,6 +7,7 @@ import random
 import shutil
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - exercised by environmen
 
 from src.datasets.canonical_window_dataset import create_train_val_test_datasets
 from src.models.canonical_rollout_transformer import CanonicalRolloutTransformer
+from src.physics.constraints import compute_ellipse_outside_fraction_torch
 from src.physics.runtime import load_physics_runtime_context, step as physics_runtime_step
 
 
@@ -52,8 +54,20 @@ RUNTIME_TARGET_FEATURES = ("vx", "vy", "bbox_w", "bbox_h")
 CURVES_COLUMNS = [
     "epoch",
     "active_rollout_horizon",
+    "train_total_loss",
+    "val_total_loss",
     "train_weighted_loss_internal_only",
     "val_weighted_loss_internal_only",
+    "train_geometry_loss",
+    "val_geometry_loss",
+    "train_geometry_count",
+    "val_geometry_count",
+    "train_geometry_outside_mean",
+    "val_geometry_outside_mean",
+    "train_geometry_outside_p95",
+    "val_geometry_outside_p95",
+    "train_geometry_violation_fraction",
+    "val_geometry_violation_fraction",
     "train_cfd_valid_target_fraction",
     "val_cfd_valid_target_fraction",
     "val_rmse_vx",
@@ -88,6 +102,16 @@ CURVES_COLUMNS = [
     ],
     "adaptive_fusion_alpha_mean",
 ]
+
+
+@dataclass(frozen=True)
+class GeometryConstraint:
+    enabled: bool
+    channel_mask: torch.Tensor
+    weight: float
+    tolerance: float
+    num_samples_x: int
+    num_samples_y: int
 
 
 class AdaptiveTargetFusion:
@@ -267,10 +291,20 @@ def main(argv: list[str] | None = None) -> None:
         cfd_library_path=config["dataset"].get("cfd_library_path", "outputs/physics/full_device_cfd/library"),
         feature_names=tuple(config["model"]["input_feature_names"]),
     )
+    geometry_constraint = create_geometry_constraint(config, runtime_context, device)
 
     initial_runtime_context = runtime_context_for_epoch(config, 1, runtime_context)
     print(f"shape_test physics_refresh={physics_refresh_mode(initial_runtime_context)}")
-    run_shape_test(model, train_loader, train_ds, normalization_stats, weights, device, initial_runtime_context)
+    run_shape_test(
+        model,
+        train_loader,
+        train_ds,
+        normalization_stats,
+        weights,
+        device,
+        initial_runtime_context,
+        geometry_constraint,
+    )
 
     start_time = time.perf_counter()
     if args.smoke_test:
@@ -285,6 +319,7 @@ def main(argv: list[str] | None = None) -> None:
             device=device,
             config=config,
             runtime_context=runtime_context,
+            geometry_constraint=geometry_constraint,
             model_config=model_config,
             output_dir=output_dir,
         )
@@ -304,6 +339,7 @@ def main(argv: list[str] | None = None) -> None:
         device=device,
         config=config,
         runtime_context=runtime_context,
+        geometry_constraint=geometry_constraint,
         model_config=model_config,
         output_dir=output_dir,
     )
@@ -336,6 +372,37 @@ def apply_smoke_test_overrides(config: dict[str, Any]) -> None:
     ]
     config["training"]["log_every_n_batches"] = 1
     config["training"]["output_dir"] = str(Path(config["training"]["output_dir"]) / "smoke_test")
+
+
+def create_geometry_constraint(config: dict[str, Any], runtime_context, device) -> GeometryConstraint | None:
+    geometry = config.get("training", {}).get("geometry_constraint", {})
+    if not bool(geometry.get("enabled", False)):
+        return None
+    if runtime_context is not None and hasattr(runtime_context, "region_labels"):
+        channel_mask_np = np.asarray(runtime_context.region_labels) > 0
+    else:
+        mask_path = geometry.get("channel_mask_path")
+        if mask_path is None:
+            raise ValueError("geometry_constraint enabled, but no runtime region_labels or channel_mask_path is available")
+        channel_mask_np = np.load(mask_path).astype(bool)
+    if channel_mask_np.ndim != 2 or not bool(channel_mask_np.any()):
+        raise ValueError("geometry_constraint channel mask must be a non-empty 2D mask")
+    constraint = GeometryConstraint(
+        enabled=True,
+        channel_mask=torch.as_tensor(channel_mask_np.astype(np.float32), device=device),
+        weight=float(geometry.get("weight", 1.0)),
+        tolerance=float(geometry.get("tolerance", 0.02)),
+        num_samples_x=int(geometry.get("num_samples_x", 48)),
+        num_samples_y=int(geometry.get("num_samples_y", 48)),
+    )
+    if constraint.weight < 0.0:
+        raise ValueError("geometry_constraint.weight must be non-negative")
+    print(
+        "Geometry constraint: "
+        f"enabled weight={constraint.weight:.6g} tolerance={constraint.tolerance:.6g} "
+        f"samples={constraint.num_samples_x}x{constraint.num_samples_y}"
+    )
+    return constraint
 
 
 def select_device(mode: str = "auto") -> dict[str, Any]:
@@ -405,7 +472,16 @@ def rollout_weights(horizon: int, alpha: float, device) -> torch.Tensor:
     return 1.0 + float(alpha) * step_ids / float(horizon - 1)
 
 
-def run_shape_test(model, train_loader, dataset, normalization_stats, weights, device, runtime_context=None) -> None:
+def run_shape_test(
+    model,
+    train_loader,
+    dataset,
+    normalization_stats,
+    weights,
+    device,
+    runtime_context=None,
+    geometry_constraint: GeometryConstraint | None = None,
+) -> None:
     model.eval()
     batch = move_batch_to_device(next(iter(train_loader)), device)
     with torch.no_grad():
@@ -416,6 +492,7 @@ def run_shape_test(model, train_loader, dataset, normalization_stats, weights, d
             normalization_stats=normalization_stats,
             weights=weights,
             runtime_context=runtime_context,
+            geometry_constraint=geometry_constraint,
         )
     print(f"history_x:       {tuple(batch['history_x'].shape)}")
     print(f"history_mask:    {tuple(batch['history_mask'].shape)}")
@@ -424,6 +501,7 @@ def run_shape_test(model, train_loader, dataset, normalization_stats, weights, d
     print(f"cfd_loss_mask:   {tuple(batch['cfd_loss_mask'].shape)}")
     print(f"pred_target:     {tuple(rollout['pred_target'].shape)}")
     print(f"weighted_loss_internal_only: {float(rollout['weighted_loss_internal_only']):.6f}")
+    print(f"geometry_loss:   {float(rollout['geometry_loss']):.6f}")
     assert rollout["pred_target"].shape == batch["future_y"].shape
     assert rollout["mask"].shape == batch["future_mask"].shape
     assert rollout["supervision_mask"].shape == batch["cfd_loss_mask"].shape
@@ -440,6 +518,7 @@ def run_smoke_test(
     device,
     config,
     runtime_context,
+    geometry_constraint,
     model_config,
     output_dir: Path,
 ) -> dict[str, Any]:
@@ -457,6 +536,7 @@ def run_smoke_test(
         max_batches=int(config["smoke_test"]["optimization_steps"]),
         runtime_context=runtime_context,
         adaptive_fusion=adaptive_fusion,
+        geometry_constraint=geometry_constraint,
     )
     val_summary = evaluate(
         model=model,
@@ -469,6 +549,7 @@ def run_smoke_test(
         max_batches=1,
         runtime_context=runtime_context,
         adaptive_fusion=adaptive_fusion,
+        geometry_constraint=geometry_constraint,
     )
     checkpoint_path = output_dir / "latest_checkpoint.pt"
     checkpoint = build_checkpoint(
@@ -495,11 +576,15 @@ def run_smoke_test(
             weights,
             runtime_context=runtime_context,
             adaptive_fusion=adaptive_fusion,
+            geometry_constraint=geometry_constraint,
         )
     assert torch.isfinite(rollout["weighted_loss_internal_only"])
+    assert torch.isfinite(rollout["total_loss"])
     return {
         "train_loss": train_summary["weighted_loss_internal_only"],
+        "train_total_loss": train_summary["total_loss"],
         "val_loss": val_summary["weighted_loss_internal_only"],
+        "val_total_loss": val_summary["total_loss"],
         "checkpoint": str(checkpoint_path),
         "checkpoint_reload": "ok",
         "finite_losses": True,
@@ -518,6 +603,7 @@ def train_full(
     device,
     config,
     runtime_context,
+    geometry_constraint,
     model_config,
     output_dir: Path,
 ) -> None:
@@ -573,6 +659,7 @@ def train_full(
             log_every=int(config["training"]["log_every_n_batches"]),
             runtime_context=active_runtime_context,
             adaptive_fusion=active_fusion,
+            geometry_constraint=geometry_constraint,
         )
         train_summary["active_rollout_horizon"] = float(active_rollout_horizon)
         val_summary = evaluate(
@@ -585,6 +672,7 @@ def train_full(
             log_every=int(config["training"]["log_every_n_batches"]),
             runtime_context=active_runtime_context,
             adaptive_fusion=active_fusion,
+            geometry_constraint=geometry_constraint,
         )
         val_summary["active_rollout_horizon"] = float(active_rollout_horizon)
         if active_fusion is None:
@@ -605,6 +693,7 @@ def train_full(
                 log_every=0,
                 runtime_context=active_runtime_context,
                 adaptive_fusion=pure_validation_fusion,
+                geometry_constraint=geometry_constraint,
             )
             val_pure_summary["active_rollout_horizon"] = float(active_rollout_horizon)
         fusion_summary = train_summary.get("adaptive_fusion")
@@ -645,9 +734,12 @@ def train_one_epoch(
     max_batches: int | None = None,
     runtime_context=None,
     adaptive_fusion: AdaptiveTargetFusion | None = None,
+    geometry_constraint: GeometryConstraint | None = None,
 ) -> dict[str, float]:
     model.train()
+    total_optimization_loss = 0.0
     total_loss = 0.0
+    geometry_accumulator = new_geometry_accumulator()
     total_supervised = 0
     total_present = 0
     total_runtime_attempts = 0
@@ -667,13 +759,16 @@ def train_one_epoch(
             weights,
             runtime_context=runtime_context,
             adaptive_fusion=adaptive_fusion,
+            geometry_constraint=geometry_constraint,
         )
-        loss = rollout["weighted_loss_internal_only"]
+        loss = rollout["total_loss"]
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
 
-        total_loss += float(loss.detach().cpu())
+        total_optimization_loss += float(loss.detach().cpu())
+        total_loss += float(rollout["weighted_loss_internal_only"].detach().cpu())
+        update_geometry_accumulator(geometry_accumulator, rollout)
         total_supervised += int(rollout["supervision_mask"].sum().detach().cpu())
         total_present += int(rollout["mask"].sum().detach().cpu())
         total_runtime_attempts += int(rollout["runtime_step_attempts"])
@@ -688,10 +783,11 @@ def train_one_epoch(
             alpha_count += 1
         num_batches += 1
         if log_every > 0 and (num_batches % log_every == 0 or num_batches == total_batches):
-            print_progress("train", num_batches, total_batches, total_loss / max(num_batches, 1))
+            print_progress("train", num_batches, total_batches, total_optimization_loss / max(num_batches, 1))
         if max_batches is not None and num_batches >= max_batches:
             break
     summary = {
+        "total_loss": total_optimization_loss / max(num_batches, 1),
         "weighted_loss_internal_only": total_loss / max(num_batches, 1),
         "supervised_samples": float(total_supervised),
         "present_samples": float(total_present),
@@ -700,6 +796,7 @@ def train_one_epoch(
         "runtime_step_fallbacks": float(total_runtime_fallbacks),
         "runtime_step_fallback_fraction": total_runtime_fallbacks / max(total_runtime_attempts, 1),
     }
+    summary.update(geometry_summary_from_accumulator(geometry_accumulator, num_batches))
     if adaptive_fusion is not None and alpha_sum is not None:
         summary["adaptive_fusion"] = alpha_used_summary(alpha_sum, alpha_count, adaptive_fusion)
     return summary
@@ -716,9 +813,12 @@ def evaluate(
     max_batches: int | None = None,
     runtime_context=None,
     adaptive_fusion: AdaptiveTargetFusion | None = None,
+    geometry_constraint: GeometryConstraint | None = None,
 ) -> dict[str, Any]:
     model.eval()
+    total_optimization_loss = 0.0
     total_loss = 0.0
+    geometry_accumulator = new_geometry_accumulator()
     total_supervised = 0
     total_present = 0
     total_runtime_attempts = 0
@@ -740,8 +840,11 @@ def evaluate(
                 weights,
                 runtime_context=runtime_context,
                 adaptive_fusion=adaptive_fusion,
+                geometry_constraint=geometry_constraint,
             )
+            total_optimization_loss += float(rollout["total_loss"].detach().cpu())
             total_loss += float(rollout["weighted_loss_internal_only"].detach().cpu())
+            update_geometry_accumulator(geometry_accumulator, rollout)
             total_supervised += int(rollout["supervision_mask"].sum().detach().cpu())
             total_present += int(rollout["mask"].sum().detach().cpu())
             total_runtime_attempts += int(rollout["runtime_step_attempts"])
@@ -757,6 +860,7 @@ def evaluate(
                 break
 
     summary = metrics_from_accumulator(accumulators["overall"])
+    summary["total_loss"] = total_optimization_loss / max(num_batches, 1)
     summary["weighted_loss_internal_only"] = total_loss / max(num_batches, 1)
     summary["supervised_samples"] = float(total_supervised)
     summary["present_samples"] = float(total_present)
@@ -768,6 +872,7 @@ def evaluate(
         metrics_from_accumulator(accumulator)["rmse_position"]
         for accumulator in accumulators["steps"]
     ]
+    summary.update(geometry_summary_from_accumulator(geometry_accumulator, num_batches))
     if adaptive_fusion is not None and alpha_sum is not None:
         summary["adaptive_fusion"] = alpha_used_summary(alpha_sum, alpha_count, adaptive_fusion)
     return summary
@@ -848,6 +953,7 @@ def boundary_conditioned_rollout(
     weights,
     runtime_context=None,
     adaptive_fusion: AdaptiveTargetFusion | None = None,
+    geometry_constraint: GeometryConstraint | None = None,
 ):
     device = batch["history_x"].device
     rollout_history = batch["history_x"].clone()
@@ -1005,9 +1111,28 @@ def boundary_conditioned_rollout(
     true_target_norm = torch.stack(true_targets_norm, dim=1)
     pred_target = torch.stack(pred_targets_phys, dim=1)
     true_target = torch.stack(true_targets_phys, dim=1)
+    pred_state_tensor = torch.stack(pred_states, dim=1)
+    pred_position_tensor = torch.stack(pred_positions, dim=1)
+    geometry_loss, geometry_payload = compute_rollout_geometry_loss(
+        pred_state=pred_state_tensor,
+        pred_position=pred_position_tensor,
+        supervision_mask=supervision_mask_tensor,
+        feature_index=feature_index,
+        geometry_constraint=geometry_constraint,
+    )
+    total_loss = weighted_loss_internal_only + geometry_loss
     return {
-        "weighted_loss": weighted_loss_internal_only,
+        "weighted_loss": total_loss,
+        "total_loss": total_loss,
         "weighted_loss_internal_only": weighted_loss_internal_only,
+        "geometry_loss": geometry_payload["unweighted_loss"],
+        "weighted_geometry_loss": geometry_loss,
+        "geometry_count": geometry_payload["count"],
+        "geometry_outside_mean": geometry_payload["outside_mean"],
+        "geometry_outside_p95": geometry_payload["outside_p95"],
+        "geometry_violation_fraction": geometry_payload["violation_fraction"],
+        "geometry_overlaps": geometry_payload["overlaps"],
+        "geometry_mask": geometry_payload["mask"],
         "step_losses": step_loss_tensor,
         "pred_target_norm": pred_target_norm,
         "true_target_norm": true_target_norm,
@@ -1017,8 +1142,8 @@ def boundary_conditioned_rollout(
         "true_velocity_norm": true_target_norm[..., :2],
         "pred_velocity": pred_target[..., :2],
         "true_velocity": true_target[..., :2],
-        "pred_state": torch.stack(pred_states, dim=1),
-        "pred_position": torch.stack(pred_positions, dim=1),
+        "pred_state": pred_state_tensor,
+        "pred_position": pred_position_tensor,
         "true_position": torch.stack(true_positions, dim=1),
         "mask": mask_tensor,
         "supervision_mask": supervision_mask_tensor,
@@ -1032,6 +1157,63 @@ def boundary_conditioned_rollout(
         ).detach(),
         "target_error_count_by_step_feature": target_error_count_by_step_feature.detach(),
         "adaptive_alpha_used": adaptive_alpha_used.detach(),
+    }
+
+
+def compute_rollout_geometry_loss(
+    *,
+    pred_state: torch.Tensor,
+    pred_position: torch.Tensor,
+    supervision_mask: torch.Tensor,
+    feature_index: dict[str, int],
+    geometry_constraint: GeometryConstraint | None,
+):
+    zero = pred_position.sum() * 0.0
+    if geometry_constraint is None or not geometry_constraint.enabled or geometry_constraint.weight == 0.0:
+        return zero, empty_geometry_payload(supervision_mask, pred_position.dtype, pred_position.device)
+    if "bbox_w" not in feature_index or "bbox_h" not in feature_index:
+        return zero, empty_geometry_payload(supervision_mask, pred_position.dtype, pred_position.device)
+
+    bbox = pred_state[:, :, :, [feature_index["bbox_w"], feature_index["bbox_h"]]]
+    finite = torch.isfinite(pred_position).all(dim=-1) & torch.isfinite(bbox).all(dim=-1)
+    positive_bbox = (bbox > 0.0).all(dim=-1)
+    mask = supervision_mask & finite & positive_bbox
+    if not bool(mask.any().item()):
+        return zero, empty_geometry_payload(mask, pred_position.dtype, pred_position.device)
+
+    overlaps = compute_ellipse_outside_fraction_torch(
+        pred_position[mask],
+        bbox[mask],
+        geometry_constraint.channel_mask,
+        num_samples_x=geometry_constraint.num_samples_x,
+        num_samples_y=geometry_constraint.num_samples_y,
+    )
+    penalties = torch.relu(overlaps - float(geometry_constraint.tolerance)).square()
+    unweighted_loss = penalties.mean()
+    weighted_loss = float(geometry_constraint.weight) * unweighted_loss
+    detached = overlaps.detach()
+    return weighted_loss, {
+        "unweighted_loss": unweighted_loss,
+        "count": int(mask.sum().detach().cpu()),
+        "outside_sum": float(detached.sum().cpu()),
+        "outside_mean": float(detached.mean().cpu()),
+        "outside_p95": float(torch.quantile(detached, 0.95).cpu()),
+        "violation_fraction": float((detached > float(geometry_constraint.tolerance)).float().mean().cpu()),
+        "overlaps": overlaps,
+        "mask": mask,
+    }
+
+
+def empty_geometry_payload(mask: torch.Tensor, dtype, device) -> dict[str, Any]:
+    return {
+        "unweighted_loss": torch.zeros((), dtype=dtype, device=device),
+        "count": 0,
+        "outside_sum": 0.0,
+        "outside_mean": 0.0,
+        "outside_p95": 0.0,
+        "violation_fraction": 0.0,
+        "overlaps": torch.empty(0, dtype=dtype, device=device),
+        "mask": torch.zeros_like(mask, dtype=torch.bool),
     }
 
 
@@ -1252,6 +1434,51 @@ def create_accumulators(num_steps):
     return {"overall": new_accumulator(), "steps": [new_accumulator() for _ in range(num_steps)]}
 
 
+def new_geometry_accumulator() -> dict[str, Any]:
+    return {
+        "loss_sum": 0.0,
+        "count": 0,
+        "outside_sum": 0.0,
+        "violation_sum": 0.0,
+        "outside_values": [],
+    }
+
+
+def update_geometry_accumulator(accumulator: dict[str, Any], rollout: dict[str, Any]) -> None:
+    count = int(rollout.get("geometry_count", 0))
+    geometry_loss = rollout.get("geometry_loss", 0.0)
+    if isinstance(geometry_loss, torch.Tensor):
+        geometry_loss = float(geometry_loss.detach().cpu())
+    accumulator["loss_sum"] += float(geometry_loss)
+    accumulator["count"] += count
+    if count <= 0:
+        return
+    overlaps = rollout["geometry_overlaps"].detach().cpu().float()
+    accumulator["outside_sum"] += float(overlaps.sum())
+    accumulator["violation_sum"] += float(rollout.get("geometry_violation_fraction", 0.0)) * count
+    accumulator["outside_values"].append(overlaps)
+
+
+def geometry_summary_from_accumulator(accumulator: dict[str, Any], num_batches: int) -> dict[str, float]:
+    count = int(accumulator["count"])
+    if count <= 0:
+        return {
+            "geometry_loss": accumulator["loss_sum"] / max(num_batches, 1),
+            "geometry_count": 0.0,
+            "geometry_outside_mean": 0.0,
+            "geometry_outside_p95": 0.0,
+            "geometry_violation_fraction": 0.0,
+        }
+    values = torch.cat(accumulator["outside_values"]) if accumulator["outside_values"] else torch.empty(0)
+    return {
+        "geometry_loss": accumulator["loss_sum"] / max(num_batches, 1),
+        "geometry_count": float(count),
+        "geometry_outside_mean": accumulator["outside_sum"] / max(count, 1),
+        "geometry_outside_p95": float(torch.quantile(values, 0.95).item()) if values.numel() else 0.0,
+        "geometry_violation_fraction": accumulator["violation_sum"] / max(count, 1),
+    }
+
+
 def new_accumulator():
     return {
         "count": 0,
@@ -1349,8 +1576,13 @@ def print_epoch_summary(epoch, train_summary, val_summary):
     print(
         f"epoch {epoch:03d} "
         f"rollout_horizon={active_rollout_horizon} "
+        f"train_total_loss={train_summary['total_loss']:.6f} "
+        f"val_total_loss={val_summary['total_loss']:.6f} "
         f"train_weighted_loss_internal_only={train_summary['weighted_loss_internal_only']:.6f} "
         f"val_weighted_loss_internal_only={val_summary['weighted_loss_internal_only']:.6f} "
+        f"train_geometry_loss={train_summary.get('geometry_loss', 0.0):.6f} "
+        f"val_geometry_loss={val_summary.get('geometry_loss', 0.0):.6f} "
+        f"val_geometry_violation={val_summary.get('geometry_violation_fraction', 0.0):.6f} "
         f"val_rmse_vx={val_summary['rmse_vx']:.6f} "
         f"val_rmse_vy={val_summary['rmse_vy']:.6f} "
         f"val_rmse_speed={val_summary['rmse_speed']:.6f} "
@@ -1521,8 +1753,20 @@ def append_curves_csv(path, epoch, train_summary, val_summary):
             [
                 epoch,
                 train_summary.get("active_rollout_horizon", np.nan),
+                train_summary.get("total_loss", train_summary["weighted_loss_internal_only"]),
+                val_summary.get("total_loss", val_summary["weighted_loss_internal_only"]),
                 train_summary["weighted_loss_internal_only"],
                 val_summary["weighted_loss_internal_only"],
+                train_summary.get("geometry_loss", 0.0),
+                val_summary.get("geometry_loss", 0.0),
+                train_summary.get("geometry_count", 0.0),
+                val_summary.get("geometry_count", 0.0),
+                train_summary.get("geometry_outside_mean", 0.0),
+                val_summary.get("geometry_outside_mean", 0.0),
+                train_summary.get("geometry_outside_p95", 0.0),
+                val_summary.get("geometry_outside_p95", 0.0),
+                train_summary.get("geometry_violation_fraction", 0.0),
+                val_summary.get("geometry_violation_fraction", 0.0),
                 train_summary["cfd_valid_target_fraction"],
                 val_summary["cfd_valid_target_fraction"],
                 val_summary["rmse_vx"],

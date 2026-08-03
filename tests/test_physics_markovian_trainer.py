@@ -326,6 +326,69 @@ def test_adaptive_fusion_uses_truth_for_rollout_but_loss_uses_raw_prediction(tmp
     assert rollout["pred_state"][0, 0, 0, idx["bbox_w"]].item() == pytest.approx(20.0)
 
 
+def test_geometry_constraint_uses_predicted_bbox_not_true_future_bbox(tmp_path: Path) -> None:
+    dataset, batch = _v2_four_target_batch(tmp_path)
+    model = _ConstantPredictionModel([0.0, 0.0, 80.0, 80.0])
+    stats = _identity_stats(16, target_dim=4)
+    weights = trainer.rollout_weights(1, 2.0, torch.device("cpu"))
+    channel_mask = torch.zeros((64, 64), dtype=torch.float32)
+    channel_mask[0:20, 0:20] = 1.0
+    geometry = trainer.GeometryConstraint(
+        enabled=True,
+        channel_mask=channel_mask,
+        weight=2.0,
+        tolerance=0.02,
+        num_samples_x=16,
+        num_samples_y=16,
+    )
+
+    rollout = trainer.boundary_conditioned_rollout(
+        model,
+        batch,
+        dataset,
+        stats,
+        weights,
+        runtime_context=None,
+        geometry_constraint=geometry,
+    )
+
+    assert rollout["geometry_count"] == 2
+    assert rollout["geometry_loss"].item() > 0.0
+    assert rollout["weighted_geometry_loss"].item() == pytest.approx(2.0 * rollout["geometry_loss"].item())
+    assert rollout["total_loss"].item() == pytest.approx(
+        rollout["weighted_loss_internal_only"].item() + rollout["weighted_geometry_loss"].item()
+    )
+
+
+def test_geometry_constraint_excludes_boundary_injected_droplets(tmp_path: Path) -> None:
+    dataset, batch = _v2_four_target_batch(tmp_path)
+    batch["history_mask"][0, :, 1] = False
+    model = _ConstantPredictionModel([0.0, 0.0, 80.0, 80.0])
+    stats = _identity_stats(16, target_dim=4)
+    weights = trainer.rollout_weights(1, 2.0, torch.device("cpu"))
+    geometry = trainer.GeometryConstraint(
+        enabled=True,
+        channel_mask=torch.ones((64, 64), dtype=torch.float32),
+        weight=1.0,
+        tolerance=0.02,
+        num_samples_x=8,
+        num_samples_y=8,
+    )
+
+    rollout = trainer.boundary_conditioned_rollout(
+        model,
+        batch,
+        dataset,
+        stats,
+        weights,
+        runtime_context=None,
+        geometry_constraint=geometry,
+    )
+
+    assert rollout["boundary_mask"][0, 0, 1].item() is True
+    assert rollout["geometry_mask"][0, 0, 1].item() is False
+
+
 def test_adaptive_fusion_alpha_decreases_with_lower_prediction_variance() -> None:
     fusion = trainer.AdaptiveTargetFusion(
         horizon=2,
@@ -460,6 +523,9 @@ def test_training_curves_include_step_rmse_and_adaptive_alpha(tmp_path: Path) ->
 
     lines = path.read_text().splitlines()
     assert "active_rollout_horizon" in lines[0]
+    assert "train_total_loss" in lines[0]
+    assert "val_geometry_loss" in lines[0]
+    assert "val_geometry_violation_fraction" in lines[0]
     assert "val_rmse_bbox_w" in lines[0]
     assert "val_pure_rmse_bbox_h" in lines[0]
     assert "val_rmse_position_s50" in lines[0]

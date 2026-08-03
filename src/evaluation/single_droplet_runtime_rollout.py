@@ -10,6 +10,7 @@ from typing import Any
 os.environ.setdefault("MPLCONFIGDIR", str(Path("outputs/.matplotlib-cache").resolve()))
 
 import matplotlib.pyplot as plt
+from matplotlib.patches import Ellipse
 import numpy as np
 import pandas as pd
 import yaml
@@ -92,6 +93,8 @@ def main(argv: list[str] | None = None) -> None:
         table = pd.DataFrame(rows)
         table.to_csv(scenario_dir / "trajectory.csv", index=False)
         save_trajectory_plot(table, runtime_context.region_labels > 0, scenario_dir / "trajectory.png")
+        save_ellipse_occupancy_animation(table, runtime_context.region_labels, scenario_dir / "ellipse_occupancy_animation.mp4")
+        save_occupancy_fraction_plot(table, scenario_dir / "occupancy_fractions.png")
         save_speed_plot(table, scenario_dir / "speed.png")
         save_flow_plot(table, scenario_dir / "left_flow_fraction.png")
         summary = summarize(table)
@@ -441,6 +444,110 @@ def save_trajectory_plot(table: pd.DataFrame, channel_mask: np.ndarray, path: Pa
     plt.close(fig)
 
 
+def save_ellipse_occupancy_animation(table: pd.DataFrame, region_labels: np.ndarray, path: Path) -> None:
+    frames = []
+    channel_mask = region_labels > 0
+    for _, current in table.iterrows():
+        history = table.loc[table["rollout_step"] <= int(current["rollout_step"])]
+        fig = plt.figure(figsize=(10, 5), constrained_layout=True)
+        gs = fig.add_gridspec(1, 2, width_ratios=[1.2, 0.8])
+        ax_xy = fig.add_subplot(gs[0, 0])
+        ax_occ = fig.add_subplot(gs[0, 1])
+
+        ax_xy.imshow(channel_mask, cmap="gray", alpha=0.22, origin="upper")
+        ax_xy.plot(history["x"], history["y"], color="#2563eb", linewidth=1.4, alpha=0.85)
+        ax_xy.scatter([table["x"].iloc[0]], [table["y"].iloc[0]], s=38, color="#22c55e", edgecolor="black", linewidth=0.5)
+        ax_xy.scatter([current["x"]], [current["y"]], s=42, color="#ef4444", edgecolor="black", linewidth=0.5)
+        ellipse = Ellipse(
+            xy=(float(current["x"]), float(current["y"])),
+            width=float(current["bbox_w"]),
+            height=float(current["bbox_h"]),
+            angle=0.0,
+            facecolor="#f97316",
+            edgecolor="#7c2d12",
+            alpha=0.42,
+            linewidth=1.5,
+        )
+        ax_xy.add_patch(ellipse)
+        cfd_dx, cfd_dy, cfd_available = cfd_arrow_delta(current)
+        if cfd_available:
+            ax_xy.arrow(
+                float(current["x"]),
+                float(current["y"]),
+                cfd_dx,
+                cfd_dy,
+                width=1.0,
+                head_width=7.0,
+                head_length=8.5,
+                length_includes_head=True,
+                color="#06b6d4",
+                alpha=0.9,
+                zorder=5,
+            )
+        ax_xy.set_title(
+            f"{current['scenario']} step {int(current['rollout_step'])} | {current['region']}\n"
+            f"bbox={current['bbox_w']:.1f}x{current['bbox_h']:.1f} "
+            f"runtime={bool(current['runtime_success'])} cfd={'on' if cfd_available else 'off'}",
+            fontsize=10,
+        )
+        ax_xy.set_xlim(80, 560)
+        ax_xy.set_ylim(region_labels.shape[0], 0)
+        ax_xy.set_xlabel("x (px)")
+        ax_xy.set_ylabel("y (px)")
+
+        labels = [name.replace("occupancy_", "") for name in OCCUPANCY_FEATURES]
+        values = [float(current[name]) for name in OCCUPANCY_FEATURES]
+        colors = ["#64748b"] * len(values)
+        if max(values) > 0.0:
+            colors[int(np.argmax(values))] = "#f97316"
+        y_pos = np.arange(len(labels))
+        ax_occ.barh(y_pos, values, color=colors)
+        ax_occ.set_yticks(y_pos)
+        ax_occ.set_yticklabels(labels, fontsize=8)
+        ax_occ.set_xlim(0.0, 1.0)
+        ax_occ.set_xlabel("fraction")
+        ax_occ.set_title(f"occupancy sum={float(current['occupancy_sum']):.3f}")
+        ax_occ.grid(True, axis="x", alpha=0.25)
+
+        fig.canvas.draw()
+        frames.append(np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy())
+        plt.close(fig)
+    write_mp4(path, frames, fps=10)
+
+
+def cfd_arrow_delta(row: pd.Series, length_px: float = 32.0) -> tuple[float, float, bool]:
+    u = float(row["cfd_u_norm"])
+    v = float(row["cfd_v_norm"])
+    if not np.isfinite(u) or not np.isfinite(v):
+        return 0.0, 0.0, False
+    norm = float(np.hypot(u, v))
+    if norm <= 1.0e-8:
+        return 0.0, 0.0, False
+    return length_px * u / norm, -length_px * v / norm, True
+
+
+def dominant_occupancy(row: pd.Series) -> str:
+    values = [(name.replace("occupancy_", ""), float(row[name])) for name in OCCUPANCY_FEATURES]
+    name, value = max(values, key=lambda item: item[1])
+    if value <= 0.0:
+        return "none"
+    return f"{name} {value:.2f}"
+
+
+def save_occupancy_fraction_plot(table: pd.DataFrame, path: Path) -> None:
+    fig, ax = plt.subplots(figsize=(9, 4.8), constrained_layout=True)
+    for name in OCCUPANCY_FEATURES:
+        label = name.replace("occupancy_", "")
+        ax.plot(table["rollout_step"], table[name], linewidth=1.4, label=label)
+    ax.set_xlabel("rollout step")
+    ax.set_ylabel("occupancy fraction")
+    ax.set_ylim(-0.02, 1.02)
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=7, ncols=2)
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
 def save_speed_plot(table: pd.DataFrame, path: Path) -> None:
     fig, ax = plt.subplots(figsize=(8, 4), constrained_layout=True)
     ax.plot(table["rollout_step"], table["speed"])
@@ -459,6 +566,27 @@ def save_flow_plot(table: pd.DataFrame, path: Path) -> None:
     ax.grid(True, alpha=0.3)
     fig.savefig(path, dpi=180)
     plt.close(fig)
+
+
+def write_mp4(path: Path, frames: list[np.ndarray], fps: int) -> None:
+    if not frames:
+        raise ValueError("No frames were rendered for the animation.")
+    try:
+        import cv2
+
+        height, width = frames[0].shape[:2]
+        writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), float(fps), (width, height))
+        if not writer.isOpened():
+            raise RuntimeError(f"Could not open video writer for {path}")
+        for frame in frames:
+            writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        writer.release()
+        return
+    except ModuleNotFoundError:
+        pass
+    import imageio.v2 as imageio
+
+    imageio.mimsave(path, frames, fps=fps)
 
 
 def save_json(path: Path, payload: dict[str, Any]) -> None:
