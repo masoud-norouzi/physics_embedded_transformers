@@ -1562,7 +1562,7 @@ def safe_rmse(sum_sq, count):
 
 def print_progress(label, num_batches, total_batches, running_loss):
     percent = 100.0 * num_batches / max(total_batches, 1)
-    print(f"  {label:<5} batch {num_batches:04d}/{total_batches:04d} ({percent:5.1f}%) weighted_loss={running_loss:.6f}")
+    print(f"  {label:<5} batch {num_batches:04d}/{total_batches:04d} ({percent:5.1f}%) loss={running_loss:.6f}")
 
 
 def print_epoch_summary(epoch, train_summary, val_summary):
