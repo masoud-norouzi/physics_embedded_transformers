@@ -54,14 +54,16 @@ training:
   loss_alpha: 2.0
   rollout_horizon_schedule:
     - start_epoch: 1
+      horizon: 1
+    - start_epoch: 11
       horizon: 3
-    - start_epoch: 8
+    - start_epoch: 20
       horizon: 5
-    - start_epoch: 14
+    - start_epoch: 30
       horizon: 10
-    - start_epoch: 22
+    - start_epoch: 40
       horizon: 20
-    - start_epoch: 32
+    - start_epoch: 50
       horizon: 50
   log_every_n_batches: 25
   output_dir: outputs/models/physics_markovian_v3
