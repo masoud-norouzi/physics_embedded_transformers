@@ -5,6 +5,11 @@ from pathlib import Path
 import numpy as np
 
 from src.config.velocity import DEFAULT_EXPERIMENT_CONFIG, load_velocity_conversion_from_experiment
+from src.physics.targets import (
+    SPEED_ANGLE_TARGET_FEATURES,
+    derive_speed_angle_targets_np,
+    velocity_target_features_for_parameterization,
+)
 
 try:
     import torch
@@ -61,7 +66,8 @@ class CanonicalWindowDataset(Dataset):
         self.velocity_mm_s_per_px_frame = self._runtime_velocity_conversion()
 
         self.feature_indices = self._feature_indices(self.feature_names)
-        self.target_indices = [self.feature_indices[name] for name in self.target_features]
+        self.target_source_features = velocity_target_features_for_parameterization(self.target_features)
+        self.target_indices = [self.feature_indices[name] for name in self.target_source_features]
 
         if fit_normalization:
             self.normalization_stats = self._fit_normalization()
@@ -97,7 +103,13 @@ class CanonicalWindowDataset(Dataset):
             future_slice = slice(frame_start + self.T_history, frame_start + self.T_total)
 
             raw_history = self.Z[selected, history_slice, :]
-            raw_future = self.Z[selected, future_slice, :][:, :, self.target_indices]
+            raw_future_features = self.Z[selected, future_slice, :]
+            raw_previous_features = self.Z[
+                selected,
+                slice(frame_start + self.T_history - 1, frame_start + self.T_total - 1),
+                :,
+            ]
+            raw_future = self._target_values(raw_future_features, raw_previous_features)
             raw_history_mask = self.mask[selected, history_slice]
             raw_future_mask = self.mask[selected, future_slice]
 
@@ -144,10 +156,19 @@ class CanonicalWindowDataset(Dataset):
         for required_name in ["x", "y", "vx", "vy"]:
             if required_name not in feature_indices:
                 raise KeyError(f"Missing required feature: {required_name}")
-        for target_name in self.target_features:
+        for target_name in velocity_target_features_for_parameterization(self.target_features):
             if target_name not in feature_indices:
                 raise KeyError(f"Missing target feature: {target_name}")
+        if tuple(self.target_features) == SPEED_ANGLE_TARGET_FEATURES:
+            for required_name in ["bbox_w", "bbox_h", "cfd_u_norm", "cfd_v_norm"]:
+                if required_name not in feature_indices:
+                    raise KeyError(f"Missing speed-angle target dependency: {required_name}")
         return feature_indices
+
+    def _target_values(self, future_features: np.ndarray, previous_features: np.ndarray) -> np.ndarray:
+        if tuple(self.target_features) == SPEED_ANGLE_TARGET_FEATURES:
+            return derive_speed_angle_targets_np(future_features, previous_features, self.feature_indices)
+        return future_features[:, :, self.target_indices]
 
     def _select_droplets(self, frame_start):
         window_mask = self.mask[:, frame_start : frame_start + self.T_total]
@@ -191,7 +212,13 @@ class CanonicalWindowDataset(Dataset):
             input_sumsq += np.where(input_valid, raw_history * raw_history, 0.0).sum(axis=(0, 1))
             input_count += input_valid.sum(axis=(0, 1))
 
-            raw_future = self.Z[selected, future_slice, :][:, :, self.target_indices]
+            raw_future_features = self.Z[selected, future_slice, :]
+            raw_previous_features = self.Z[
+                selected,
+                slice(int(frame_start) + self.T_history - 1, int(frame_start) + self.T_total - 1),
+                :,
+            ]
+            raw_future = self._target_values(raw_future_features, raw_previous_features)
             raw_future_mask = self.mask[selected, future_slice]
             target_valid = raw_future_mask[:, :, None] & np.isfinite(raw_future)
             target_sum += np.where(target_valid, raw_future, 0.0).sum(axis=(0, 1))

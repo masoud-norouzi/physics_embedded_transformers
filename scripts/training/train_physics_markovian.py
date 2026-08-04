@@ -28,6 +28,11 @@ from src.datasets.canonical_window_dataset import create_train_val_test_datasets
 from src.models.canonical_rollout_transformer import CanonicalRolloutTransformer
 from src.physics.constraints import compute_ellipse_outside_fraction_torch
 from src.physics.runtime import load_physics_runtime_context, step as physics_runtime_step
+from src.physics.targets import (
+    SPEED_ANGLE_TARGET_FEATURES,
+    derive_speed_angle_targets_torch,
+    reconstruct_velocity_from_speed_angle_torch,
+)
 
 
 FEATURE_NAMES = [
@@ -51,6 +56,7 @@ FEATURE_NAMES = [
 
 DIAGNOSTIC_STEPS = (1, 5, 10, 20, 30, 40, 50)
 RUNTIME_TARGET_FEATURES = ("vx", "vy", "bbox_w", "bbox_h")
+VELOCITY_TARGET_FEATURES = ("vx", "vy", "bbox_w", "bbox_h")
 CURVES_COLUMNS = [
     "epoch",
     "active_rollout_horizon",
@@ -68,6 +74,10 @@ CURVES_COLUMNS = [
     "val_geometry_outside_p95",
     "train_geometry_violation_fraction",
     "val_geometry_violation_fraction",
+    "train_base_direction_fallback_fraction",
+    "val_base_direction_fallback_fraction",
+    "val_rmse_target_speed",
+    "val_rmse_angular_correction",
     "train_cfd_valid_target_fraction",
     "val_cfd_valid_target_fraction",
     "val_rmse_vx",
@@ -245,6 +255,9 @@ def main(argv: list[str] | None = None) -> None:
         experiment_config=config["dataset"].get("experiment_config", "configs/experiments/video_2.yml"),
     )
     validate_feature_contract(train_ds, config)
+    target_parameterization = target_parameterization_from_config(config)
+    if target_parameterization["mode"] == "speed_angle_correction" and adaptive_target_fusion_enabled(config):
+        raise ValueError("adaptive_target_fusion is not implemented for speed_angle_correction targets")
     if args.smoke_test:
         train_ds = SubsetByIndex(train_ds, int(config["smoke_test"]["train_windows"]))
         val_ds = SubsetByIndex(val_ds, int(config["smoke_test"]["val_windows"]))
@@ -304,6 +317,7 @@ def main(argv: list[str] | None = None) -> None:
         device,
         initial_runtime_context,
         geometry_constraint,
+        target_parameterization,
     )
 
     start_time = time.perf_counter()
@@ -320,6 +334,7 @@ def main(argv: list[str] | None = None) -> None:
             config=config,
             runtime_context=runtime_context,
             geometry_constraint=geometry_constraint,
+            target_parameterization=target_parameterization,
             model_config=model_config,
             output_dir=output_dir,
         )
@@ -340,6 +355,7 @@ def main(argv: list[str] | None = None) -> None:
         config=config,
         runtime_context=runtime_context,
         geometry_constraint=geometry_constraint,
+        target_parameterization=target_parameterization,
         model_config=model_config,
         output_dir=output_dir,
     )
@@ -440,11 +456,28 @@ def validate_feature_contract(dataset, config: dict[str, Any]) -> None:
     if len(dataset.feature_names) != int(config["model"]["input_dim"]):
         raise ValueError("Dataset feature count does not match configured input_dim.")
     target_features = tuple(config["model"]["target_features"])
-    if dataset.feature_names == FEATURE_NAMES and target_features != RUNTIME_TARGET_FEATURES:
+    if dataset.feature_names == FEATURE_NAMES and target_features not in {RUNTIME_TARGET_FEATURES, SPEED_ANGLE_TARGET_FEATURES}:
         raise ValueError(
-            "Closed-loop physics rollout requires target_features to be exactly "
-            f"{RUNTIME_TARGET_FEATURES}, got {target_features}."
+            "Closed-loop physics rollout requires target_features to be either "
+            f"{RUNTIME_TARGET_FEATURES} or {SPEED_ANGLE_TARGET_FEATURES}, got {target_features}."
         )
+
+
+def target_parameterization_from_config(config: dict[str, Any]) -> dict[str, Any]:
+    target_features = tuple(config["model"]["target_features"])
+    parameterization = dict(config["model"].get("target_parameterization", {}))
+    if target_features == SPEED_ANGLE_TARGET_FEATURES:
+        mode = str(parameterization.get("mode", "speed_angle_correction"))
+        if mode != "speed_angle_correction":
+            raise ValueError(f"Expected target_parameterization.mode=speed_angle_correction, got {mode!r}")
+        return {
+            "mode": "speed_angle_correction",
+            "cfd_flip_y": bool(parameterization.get("cfd_flip_y", True)),
+            "max_angular_correction": float(parameterization.get("max_angular_correction_radians", np.pi)),
+        }
+    if target_features == VELOCITY_TARGET_FEATURES:
+        return {"mode": "velocity"}
+    raise ValueError(f"Unsupported target_features: {target_features}")
 
 
 class SubsetByIndex:
@@ -481,6 +514,7 @@ def run_shape_test(
     device,
     runtime_context=None,
     geometry_constraint: GeometryConstraint | None = None,
+    target_parameterization: dict[str, Any] | None = None,
 ) -> None:
     model.eval()
     batch = move_batch_to_device(next(iter(train_loader)), device)
@@ -493,6 +527,7 @@ def run_shape_test(
             weights=weights,
             runtime_context=runtime_context,
             geometry_constraint=geometry_constraint,
+            target_parameterization=target_parameterization,
         )
     print(f"history_x:       {tuple(batch['history_x'].shape)}")
     print(f"history_mask:    {tuple(batch['history_mask'].shape)}")
@@ -519,6 +554,7 @@ def run_smoke_test(
     config,
     runtime_context,
     geometry_constraint,
+    target_parameterization,
     model_config,
     output_dir: Path,
 ) -> dict[str, Any]:
@@ -537,6 +573,7 @@ def run_smoke_test(
         runtime_context=runtime_context,
         adaptive_fusion=adaptive_fusion,
         geometry_constraint=geometry_constraint,
+        target_parameterization=target_parameterization,
     )
     val_summary = evaluate(
         model=model,
@@ -550,6 +587,7 @@ def run_smoke_test(
         runtime_context=runtime_context,
         adaptive_fusion=adaptive_fusion,
         geometry_constraint=geometry_constraint,
+        target_parameterization=target_parameterization,
     )
     checkpoint_path = output_dir / "latest_checkpoint.pt"
     checkpoint = build_checkpoint(
@@ -577,6 +615,7 @@ def run_smoke_test(
             runtime_context=runtime_context,
             adaptive_fusion=adaptive_fusion,
             geometry_constraint=geometry_constraint,
+            target_parameterization=target_parameterization,
         )
     assert torch.isfinite(rollout["weighted_loss_internal_only"])
     assert torch.isfinite(rollout["total_loss"])
@@ -604,6 +643,7 @@ def train_full(
     config,
     runtime_context,
     geometry_constraint,
+    target_parameterization,
     model_config,
     output_dir: Path,
 ) -> None:
@@ -660,6 +700,7 @@ def train_full(
             runtime_context=active_runtime_context,
             adaptive_fusion=active_fusion,
             geometry_constraint=geometry_constraint,
+            target_parameterization=target_parameterization,
         )
         train_summary["active_rollout_horizon"] = float(active_rollout_horizon)
         val_summary = evaluate(
@@ -673,6 +714,7 @@ def train_full(
             runtime_context=active_runtime_context,
             adaptive_fusion=active_fusion,
             geometry_constraint=geometry_constraint,
+            target_parameterization=target_parameterization,
         )
         val_summary["active_rollout_horizon"] = float(active_rollout_horizon)
         if active_fusion is None:
@@ -694,6 +736,7 @@ def train_full(
                 runtime_context=active_runtime_context,
                 adaptive_fusion=pure_validation_fusion,
                 geometry_constraint=geometry_constraint,
+                target_parameterization=target_parameterization,
             )
             val_pure_summary["active_rollout_horizon"] = float(active_rollout_horizon)
         fusion_summary = train_summary.get("adaptive_fusion")
@@ -735,6 +778,7 @@ def train_one_epoch(
     runtime_context=None,
     adaptive_fusion: AdaptiveTargetFusion | None = None,
     geometry_constraint: GeometryConstraint | None = None,
+    target_parameterization: dict[str, Any] | None = None,
 ) -> dict[str, float]:
     model.train()
     total_optimization_loss = 0.0
@@ -744,6 +788,10 @@ def train_one_epoch(
     total_present = 0
     total_runtime_attempts = 0
     total_runtime_fallbacks = 0
+    total_base_fallbacks = 0
+    total_target_speed_sse = 0.0
+    total_angular_sse = 0.0
+    total_target_diagnostic_count = 0
     alpha_sum = None
     alpha_count = 0
     num_batches = 0
@@ -760,6 +808,7 @@ def train_one_epoch(
             runtime_context=runtime_context,
             adaptive_fusion=adaptive_fusion,
             geometry_constraint=geometry_constraint,
+            target_parameterization=target_parameterization,
         )
         loss = rollout["total_loss"]
         loss.backward()
@@ -773,6 +822,11 @@ def train_one_epoch(
         total_present += int(rollout["mask"].sum().detach().cpu())
         total_runtime_attempts += int(rollout["runtime_step_attempts"])
         total_runtime_fallbacks += int(rollout["runtime_step_fallbacks"])
+        fallback_count, speed_sse, angular_sse, diagnostic_count = target_parameterization_diagnostics(rollout, target_parameterization)
+        total_base_fallbacks += fallback_count
+        total_target_speed_sse += speed_sse
+        total_angular_sse += angular_sse
+        total_target_diagnostic_count += diagnostic_count
         if adaptive_fusion is not None:
             adaptive_fusion.update(
                 rollout["target_error_mse_by_step_feature"],
@@ -795,6 +849,9 @@ def train_one_epoch(
         "runtime_step_attempts": float(total_runtime_attempts),
         "runtime_step_fallbacks": float(total_runtime_fallbacks),
         "runtime_step_fallback_fraction": total_runtime_fallbacks / max(total_runtime_attempts, 1),
+        "base_direction_fallback_fraction": total_base_fallbacks / max(total_supervised, 1),
+        "rmse_target_speed": safe_rmse(total_target_speed_sse, total_target_diagnostic_count),
+        "rmse_angular_correction": safe_rmse(total_angular_sse, total_target_diagnostic_count),
     }
     summary.update(geometry_summary_from_accumulator(geometry_accumulator, num_batches))
     if adaptive_fusion is not None and alpha_sum is not None:
@@ -814,6 +871,7 @@ def evaluate(
     runtime_context=None,
     adaptive_fusion: AdaptiveTargetFusion | None = None,
     geometry_constraint: GeometryConstraint | None = None,
+    target_parameterization: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     model.eval()
     total_optimization_loss = 0.0
@@ -823,6 +881,10 @@ def evaluate(
     total_present = 0
     total_runtime_attempts = 0
     total_runtime_fallbacks = 0
+    total_base_fallbacks = 0
+    total_target_speed_sse = 0.0
+    total_angular_sse = 0.0
+    total_target_diagnostic_count = 0
     alpha_sum = None
     alpha_count = 0
     num_batches = 0
@@ -841,6 +903,7 @@ def evaluate(
                 runtime_context=runtime_context,
                 adaptive_fusion=adaptive_fusion,
                 geometry_constraint=geometry_constraint,
+                target_parameterization=target_parameterization,
             )
             total_optimization_loss += float(rollout["total_loss"].detach().cpu())
             total_loss += float(rollout["weighted_loss_internal_only"].detach().cpu())
@@ -849,6 +912,11 @@ def evaluate(
             total_present += int(rollout["mask"].sum().detach().cpu())
             total_runtime_attempts += int(rollout["runtime_step_attempts"])
             total_runtime_fallbacks += int(rollout["runtime_step_fallbacks"])
+            fallback_count, speed_sse, angular_sse, diagnostic_count = target_parameterization_diagnostics(rollout, target_parameterization)
+            total_base_fallbacks += fallback_count
+            total_target_speed_sse += speed_sse
+            total_angular_sse += angular_sse
+            total_target_diagnostic_count += diagnostic_count
             if "adaptive_alpha_used" in rollout:
                 alpha_sum = accumulate_alpha_used(alpha_sum, rollout["adaptive_alpha_used"])
                 alpha_count += 1
@@ -868,6 +936,9 @@ def evaluate(
     summary["runtime_step_attempts"] = float(total_runtime_attempts)
     summary["runtime_step_fallbacks"] = float(total_runtime_fallbacks)
     summary["runtime_step_fallback_fraction"] = total_runtime_fallbacks / max(total_runtime_attempts, 1)
+    summary["base_direction_fallback_fraction"] = total_base_fallbacks / max(total_supervised, 1)
+    summary["rmse_target_speed"] = safe_rmse(total_target_speed_sse, total_target_diagnostic_count)
+    summary["rmse_angular_correction"] = safe_rmse(total_angular_sse, total_target_diagnostic_count)
     summary["step_rmse_position"] = [
         metrics_from_accumulator(accumulator)["rmse_position"]
         for accumulator in accumulators["steps"]
@@ -954,6 +1025,7 @@ def boundary_conditioned_rollout(
     runtime_context=None,
     adaptive_fusion: AdaptiveTargetFusion | None = None,
     geometry_constraint: GeometryConstraint | None = None,
+    target_parameterization: dict[str, Any] | None = None,
 ):
     device = batch["history_x"].device
     rollout_history = batch["history_x"].clone()
@@ -963,6 +1035,9 @@ def boundary_conditioned_rollout(
     true_targets_norm = []
     pred_targets_phys = []
     true_targets_phys = []
+    pred_velocity_phys = []
+    true_velocity_phys = []
+    base_direction_fallback_masks = []
     pred_positions = []
     true_positions = []
     pred_states = []
@@ -983,6 +1058,7 @@ def boundary_conditioned_rollout(
     )
 
     feature_index = dataset.feature_indices
+    target_parameterization = target_parameterization or {"mode": "velocity"}
     true_future_features = get_true_future_features(batch, dataset, device, weights.numel())
     true_future_xy = true_future_features[:, :, :, [feature_index["x"], feature_index["y"]]]
 
@@ -995,29 +1071,45 @@ def boundary_conditioned_rollout(
             device,
         )[:, 0, :, :]
 
-        true_step_norm = batch["future_y"][:, step_index, :, :]
-        true_step_phys = denormalize_targets(
-            true_step_norm[:, None, :, :],
-            normalization_stats,
-            device,
-        )[:, 0, :, :]
-
         history_phys = denormalize_features(rollout_history, normalization_stats, device)
         last_frame = history_phys[:, -1, :, :]
+        true_step_features = true_future_features[:, step_index, :, :]
+        true_step_phys, true_step_norm, true_step_velocity, base_fallback_mask = target_tensors_for_step(
+            true_step_features=true_step_features,
+            previous_features=last_frame,
+            batch_future_y=batch["future_y"][:, step_index, :, :],
+            normalization_stats=normalization_stats,
+            feature_index=feature_index,
+            target_parameterization=target_parameterization,
+            device=device,
+        )
+        pred_step_runtime_phys, pred_step_velocity, pred_base_fallback_mask = runtime_prediction_from_model_target(
+            pred_step_phys_raw,
+            last_frame,
+            feature_index,
+            target_parameterization,
+        )
         new_mask = batch["future_mask"][:, step_index, :]
         continuing_mask = new_mask & previous_last_mask
         entering_mask = new_mask & ~previous_last_mask
-        true_step_features = true_future_features[:, step_index, :, :]
         true_step_features_finite = torch.isfinite(true_step_features).all(dim=-1)
         boundary_mask = entering_mask & true_step_features_finite
         alpha_for_step = alpha_for_rollout_step(adaptive_fusion, step_index, pred_step_phys_raw.device, rollout_variance)
         if alpha_for_step is not None:
             adaptive_alpha_used[step_index] = alpha_for_step
         target_for_rollout_phys = fuse_rollout_targets(
-            pred_step_phys_raw,
-            true_step_phys,
+            pred_step_runtime_phys,
+            torch.stack(
+                [
+                    true_step_velocity[..., 0],
+                    true_step_velocity[..., 1],
+                    true_step_features[..., feature_index["bbox_w"]],
+                    true_step_features[..., feature_index["bbox_h"]],
+                ],
+                dim=-1,
+            ),
             continuing_mask,
-            alpha_for_step,
+            None if target_parameterization.get("mode") == "speed_angle_correction" else alpha_for_step,
         )
 
         if runtime_context is None:
@@ -1066,6 +1158,10 @@ def boundary_conditioned_rollout(
         pred_step_phys = pred_step_phys_raw.clone()
         pred_step_norm[boundary_mask] = true_step_norm[boundary_mask]
         pred_step_phys[boundary_mask] = true_step_phys[boundary_mask]
+        pred_step_velocity_for_metrics = pred_step_velocity.clone()
+        pred_step_velocity_for_metrics[boundary_mask] = true_step_velocity[boundary_mask]
+        pred_step_runtime_for_metrics = pred_step_runtime_phys.clone()
+        pred_step_runtime_for_metrics[boundary_mask] = target_for_rollout_phys[boundary_mask]
 
         target_cfd_mask = batch.get("cfd_loss_mask", batch["future_mask"])[:, step_index, :]
         supervision_mask = target_cfd_mask & ~boundary_mask
@@ -1096,6 +1192,9 @@ def boundary_conditioned_rollout(
         true_targets_norm.append(true_step_norm)
         pred_targets_phys.append(pred_step_phys)
         true_targets_phys.append(true_step_phys)
+        pred_velocity_phys.append(pred_step_velocity_for_metrics)
+        true_velocity_phys.append(true_step_velocity)
+        base_direction_fallback_masks.append(pred_base_fallback_mask | base_fallback_mask)
         pred_states.append(new_frame_phys)
         pred_positions.append(new_frame_phys[:, :, [feature_index["x"], feature_index["y"]]])
         true_positions.append(true_future_xy[:, step_index, :, :])
@@ -1111,6 +1210,9 @@ def boundary_conditioned_rollout(
     true_target_norm = torch.stack(true_targets_norm, dim=1)
     pred_target = torch.stack(pred_targets_phys, dim=1)
     true_target = torch.stack(true_targets_phys, dim=1)
+    pred_velocity_tensor = torch.stack(pred_velocity_phys, dim=1)
+    true_velocity_tensor = torch.stack(true_velocity_phys, dim=1)
+    base_fallback_tensor = torch.stack(base_direction_fallback_masks, dim=1)
     pred_state_tensor = torch.stack(pred_states, dim=1)
     pred_position_tensor = torch.stack(pred_positions, dim=1)
     geometry_loss, geometry_payload = compute_rollout_geometry_loss(
@@ -1140,8 +1242,9 @@ def boundary_conditioned_rollout(
         "true_target": true_target,
         "pred_velocity_norm": pred_target_norm[..., :2],
         "true_velocity_norm": true_target_norm[..., :2],
-        "pred_velocity": pred_target[..., :2],
-        "true_velocity": true_target[..., :2],
+        "pred_velocity": pred_velocity_tensor,
+        "true_velocity": true_velocity_tensor,
+        "base_direction_fallback_mask": base_fallback_tensor,
         "pred_state": pred_state_tensor,
         "pred_position": pred_position_tensor,
         "true_position": torch.stack(true_positions, dim=1),
@@ -1217,6 +1320,59 @@ def empty_geometry_payload(mask: torch.Tensor, dtype, device) -> dict[str, Any]:
     }
 
 
+def target_tensors_for_step(
+    *,
+    true_step_features: torch.Tensor,
+    previous_features: torch.Tensor,
+    batch_future_y: torch.Tensor,
+    normalization_stats: dict[str, Any],
+    feature_index: dict[str, int],
+    target_parameterization: dict[str, Any],
+    device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if target_parameterization.get("mode") == "speed_angle_correction":
+        true_step_phys, fallback = derive_speed_angle_targets_torch(
+            true_step_features,
+            previous_features,
+            feature_index,
+            cfd_flip_y=bool(target_parameterization.get("cfd_flip_y", True)),
+        )
+        true_step_norm = normalize_targets(true_step_phys[:, None, :, :], normalization_stats, device)[:, 0, :, :]
+        true_velocity = true_step_features[:, :, [feature_index["vx"], feature_index["vy"]]]
+        return true_step_phys, true_step_norm, true_velocity, fallback
+
+    true_step_norm = batch_future_y
+    true_step_phys = denormalize_targets(true_step_norm[:, None, :, :], normalization_stats, device)[:, 0, :, :]
+    return true_step_phys, true_step_norm, true_step_phys[..., :2], torch.zeros_like(true_step_norm[..., 0], dtype=torch.bool)
+
+
+def runtime_prediction_from_model_target(
+    pred_step_phys: torch.Tensor,
+    previous_features: torch.Tensor,
+    feature_index: dict[str, int],
+    target_parameterization: dict[str, Any],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if target_parameterization.get("mode") == "speed_angle_correction":
+        velocity, fallback = reconstruct_velocity_from_speed_angle_torch(
+            pred_step_phys,
+            previous_features,
+            feature_index,
+            cfd_flip_y=bool(target_parameterization.get("cfd_flip_y", True)),
+            max_angular_correction=target_parameterization.get("max_angular_correction"),
+        )
+        runtime_target = torch.stack(
+            [
+                velocity[..., 0],
+                velocity[..., 1],
+                pred_step_phys[..., 2],
+                pred_step_phys[..., 3],
+            ],
+            dim=-1,
+        )
+        return runtime_target, velocity, fallback
+    return pred_step_phys, pred_step_phys[..., :2], torch.zeros_like(pred_step_phys[..., 0], dtype=torch.bool)
+
+
 def alpha_for_rollout_step(adaptive_fusion, step_index: int, device, rollout_variance=None):
     if adaptive_fusion is None or not adaptive_fusion.enabled:
         return None
@@ -1261,6 +1417,29 @@ def target_error_mse_for_step(prediction, target, mask):
 
 def safe_divide_tensor(numerator, denominator):
     return torch.where(denominator > 0, numerator / torch.clamp_min(denominator, 1.0), torch.zeros_like(numerator))
+
+
+def target_parameterization_diagnostics(rollout: dict[str, Any], target_parameterization: dict[str, Any] | None):
+    mask = rollout["supervision_mask"]
+    fallback_mask = rollout.get("base_direction_fallback_mask", torch.zeros_like(mask))
+    fallback_count = int((fallback_mask & mask).sum().detach().cpu())
+    if target_parameterization is None or target_parameterization.get("mode") != "speed_angle_correction":
+        return fallback_count, 0.0, 0.0, 0
+    finite = torch.isfinite(rollout["pred_target"][..., :2]) & torch.isfinite(rollout["true_target"][..., :2])
+    valid = mask[:, :, :, None] & finite
+    speed_valid = valid[..., 0]
+    angular_valid = valid[..., 1]
+    common_count = int((speed_valid & angular_valid).sum().detach().cpu())
+    if common_count == 0:
+        return fallback_count, 0.0, 0.0, 0
+    target_error = rollout["pred_target"][..., :2] - rollout["true_target"][..., :2]
+    speed_sse = float(target_error[..., 0][speed_valid].square().sum().detach().cpu())
+    angular_sse = float(wrap_model_angle_error(target_error[..., 1][angular_valid]).square().sum().detach().cpu())
+    return fallback_count, speed_sse, angular_sse, common_count
+
+
+def wrap_model_angle_error(error: torch.Tensor) -> torch.Tensor:
+    return torch.remainder(error + np.pi, 2.0 * np.pi) - np.pi
 
 
 def build_stale_refresh_frame(
@@ -1369,8 +1548,10 @@ def add_profile_time(profile: dict[str, float], key: str, elapsed: float) -> Non
 
 
 def masked_velocity_mse(prediction, target, mask):
-    expanded_mask = mask.unsqueeze(-1).expand_as(target)
-    squared_error = (prediction - target) ** 2
+    finite = torch.isfinite(prediction) & torch.isfinite(target)
+    expanded_mask = mask.unsqueeze(-1).expand_as(target) & finite
+    error = torch.where(finite, prediction - target, torch.zeros_like(prediction))
+    squared_error = error ** 2
     valid_error = squared_error[expanded_mask]
     if valid_error.numel() == 0:
         return squared_error.sum() * 0.0
@@ -1428,6 +1609,12 @@ def denormalize_targets(targets, normalization_stats, device):
     mean = torch.as_tensor(normalization_stats["target_mean"], dtype=torch.float32, device=device)
     std = torch.as_tensor(normalization_stats["target_std"], dtype=torch.float32, device=device)
     return targets * std.view(1, 1, 1, -1) + mean.view(1, 1, 1, -1)
+
+
+def normalize_targets(targets, normalization_stats, device):
+    mean = torch.as_tensor(normalization_stats["target_mean"], dtype=torch.float32, device=device)
+    std = torch.as_tensor(normalization_stats["target_std"], dtype=torch.float32, device=device)
+    return (targets - mean.view(1, 1, 1, -1)) / std.view(1, 1, 1, -1)
 
 
 def create_accumulators(num_steps):
@@ -1583,6 +1770,8 @@ def print_epoch_summary(epoch, train_summary, val_summary):
         f"train_geometry_loss={train_summary.get('geometry_loss', 0.0):.6f} "
         f"val_geometry_loss={val_summary.get('geometry_loss', 0.0):.6f} "
         f"val_geometry_violation={val_summary.get('geometry_violation_fraction', 0.0):.6f} "
+        f"val_base_dir_fallback={val_summary.get('base_direction_fallback_fraction', 0.0):.6f} "
+        f"val_rmse_angle={val_summary.get('rmse_angular_correction', np.nan):.6f} "
         f"val_rmse_vx={val_summary['rmse_vx']:.6f} "
         f"val_rmse_vy={val_summary['rmse_vy']:.6f} "
         f"val_rmse_speed={val_summary['rmse_speed']:.6f} "
@@ -1767,6 +1956,10 @@ def append_curves_csv(path, epoch, train_summary, val_summary):
                 val_summary.get("geometry_outside_p95", 0.0),
                 train_summary.get("geometry_violation_fraction", 0.0),
                 val_summary.get("geometry_violation_fraction", 0.0),
+                train_summary.get("base_direction_fallback_fraction", 0.0),
+                val_summary.get("base_direction_fallback_fraction", 0.0),
+                val_summary.get("rmse_target_speed", np.nan),
+                val_summary.get("rmse_angular_correction", np.nan),
                 train_summary["cfd_valid_target_fraction"],
                 val_summary["cfd_valid_target_fraction"],
                 val_summary["rmse_vx"],
