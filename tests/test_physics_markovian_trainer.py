@@ -618,6 +618,57 @@ def test_stale_refresh_uses_predicted_bbox_and_observed_non_target_physics(tmp_p
     )
 
 
+def test_position_targets_directly_update_rollout_state(tmp_path: Path) -> None:
+    dataset, batch = _v2_position_target_batch(tmp_path)
+    model = _ConstantPredictionModel([12.5, 34.5, 31.0, 17.0])
+    stats = _identity_stats(16, target_dim=4)
+    weights = trainer.rollout_weights(1, 2.0, torch.device("cpu"))
+
+    rollout = trainer.boundary_conditioned_rollout(
+        model,
+        batch,
+        dataset,
+        stats,
+        weights,
+        runtime_context=None,
+        target_parameterization={"mode": "position"},
+    )
+
+    idx = dataset.feature_indices
+    scale = dataset.velocity_mm_s_per_px_frame
+    previous_x = float(dataset.Z[0, 0, idx["x"]])
+    previous_y = float(dataset.Z[0, 0, idx["y"]])
+    assert rollout["pred_state"][0, 0, 0, idx["x"]].item() == pytest.approx(12.5)
+    assert rollout["pred_state"][0, 0, 0, idx["y"]].item() == pytest.approx(34.5)
+    assert rollout["pred_state"][0, 0, 0, idx["vx"]].item() == pytest.approx((12.5 - previous_x) * scale)
+    assert rollout["pred_state"][0, 0, 0, idx["vy"]].item() == pytest.approx((34.5 - previous_y) * scale)
+    assert rollout["pred_target"][0, 0, 0, 0].item() == pytest.approx(12.5)
+    assert rollout["true_target"][0, 0, 0, 0].item() == pytest.approx(dataset.Z[0, 1, idx["x"]])
+
+
+def test_position_targets_runtime_uses_position_prediction_mode(tmp_path: Path, monkeypatch) -> None:
+    dataset, batch = _v2_position_target_batch(tmp_path)
+    model = _ConstantPredictionModel([12.5, 34.5, 31.0, 17.0])
+    stats = _identity_stats(16, target_dim=4)
+    weights = trainer.rollout_weights(1, 2.0, torch.device("cpu"))
+    recorder = _RuntimeRecorder(dataset.feature_indices)
+    monkeypatch.setattr(trainer, "physics_runtime_step", recorder)
+
+    trainer.boundary_conditioned_rollout(
+        model,
+        batch,
+        dataset,
+        stats,
+        weights,
+        runtime_context=_runtime_context(dataset),
+        target_parameterization={"mode": "position"},
+    )
+
+    assert recorder.calls[0]["prediction_mode"] == "position"
+    assert recorder.calls[0]["model_prediction"][0, 0] == pytest.approx(12.5)
+    assert recorder.calls[0]["model_prediction"][0, 1] == pytest.approx(34.5)
+
+
 def _small_model(
     input_dim: int,
     horizon: int,
@@ -660,6 +711,20 @@ def _v2_four_target_batch(tmp_path: Path):
     return dataset, batch
 
 
+def _v2_position_target_batch(tmp_path: Path):
+    npz = _write_npz(tmp_path / "v2_position_target.npz", V2_FEATURES)
+    dataset = CanonicalWindowDataset(
+        npz,
+        start_frames=[0],
+        T_history=1,
+        T_future=3,
+        max_droplets=4,
+        target_features=trainer.POSITION_TARGET_FEATURES,
+    )
+    batch = trainer.move_batch_to_device(next(iter(DataLoader(dataset, batch_size=1))), torch.device("cpu"))
+    return dataset, batch
+
+
 def _runtime_context(dataset: CanonicalWindowDataset):
     return SimpleNamespace(feature_index=dataset.feature_indices)
 
@@ -681,13 +746,14 @@ class _RuntimeRecorder:
         self.feature_index = feature_index
         self.calls = []
 
-    def __call__(self, current_state, model_prediction, context, active_mask=None):
+    def __call__(self, current_state, model_prediction, context, active_mask=None, prediction_mode="velocity", **_kwargs):
         active = np.asarray(active_mask, dtype=bool)
         self.calls.append(
             {
                 "current_state": np.asarray(current_state).copy(),
                 "model_prediction": np.asarray(model_prediction).copy(),
                 "active_mask": active.copy(),
+                "prediction_mode": prediction_mode,
             }
         )
         out = np.zeros_like(current_state, dtype=np.float32)

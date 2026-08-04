@@ -97,6 +97,20 @@ def test_update_positions_uses_mm_s_to_px_frame_conversion() -> None:
     assert state[1].sum() == pytest.approx(0.0)
 
 
+def test_update_positions_position_mode_sets_centroid_and_recovers_velocity() -> None:
+    context = _context()
+    state = _state(context)
+    prediction = np.array([[25.0, 17.0, 12.0, 9.0], [999.0, 999.0, 1.0, 1.0]], dtype=np.float32)
+    update_positions(state, prediction, context, np.array([True, False]), prediction_mode="position")
+    idx = context.feature_index
+    assert state[0, idx["x"]] == pytest.approx(25.0)
+    assert state[0, idx["y"]] == pytest.approx(17.0)
+    assert state[0, idx["vx"]] == pytest.approx((25.0 - 20.0) * context.velocity_mm_s_per_px_frame)
+    assert state[0, idx["vy"]] == pytest.approx((17.0 - 20.0) * context.velocity_mm_s_per_px_frame)
+    assert state[0, idx["bbox_w"]] == pytest.approx(12.0)
+    assert state[1].sum() == pytest.approx(0.0)
+
+
 def test_construct_ellipses_and_compute_occupancy_reuse_region_labels() -> None:
     labels = np.zeros((80, 80), dtype=np.uint8)
     labels[:, :40] = 3

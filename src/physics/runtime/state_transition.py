@@ -110,6 +110,7 @@ def step(
     context: PhysicsRuntimeContext,
     active_mask: np.ndarray | None = None,
     profile: dict[str, float] | None = None,
+    prediction_mode: str = "velocity",
 ) -> np.ndarray:
     """Advance one deterministic physics state from learned kinematic predictions."""
     if profile is None:
@@ -118,7 +119,7 @@ def step(
         active = infer_active_mask(state, context) if active_mask is None else _mask(active_mask, len(state))
 
         updated = state.copy()
-        update_positions(updated, prediction, context, active)
+        update_positions(updated, prediction, context, active, prediction_mode=prediction_mode)
         ellipses = construct_ellipses(updated, context, active)
         occupancy = compute_occupancy(ellipses, context, active)
         hydraulics = update_hydraulics(occupancy, active, context)
@@ -139,7 +140,7 @@ def step(
     _profile_add(profile, "runtime_state_copy_seconds", time.perf_counter() - section_start)
 
     section_start = time.perf_counter()
-    update_positions(updated, prediction, context, active)
+    update_positions(updated, prediction, context, active, prediction_mode=prediction_mode)
     _profile_add(profile, "runtime_update_positions_seconds", time.perf_counter() - section_start)
 
     section_start = time.perf_counter()
@@ -174,8 +175,9 @@ def update_positions(
     prediction: np.ndarray,
     context: PhysicsRuntimeContext,
     active_mask: np.ndarray,
+    prediction_mode: str = "velocity",
 ) -> np.ndarray:
-    """Update centroids in image pixels using predicted mm/s velocities."""
+    """Update centroids from either velocity targets or direct position targets."""
     idx = context.feature_index
     scale = float(context.velocity_mm_s_per_px_frame)
     if scale <= 0 or not np.isfinite(scale):
@@ -183,10 +185,20 @@ def update_positions(
     if np.any(active_mask):
         if np.any(prediction[active_mask, 2:] <= 0.0):
             raise ValueError("Predicted bbox_w and bbox_h must be positive for active droplets")
-        state[active_mask, idx["x"]] += prediction[active_mask, 0] / scale
-        state[active_mask, idx["y"]] += prediction[active_mask, 1] / scale
-        state[active_mask, idx["vx"]] = prediction[active_mask, 0]
-        state[active_mask, idx["vy"]] = prediction[active_mask, 1]
+        if prediction_mode == "velocity":
+            state[active_mask, idx["x"]] += prediction[active_mask, 0] / scale
+            state[active_mask, idx["y"]] += prediction[active_mask, 1] / scale
+            state[active_mask, idx["vx"]] = prediction[active_mask, 0]
+            state[active_mask, idx["vy"]] = prediction[active_mask, 1]
+        elif prediction_mode == "position":
+            previous_x = state[active_mask, idx["x"]].copy()
+            previous_y = state[active_mask, idx["y"]].copy()
+            state[active_mask, idx["x"]] = prediction[active_mask, 0]
+            state[active_mask, idx["y"]] = prediction[active_mask, 1]
+            state[active_mask, idx["vx"]] = (prediction[active_mask, 0] - previous_x) * scale
+            state[active_mask, idx["vy"]] = (prediction[active_mask, 1] - previous_y) * scale
+        else:
+            raise ValueError(f"Unsupported prediction_mode: {prediction_mode!r}")
         state[active_mask, idx["bbox_w"]] = prediction[active_mask, 2]
         state[active_mask, idx["bbox_h"]] = prediction[active_mask, 3]
     return state
