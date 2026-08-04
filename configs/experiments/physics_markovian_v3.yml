@@ -54,17 +54,19 @@ training:
   loss_alpha: 2.0
   rollout_horizon_schedule:
     - start_epoch: 1
+      horizon: 3
+    - start_epoch: 8
+      horizon: 5
+    - start_epoch: 14
       horizon: 10
-    - start_epoch: 4
+    - start_epoch: 22
       horizon: 20
-    - start_epoch: 6
-      horizon: 30
-    - start_epoch: 9
+    - start_epoch: 32
       horizon: 50
   log_every_n_batches: 25
   output_dir: outputs/models/physics_markovian_v3
   physics_refresh:
-    runtime_start_epoch: 2
+    runtime_start_epoch: 1
   geometry_constraint:
     enabled: true
     weight: 5.0
