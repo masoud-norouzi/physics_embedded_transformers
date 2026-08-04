@@ -70,7 +70,7 @@ training:
   physics_refresh:
     runtime_start_epoch: 1
   geometry_constraint:
-    enabled: true
+    enabled: false
     weight: 5.0
     tolerance: 0.005
     num_samples_x: 48
