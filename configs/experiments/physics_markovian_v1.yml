@@ -56,10 +56,20 @@ training:
     - start_epoch: 21
       horizon: 10
     - start_epoch: 41
-      horizon: 20
+      horizon: 15
     - start_epoch: 61
-      horizon: 30
+      horizon: 20
     - start_epoch: 81
+      horizon: 25
+    - start_epoch: 101
+      horizon: 30
+    - start_epoch: 121
+      horizon: 35
+    - start_epoch: 141
+      horizon: 40
+    - start_epoch: 161
+      horizon: 45
+    - start_epoch: 181
       horizon: 50
   log_every_n_batches: 25
   output_dir: outputs/models/physics_markovian_v1
@@ -77,6 +87,9 @@ training:
     parent_pre_frames: 10
     parent_post_frames: 25
     nearby_radius_px: 70.0
+  stage_handoff:
+    enabled: true
+    metric: active_horizon_position_rmse
   adaptive_target_fusion:
     enabled: false
     mode: causal_rollout

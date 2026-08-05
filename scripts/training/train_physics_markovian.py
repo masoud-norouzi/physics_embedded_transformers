@@ -871,9 +871,25 @@ def train_full(
         normalization_stats,
     )
     alpha_history: list[dict[str, Any]] = []
+    stage_handoff = stage_handoff_from_config(config)
+    stage_best_metric = float("inf")
+    stage_best_path: Path | None = None
+    previous_rollout_horizon: int | None = None
 
     for epoch in range(1, int(config["training"]["epochs"]) + 1):
         active_rollout_horizon = rollout_horizon_for_epoch(config, epoch, full_rollout_horizon)
+        if previous_rollout_horizon is not None and active_rollout_horizon != previous_rollout_horizon:
+            maybe_restore_stage_best(
+                model=model,
+                optimizer=optimizer,
+                stage_best_path=stage_best_path,
+                previous_rollout_horizon=previous_rollout_horizon,
+                next_rollout_horizon=active_rollout_horizon,
+                device=device,
+                enabled=stage_handoff["enabled"],
+            )
+            stage_best_metric = float("inf")
+            stage_best_path = None
         active_weights = rollout_weights(
             active_rollout_horizon,
             float(config["training"]["loss_alpha"]),
@@ -967,6 +983,20 @@ def train_full(
         checkpoint = build_checkpoint(model, optimizer, epoch, val_pure_summary, normalization_stats, config, model_config)
         latest_path = output_dir / "latest_checkpoint.pt"
         torch.save(checkpoint, latest_path)
+        stage_metric = stage_handoff_metric(val_pure_summary, active_rollout_horizon)
+        if stage_handoff["enabled"] and stage_metric < stage_best_metric:
+            stage_best_metric = stage_metric
+            stage_best_path = output_dir / f"best_stage_horizon_{active_rollout_horizon:03d}.pt"
+            checkpoint["stage_handoff"] = {
+                "metric": "active_horizon_position_rmse",
+                "metric_value": float(stage_metric),
+                "active_rollout_horizon": int(active_rollout_horizon),
+            }
+            torch.save(checkpoint, stage_best_path)
+            print(
+                f"Saved stage-best checkpoint: {stage_best_path} "
+                f"active_horizon_position_rmse={stage_metric:.6f}"
+            )
         if should_update_best_checkpoint(
             active_runtime_context,
             val_pure_summary,
@@ -977,6 +1007,7 @@ def train_full(
             best_val_loss = val_pure_summary["weighted_loss_internal_only"]
             torch.save(checkpoint, output_dir / "best_checkpoint.pt")
             print(f"Saved best checkpoint: {output_dir / 'best_checkpoint.pt'}")
+        previous_rollout_horizon = active_rollout_horizon
 
 
 def train_one_epoch(
@@ -2238,6 +2269,62 @@ def rollout_horizon_for_epoch(config: dict[str, Any], epoch: int, full_rollout_h
 
 def rollout_horizon_schedule_enabled(config: dict[str, Any]) -> bool:
     return bool(config.get("training", {}).get("rollout_horizon_schedule", []))
+
+
+def stage_handoff_from_config(config: dict[str, Any]) -> dict[str, Any]:
+    handoff = dict(config.get("training", {}).get("stage_handoff", {}))
+    metric = str(handoff.get("metric", "active_horizon_position_rmse"))
+    if metric != "active_horizon_position_rmse":
+        raise ValueError(f"Unsupported stage_handoff.metric: {metric!r}")
+    return {
+        "enabled": bool(handoff.get("enabled", False)),
+        "metric": metric,
+    }
+
+
+def stage_handoff_metric(val_summary: dict[str, Any], active_rollout_horizon: int) -> float:
+    values = val_summary.get("step_rmse_position", [])
+    index = int(active_rollout_horizon) - 1
+    if 0 <= index < len(values):
+        value = float(values[index])
+        if np.isfinite(value):
+            return value
+    return float(val_summary["weighted_loss_internal_only"])
+
+
+def maybe_restore_stage_best(
+    *,
+    model,
+    optimizer,
+    stage_best_path: Path | None,
+    previous_rollout_horizon: int,
+    next_rollout_horizon: int,
+    device,
+    enabled: bool,
+) -> None:
+    if not enabled:
+        return
+    if stage_best_path is None or not stage_best_path.exists():
+        print(
+            f"Stage handoff skipped: no stage-best checkpoint found for "
+            f"horizon {previous_rollout_horizon} before switching to {next_rollout_horizon}"
+        )
+        return
+    checkpoint = torch.load(stage_best_path, map_location=device, weights_only=False)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    move_optimizer_state_to_device(optimizer, device)
+    print(
+        f"Restored stage-best checkpoint before horizon increase: {stage_best_path} "
+        f"({previous_rollout_horizon} -> {next_rollout_horizon})"
+    )
+
+
+def move_optimizer_state_to_device(optimizer, device) -> None:
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                state[key] = value.to(device)
 
 
 def adaptive_target_fusion_enabled(config: dict[str, Any]) -> bool:
