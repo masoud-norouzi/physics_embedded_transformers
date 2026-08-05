@@ -54,6 +54,8 @@ def main(argv: list[str] | None = None) -> None:
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     model = load_model(torch, checkpoint, device)
     normalization = checkpoint["normalization_stats"]
+    target_features = tuple(str(name) for name in checkpoint.get("target_features", config["model"]["target_features"]))
+    prediction_mode = prediction_mode_from_targets(target_features)
     runtime_context = load_physics_runtime_context(
         experiment_config_path=args.experiment_config,
         cfd_library_path=args.cfd_library,
@@ -89,6 +91,7 @@ def main(argv: list[str] | None = None) -> None:
             runtime_context=runtime_context,
             rollout_length=int(args.rollout_length),
             scenario=scenario,
+            prediction_mode=prediction_mode,
         )
         table = pd.DataFrame(rows)
         table.to_csv(scenario_dir / "trajectory.csv", index=False)
@@ -103,6 +106,8 @@ def main(argv: list[str] | None = None) -> None:
             scenario_dir / "metadata.json",
             {
                 "checkpoint": checkpoint_metadata(args.checkpoint, checkpoint),
+                "target_features": target_features,
+                "prediction_mode": prediction_mode,
                 "scenario": scenario_metadata(scenario),
                 "rollout_length": int(args.rollout_length),
                 "runtime_feature_names": feature_names,
@@ -114,6 +119,8 @@ def main(argv: list[str] | None = None) -> None:
         output_dir / "summary.json",
         {
             "checkpoint": checkpoint_metadata(args.checkpoint, checkpoint),
+            "target_features": target_features,
+            "prediction_mode": prediction_mode,
             "scenario_count": len(summaries),
             "summaries": summaries,
         },
@@ -172,8 +179,20 @@ def validate_current_feature_contract(feature_names: list[str], config: dict[str
         raise ValueError(f"Dataset feature order does not match config.\nExpected: {expected}\nFound: {feature_names}")
     if feature_names != list(CANONICAL_RUNTIME_FEATURE_NAMES):
         raise ValueError(f"Runtime single-droplet rollout requires current 16-feature state, got {feature_names}")
-    if tuple(config["model"]["target_features"]) != ("vx", "vy", "bbox_w", "bbox_h"):
-        raise ValueError("Runtime single-droplet rollout requires target_features: vx, vy, bbox_w, bbox_h")
+    target_features = tuple(config["model"]["target_features"])
+    if target_features not in {("vx", "vy", "bbox_w", "bbox_h"), ("x", "y", "bbox_w", "bbox_h")}:
+        raise ValueError(
+            "Runtime single-droplet rollout requires target_features to be either "
+            "vx, vy, bbox_w, bbox_h or x, y, bbox_w, bbox_h"
+        )
+
+
+def prediction_mode_from_targets(target_features: tuple[str, ...]) -> str:
+    if target_features == ("x", "y", "bbox_w", "bbox_h"):
+        return "position"
+    if target_features == ("vx", "vy", "bbox_w", "bbox_h"):
+        return "velocity"
+    raise ValueError(f"Unsupported checkpoint target_features for single-droplet rollout: {target_features}")
 
 
 def load_model(torch, checkpoint: dict[str, Any], device):
@@ -186,10 +205,10 @@ def load_model(torch, checkpoint: dict[str, Any], device):
 def checkpoint_metadata(path: Path, checkpoint: dict[str, Any]) -> dict[str, Any]:
     if not Path(path).exists():
         raise FileNotFoundError(f"Selected checkpoint does not exist: {path}")
-    if Path(path).name == "latest_checkpoint.pt":
-        raise ValueError("Use a frozen best checkpoint, not latest_checkpoint.pt.")
     return {
         "path": str(path),
+        "checkpoint_name": Path(path).name,
+        "is_latest_checkpoint": Path(path).name == "latest_checkpoint.pt",
         "epoch": int(checkpoint.get("epoch", -1)),
         "val_loss": float(checkpoint.get("val_loss", np.nan)),
         "sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest(),
@@ -287,6 +306,7 @@ def rollout_single_droplet(
     runtime_context,
     rollout_length: int,
     scenario: dict[str, Any],
+    prediction_mode: str,
 ) -> list[dict[str, Any]]:
     max_droplets = int(model.max_droplets)
     feature_dim = len(runtime_context.feature_names)
@@ -308,11 +328,11 @@ def rollout_single_droplet(
             pred_norm = model(history_norm.reshape(1, int(model.T_history), max_droplets, feature_dim), history_mask)[0]
             pred_phys = denormalize_target(pred_norm, normalization, torch, device).detach().cpu().numpy().astype(np.float32)
         try:
-            next_state = physics_runtime_step(state, pred_phys, runtime_context, active_mask=active_mask)
+            next_state = physics_runtime_step(state, pred_phys, runtime_context, active_mask=active_mask, prediction_mode=prediction_mode)
             runtime_success = True
             source = "runtime_closed_loop"
         except Exception as exc:
-            next_state = fallback_kinematic_step(state, pred_phys, feature_index, runtime_context)
+            next_state = fallback_kinematic_step(state, pred_phys, feature_index, runtime_context, prediction_mode)
             runtime_success = False
             source = f"kinematic_fallback_after_runtime_error:{type(exc).__name__}"
         state = next_state.astype(np.float32)
@@ -334,13 +354,22 @@ def denormalize_target(target, normalization: dict[str, Any], torch, device):
     return target * std.view(1, -1) + mean.view(1, -1)
 
 
-def fallback_kinematic_step(state: np.ndarray, prediction: np.ndarray, feature_index: dict[str, int], runtime_context) -> np.ndarray:
+def fallback_kinematic_step(state: np.ndarray, prediction: np.ndarray, feature_index: dict[str, int], runtime_context, prediction_mode: str) -> np.ndarray:
     next_state = state.copy()
     idx = feature_index
-    next_state[0, idx["x"]] += prediction[0, 0] / float(runtime_context.velocity_mm_s_per_px_frame)
-    next_state[0, idx["y"]] += prediction[0, 1] / float(runtime_context.velocity_mm_s_per_px_frame)
-    next_state[0, idx["vx"]] = prediction[0, 0]
-    next_state[0, idx["vy"]] = prediction[0, 1]
+    scale = float(runtime_context.velocity_mm_s_per_px_frame)
+    if prediction_mode == "position":
+        previous_x = float(next_state[0, idx["x"]])
+        previous_y = float(next_state[0, idx["y"]])
+        next_state[0, idx["x"]] = prediction[0, 0]
+        next_state[0, idx["y"]] = prediction[0, 1]
+        next_state[0, idx["vx"]] = (prediction[0, 0] - previous_x) * scale
+        next_state[0, idx["vy"]] = (prediction[0, 1] - previous_y) * scale
+    else:
+        next_state[0, idx["x"]] += prediction[0, 0] / scale
+        next_state[0, idx["y"]] += prediction[0, 1] / scale
+        next_state[0, idx["vx"]] = prediction[0, 0]
+        next_state[0, idx["vy"]] = prediction[0, 1]
     next_state[0, idx["bbox_w"]] = max(float(prediction[0, 2]), 1.0e-3)
     next_state[0, idx["bbox_h"]] = max(float(prediction[0, 3]), 1.0e-3)
     next_state[1:] = 0.0

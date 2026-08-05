@@ -75,6 +75,10 @@ CURVES_COLUMNS = [
     "val_geometry_outside_p95",
     "train_geometry_violation_fraction",
     "val_geometry_violation_fraction",
+    "train_target_deadband_fraction",
+    "val_target_deadband_fraction",
+    "train_event_excluded_fraction",
+    "val_event_excluded_fraction",
     "train_base_direction_fallback_fraction",
     "val_base_direction_fallback_fraction",
     "val_rmse_target_speed",
@@ -129,6 +133,16 @@ class GeometryConstraint:
     tolerance: float
     num_samples_x: int
     num_samples_y: int
+
+
+@dataclass(frozen=True)
+class EventExclusion:
+    enabled: bool
+    intervals_by_track: dict[int, tuple[tuple[int, int, str], ...]]
+    event_records: tuple[dict[str, Any], ...]
+    source_csv: str | None = None
+    parent_pre_frames: int = 10
+    parent_post_frames: int = 25
 
 
 class AdaptiveTargetFusion:
@@ -263,6 +277,9 @@ def main(argv: list[str] | None = None) -> None:
     )
     validate_feature_contract(train_ds, config)
     target_parameterization = target_parameterization_from_config(config)
+    target_deadband = target_deadband_from_config(config)
+    event_exclusion = event_exclusion_from_config(config)
+    save_json(output_dir / "event_exclusion_resolved.json", event_exclusion_summary(event_exclusion))
     if target_parameterization["mode"] == "speed_angle_correction" and adaptive_target_fusion_enabled(config):
         raise ValueError("adaptive_target_fusion is not implemented for speed_angle_correction targets")
     if target_parameterization["mode"] == "position" and adaptive_target_fusion_enabled(config):
@@ -276,6 +293,14 @@ def main(argv: list[str] | None = None) -> None:
     print(f"Test windows: {len(test_ds)}")
     print(f"Input dimension: {config['model']['input_dim']}")
     print(f"Prediction targets: {tuple(config['model']['target_features'])}")
+    if target_deadband["enabled"]:
+        print(f"Target deadband: displacement < {target_deadband['displacement_px']:.4f} px -> position target held at previous centroid")
+    if event_exclusion.enabled:
+        interval_count = sum(len(intervals) for intervals in event_exclusion.intervals_by_track.values())
+        print(
+            f"Event exclusion: {len(event_exclusion.event_records)} split events, "
+            f"{len(event_exclusion.intervals_by_track)} tracks, {interval_count} track-frame intervals"
+        )
 
     train_loader = DataLoader(
         train_ds,
@@ -327,6 +352,8 @@ def main(argv: list[str] | None = None) -> None:
         initial_runtime_context,
         geometry_constraint,
         target_parameterization,
+        target_deadband,
+        event_exclusion,
     )
 
     start_time = time.perf_counter()
@@ -344,6 +371,8 @@ def main(argv: list[str] | None = None) -> None:
             runtime_context=runtime_context,
             geometry_constraint=geometry_constraint,
             target_parameterization=target_parameterization,
+            target_deadband=target_deadband,
+            event_exclusion=event_exclusion,
             model_config=model_config,
             output_dir=output_dir,
         )
@@ -365,6 +394,8 @@ def main(argv: list[str] | None = None) -> None:
         runtime_context=runtime_context,
         geometry_constraint=geometry_constraint,
         target_parameterization=target_parameterization,
+        target_deadband=target_deadband,
+        event_exclusion=event_exclusion,
         model_config=model_config,
         output_dir=output_dir,
     )
@@ -494,6 +525,156 @@ def target_parameterization_from_config(config: dict[str, Any]) -> dict[str, Any
     raise ValueError(f"Unsupported target_features: {target_features}")
 
 
+def target_deadband_from_config(config: dict[str, Any]) -> dict[str, Any]:
+    deadband = dict(config.get("training", {}).get("target_deadband", {}))
+    enabled = bool(deadband.get("enabled", False))
+    threshold_px = float(deadband.get("displacement_px", 0.0))
+    if threshold_px < 0.0 or not np.isfinite(threshold_px):
+        raise ValueError(f"target_deadband.displacement_px must be finite and non-negative, got {threshold_px}")
+    apply_to = str(deadband.get("apply_to", "position"))
+    if apply_to != "position":
+        raise ValueError(f"Only target_deadband.apply_to=position is supported, got {apply_to!r}")
+    return {
+        "enabled": enabled and threshold_px > 0.0,
+        "displacement_px": threshold_px,
+        "apply_to": apply_to,
+    }
+
+
+def event_exclusion_from_config(config: dict[str, Any]) -> EventExclusion:
+    exclusion = dict(config.get("training", {}).get("event_exclusion", {}))
+    enabled = bool(exclusion.get("enabled", False))
+    if not enabled:
+        return EventExclusion(enabled=False, intervals_by_track={}, event_records=())
+    csv_path = Path(str(exclusion.get("split_events_csv", "")))
+    if not csv_path.exists():
+        raise FileNotFoundError(f"event_exclusion.split_events_csv does not exist: {csv_path}")
+    parent_pre = int(exclusion.get("parent_pre_frames", 10))
+    parent_post = int(exclusion.get("parent_post_frames", 25))
+    nearby_radius = float(exclusion.get("nearby_radius_px", 70.0))
+    if parent_pre < 0 or parent_post < 0:
+        raise ValueError("event_exclusion parent_pre_frames and parent_post_frames must be non-negative")
+    records = load_split_event_records(csv_path, parent_pre, parent_post, nearby_radius)
+    intervals: dict[int, list[tuple[int, int, str]]] = {}
+    for record in records:
+        child_track = int(record["split_child_track_id"])
+        add_event_interval(
+            intervals,
+            child_track,
+            int(record["start_frame"]),
+            int(record["end_frame"]),
+            "split_child_full_lifetime",
+        )
+        for nearby in record["nearby_tracks"]:
+            track_id = int(nearby["track_id"])
+            add_event_interval(
+                intervals,
+                track_id,
+                int(record["start_frame"]) - parent_pre,
+                int(record["start_frame"]) + parent_post,
+                f"near_split_child_{child_track}",
+            )
+    frozen = {track: tuple(values) for track, values in sorted(intervals.items())}
+    return EventExclusion(
+        enabled=True,
+        intervals_by_track=frozen,
+        event_records=tuple(records),
+        source_csv=str(csv_path),
+        parent_pre_frames=parent_pre,
+        parent_post_frames=parent_post,
+    )
+
+
+def load_split_event_records(csv_path: Path, parent_pre: int, parent_post: int, nearby_radius: float) -> list[dict[str, Any]]:
+    import pandas as pd
+
+    table = pd.read_csv(csv_path)
+    required = {
+        "split_child_track_id",
+        "start_frame",
+        "start_region",
+        "start_x",
+        "start_y",
+        "start_area",
+        "end_frame",
+        "lifetime_frames",
+        "nearby_tracks_at_start",
+    }
+    missing = sorted(required - set(table.columns))
+    if missing:
+        raise ValueError(f"Split event CSV is missing columns: {missing}")
+    records: list[dict[str, Any]] = []
+    for row in table.itertuples(index=False):
+        nearby = [
+            item
+            for item in parse_nearby_tracks(str(row.nearby_tracks_at_start))
+            if float(item["distance_px"]) <= nearby_radius
+        ]
+        records.append(
+            {
+                "split_child_track_id": int(row.split_child_track_id),
+                "start_frame": int(row.start_frame),
+                "start_region": str(row.start_region),
+                "start_x": float(row.start_x),
+                "start_y": float(row.start_y),
+                "start_area": float(row.start_area),
+                "end_frame": int(row.end_frame),
+                "lifetime_frames": int(row.lifetime_frames),
+                "nearby_radius_px": float(nearby_radius),
+                "parent_context_window": [int(row.start_frame) - parent_pre, int(row.start_frame) + parent_post],
+                "nearby_tracks": nearby,
+            }
+        )
+    return records
+
+
+def parse_nearby_tracks(text: str) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for raw_item in text.split(";"):
+        item = raw_item.strip()
+        if not item:
+            continue
+        parts = item.split(":")
+        if len(parts) < 4:
+            continue
+        distance_text = parts[1].removesuffix("px")
+        area_text = parts[3].removeprefix("area")
+        entries.append(
+            {
+                "track_id": int(parts[0]),
+                "distance_px": float(distance_text),
+                "region": str(parts[2]),
+                "area": float(area_text),
+            }
+        )
+    return entries
+
+
+def add_event_interval(intervals: dict[int, list[tuple[int, int, str]]], track_id: int, start: int, end: int, reason: str) -> None:
+    if end < start:
+        return
+    intervals.setdefault(int(track_id), []).append((max(0, int(start)), int(end), str(reason)))
+
+
+def event_exclusion_summary(event_exclusion: EventExclusion) -> dict[str, Any]:
+    intervals = [
+        {"track_id": int(track_id), "start_frame": int(start), "end_frame": int(end), "reason": reason}
+        for track_id, values in event_exclusion.intervals_by_track.items()
+        for start, end, reason in values
+    ]
+    return {
+        "enabled": bool(event_exclusion.enabled),
+        "source_csv": event_exclusion.source_csv,
+        "split_event_count": int(len(event_exclusion.event_records)),
+        "masked_track_count": int(len(event_exclusion.intervals_by_track)),
+        "interval_count": int(len(intervals)),
+        "parent_pre_frames": int(event_exclusion.parent_pre_frames),
+        "parent_post_frames": int(event_exclusion.parent_post_frames),
+        "events": list(event_exclusion.event_records),
+        "intervals": intervals,
+    }
+
+
 class SubsetByIndex:
     def __init__(self, base_dataset, count: int):
         self.base_dataset = base_dataset
@@ -529,6 +710,8 @@ def run_shape_test(
     runtime_context=None,
     geometry_constraint: GeometryConstraint | None = None,
     target_parameterization: dict[str, Any] | None = None,
+    target_deadband: dict[str, Any] | None = None,
+    event_exclusion: EventExclusion | None = None,
 ) -> None:
     model.eval()
     batch = move_batch_to_device(next(iter(train_loader)), device)
@@ -542,6 +725,8 @@ def run_shape_test(
             runtime_context=runtime_context,
             geometry_constraint=geometry_constraint,
             target_parameterization=target_parameterization,
+            target_deadband=target_deadband,
+            event_exclusion=event_exclusion,
         )
     print(f"history_x:       {tuple(batch['history_x'].shape)}")
     print(f"history_mask:    {tuple(batch['history_mask'].shape)}")
@@ -569,6 +754,8 @@ def run_smoke_test(
     runtime_context,
     geometry_constraint,
     target_parameterization,
+    target_deadband,
+    event_exclusion,
     model_config,
     output_dir: Path,
 ) -> dict[str, Any]:
@@ -588,6 +775,8 @@ def run_smoke_test(
         adaptive_fusion=adaptive_fusion,
         geometry_constraint=geometry_constraint,
         target_parameterization=target_parameterization,
+        target_deadband=target_deadband,
+        event_exclusion=event_exclusion,
     )
     val_summary = evaluate(
         model=model,
@@ -602,6 +791,8 @@ def run_smoke_test(
         adaptive_fusion=adaptive_fusion,
         geometry_constraint=geometry_constraint,
         target_parameterization=target_parameterization,
+        target_deadband=target_deadband,
+        event_exclusion=event_exclusion,
     )
     checkpoint_path = output_dir / "latest_checkpoint.pt"
     checkpoint = build_checkpoint(
@@ -630,6 +821,8 @@ def run_smoke_test(
             adaptive_fusion=adaptive_fusion,
             geometry_constraint=geometry_constraint,
             target_parameterization=target_parameterization,
+            target_deadband=target_deadband,
+            event_exclusion=event_exclusion,
         )
     assert torch.isfinite(rollout["weighted_loss_internal_only"])
     assert torch.isfinite(rollout["total_loss"])
@@ -658,6 +851,8 @@ def train_full(
     runtime_context,
     geometry_constraint,
     target_parameterization,
+    target_deadband,
+    event_exclusion,
     model_config,
     output_dir: Path,
 ) -> None:
@@ -715,6 +910,8 @@ def train_full(
             adaptive_fusion=active_fusion,
             geometry_constraint=geometry_constraint,
             target_parameterization=target_parameterization,
+            target_deadband=target_deadband,
+            event_exclusion=event_exclusion,
         )
         train_summary["active_rollout_horizon"] = float(active_rollout_horizon)
         val_summary = evaluate(
@@ -729,6 +926,8 @@ def train_full(
             adaptive_fusion=active_fusion,
             geometry_constraint=geometry_constraint,
             target_parameterization=target_parameterization,
+            target_deadband=target_deadband,
+            event_exclusion=event_exclusion,
         )
         val_summary["active_rollout_horizon"] = float(active_rollout_horizon)
         if active_fusion is None:
@@ -751,6 +950,8 @@ def train_full(
                 adaptive_fusion=pure_validation_fusion,
                 geometry_constraint=geometry_constraint,
                 target_parameterization=target_parameterization,
+                target_deadband=target_deadband,
+                event_exclusion=event_exclusion,
             )
             val_pure_summary["active_rollout_horizon"] = float(active_rollout_horizon)
         fusion_summary = train_summary.get("adaptive_fusion")
@@ -793,6 +994,8 @@ def train_one_epoch(
     adaptive_fusion: AdaptiveTargetFusion | None = None,
     geometry_constraint: GeometryConstraint | None = None,
     target_parameterization: dict[str, Any] | None = None,
+    target_deadband: dict[str, Any] | None = None,
+    event_exclusion: EventExclusion | None = None,
 ) -> dict[str, float]:
     model.train()
     total_optimization_loss = 0.0
@@ -800,6 +1003,8 @@ def train_one_epoch(
     geometry_accumulator = new_geometry_accumulator()
     total_supervised = 0
     total_present = 0
+    total_deadband = 0
+    total_event_excluded = 0
     total_runtime_attempts = 0
     total_runtime_fallbacks = 0
     total_base_fallbacks = 0
@@ -825,6 +1030,8 @@ def train_one_epoch(
             adaptive_fusion=adaptive_fusion,
             geometry_constraint=geometry_constraint,
             target_parameterization=target_parameterization,
+            target_deadband=target_deadband,
+            event_exclusion=event_exclusion,
         )
         loss = rollout["total_loss"]
         loss.backward()
@@ -836,6 +1043,8 @@ def train_one_epoch(
         update_geometry_accumulator(geometry_accumulator, rollout)
         total_supervised += int(rollout["supervision_mask"].sum().detach().cpu())
         total_present += int(rollout["mask"].sum().detach().cpu())
+        total_deadband += int((rollout["target_deadband_mask"] & rollout["supervision_mask"]).sum().detach().cpu())
+        total_event_excluded += int(rollout["event_exclusion_mask"].sum().detach().cpu())
         total_runtime_attempts += int(rollout["runtime_step_attempts"])
         total_runtime_fallbacks += int(rollout["runtime_step_fallbacks"])
         fallback_count, speed_sse, angular_sse, diagnostic_count = target_parameterization_diagnostics(rollout, target_parameterization)
@@ -867,6 +1076,8 @@ def train_one_epoch(
         "supervised_samples": float(total_supervised),
         "present_samples": float(total_present),
         "cfd_valid_target_fraction": total_supervised / max(total_present, 1),
+        "target_deadband_fraction": total_deadband / max(total_supervised, 1),
+        "event_excluded_fraction": total_event_excluded / max(total_present, 1),
         "runtime_step_attempts": float(total_runtime_attempts),
         "runtime_step_fallbacks": float(total_runtime_fallbacks),
         "runtime_step_fallback_fraction": total_runtime_fallbacks / max(total_runtime_attempts, 1),
@@ -894,6 +1105,8 @@ def evaluate(
     adaptive_fusion: AdaptiveTargetFusion | None = None,
     geometry_constraint: GeometryConstraint | None = None,
     target_parameterization: dict[str, Any] | None = None,
+    target_deadband: dict[str, Any] | None = None,
+    event_exclusion: EventExclusion | None = None,
 ) -> dict[str, Any]:
     model.eval()
     total_optimization_loss = 0.0
@@ -901,6 +1114,8 @@ def evaluate(
     geometry_accumulator = new_geometry_accumulator()
     total_supervised = 0
     total_present = 0
+    total_deadband = 0
+    total_event_excluded = 0
     total_runtime_attempts = 0
     total_runtime_fallbacks = 0
     total_base_fallbacks = 0
@@ -928,12 +1143,16 @@ def evaluate(
                 adaptive_fusion=adaptive_fusion,
                 geometry_constraint=geometry_constraint,
                 target_parameterization=target_parameterization,
+                target_deadband=target_deadband,
+                event_exclusion=event_exclusion,
             )
             total_optimization_loss += float(rollout["total_loss"].detach().cpu())
             total_loss += float(rollout["weighted_loss_internal_only"].detach().cpu())
             update_geometry_accumulator(geometry_accumulator, rollout)
             total_supervised += int(rollout["supervision_mask"].sum().detach().cpu())
             total_present += int(rollout["mask"].sum().detach().cpu())
+            total_deadband += int((rollout["target_deadband_mask"] & rollout["supervision_mask"]).sum().detach().cpu())
+            total_event_excluded += int(rollout["event_exclusion_mask"].sum().detach().cpu())
             total_runtime_attempts += int(rollout["runtime_step_attempts"])
             total_runtime_fallbacks += int(rollout["runtime_step_fallbacks"])
             fallback_count, speed_sse, angular_sse, diagnostic_count = target_parameterization_diagnostics(rollout, target_parameterization)
@@ -962,6 +1181,8 @@ def evaluate(
     summary["supervised_samples"] = float(total_supervised)
     summary["present_samples"] = float(total_present)
     summary["cfd_valid_target_fraction"] = total_supervised / max(total_present, 1)
+    summary["target_deadband_fraction"] = total_deadband / max(total_supervised, 1)
+    summary["event_excluded_fraction"] = total_event_excluded / max(total_present, 1)
     summary["runtime_step_attempts"] = float(total_runtime_attempts)
     summary["runtime_step_fallbacks"] = float(total_runtime_fallbacks)
     summary["runtime_step_fallback_fraction"] = total_runtime_fallbacks / max(total_runtime_attempts, 1)
@@ -1056,6 +1277,8 @@ def boundary_conditioned_rollout(
     adaptive_fusion: AdaptiveTargetFusion | None = None,
     geometry_constraint: GeometryConstraint | None = None,
     target_parameterization: dict[str, Any] | None = None,
+    target_deadband: dict[str, Any] | None = None,
+    event_exclusion: EventExclusion | None = None,
 ):
     device = batch["history_x"].device
     rollout_history = batch["history_x"].clone()
@@ -1074,6 +1297,8 @@ def boundary_conditioned_rollout(
     step_masks = []
     supervision_masks = []
     boundary_masks = []
+    deadband_masks = []
+    event_exclusion_masks = []
     step_losses = []
     runtime_step_attempts = 0
     runtime_step_fallbacks = 0
@@ -1104,13 +1329,16 @@ def boundary_conditioned_rollout(
         history_phys = denormalize_features(rollout_history, normalization_stats, device)
         last_frame = history_phys[:, -1, :, :]
         true_step_features = true_future_features[:, step_index, :, :]
-        true_step_phys, true_step_norm, true_step_velocity, base_fallback_mask = target_tensors_for_step(
+        previous_target_features = last_frame if step_index == 0 else true_future_features[:, step_index - 1, :, :]
+        true_step_phys, true_step_norm, true_step_velocity, base_fallback_mask, deadband_mask = target_tensors_for_step(
             true_step_features=true_step_features,
-            previous_features=last_frame,
+            previous_features=previous_target_features,
             batch_future_y=batch["future_y"][:, step_index, :, :],
             normalization_stats=normalization_stats,
             feature_index=feature_index,
             target_parameterization=target_parameterization,
+            target_deadband=target_deadband,
+            dataset=dataset,
             device=device,
         )
         pred_step_runtime_phys, pred_step_velocity, pred_base_fallback_mask = runtime_prediction_from_model_target(
@@ -1193,7 +1421,8 @@ def boundary_conditioned_rollout(
         pred_step_velocity_for_metrics = pred_step_velocity.clone()
         pred_step_velocity_for_metrics[boundary_mask] = true_step_velocity[boundary_mask]
         target_cfd_mask = batch.get("cfd_loss_mask", batch["future_mask"])[:, step_index, :]
-        supervision_mask = target_cfd_mask & ~boundary_mask
+        event_exclusion_mask = event_exclusion_mask_for_step(batch, step_index, target_cfd_mask, event_exclusion, dataset)
+        supervision_mask = target_cfd_mask & ~boundary_mask & ~event_exclusion_mask
         step_loss = masked_velocity_mse(pred_step_norm, true_step_norm, supervision_mask)
         step_losses.append(step_loss)
         update_target_error_stats(
@@ -1230,6 +1459,8 @@ def boundary_conditioned_rollout(
         step_masks.append(new_mask)
         supervision_masks.append(supervision_mask)
         boundary_masks.append(boundary_mask)
+        deadband_masks.append(deadband_mask)
+        event_exclusion_masks.append(event_exclusion_mask)
 
     step_loss_tensor = torch.stack(step_losses)
     weighted_loss_internal_only = (step_loss_tensor * weights).sum() / weights.sum()
@@ -1280,6 +1511,8 @@ def boundary_conditioned_rollout(
         "mask": mask_tensor,
         "supervision_mask": supervision_mask_tensor,
         "boundary_mask": torch.stack(boundary_masks, dim=1),
+        "target_deadband_mask": torch.stack(deadband_masks, dim=1),
+        "event_exclusion_mask": torch.stack(event_exclusion_masks, dim=1),
         "internal_loss_mask": supervision_mask_tensor,
         "runtime_step_attempts": runtime_step_attempts,
         "runtime_step_fallbacks": runtime_step_fallbacks,
@@ -1357,8 +1590,10 @@ def target_tensors_for_step(
     normalization_stats: dict[str, Any],
     feature_index: dict[str, int],
     target_parameterization: dict[str, Any],
+    target_deadband: dict[str, Any] | None,
+    dataset,
     device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if target_parameterization.get("mode") == "speed_angle_correction":
         true_step_phys, fallback = derive_speed_angle_targets_torch(
             true_step_features,
@@ -1368,16 +1603,67 @@ def target_tensors_for_step(
         )
         true_step_norm = normalize_targets(true_step_phys[:, None, :, :], normalization_stats, device)[:, 0, :, :]
         true_velocity = true_step_features[:, :, [feature_index["vx"], feature_index["vy"]]]
-        return true_step_phys, true_step_norm, true_velocity, fallback
+        return true_step_phys, true_step_norm, true_velocity, fallback, torch.zeros_like(true_step_norm[..., 0], dtype=torch.bool)
     if target_parameterization.get("mode") == "position":
         true_step_norm = batch_future_y
         true_step_phys = denormalize_targets(true_step_norm[:, None, :, :], normalization_stats, device)[:, 0, :, :]
-        true_velocity = true_step_features[:, :, [feature_index["vx"], feature_index["vy"]]]
-        return true_step_phys, true_step_norm, true_velocity, torch.zeros_like(true_step_norm[..., 0], dtype=torch.bool)
+        true_step_phys, deadband_mask = apply_position_target_deadband(
+            true_step_phys,
+            previous_features,
+            feature_index,
+            target_deadband,
+        )
+        true_step_norm = normalize_targets(true_step_phys[:, None, :, :], normalization_stats, device)[:, 0, :, :]
+        true_velocity = position_target_to_velocity(true_step_phys, previous_features, feature_index, dataset)
+        return true_step_phys, true_step_norm, true_velocity, torch.zeros_like(true_step_norm[..., 0], dtype=torch.bool), deadband_mask
 
     true_step_norm = batch_future_y
     true_step_phys = denormalize_targets(true_step_norm[:, None, :, :], normalization_stats, device)[:, 0, :, :]
-    return true_step_phys, true_step_norm, true_step_phys[..., :2], torch.zeros_like(true_step_norm[..., 0], dtype=torch.bool)
+    return true_step_phys, true_step_norm, true_step_phys[..., :2], torch.zeros_like(true_step_norm[..., 0], dtype=torch.bool), torch.zeros_like(true_step_norm[..., 0], dtype=torch.bool)
+
+
+def apply_position_target_deadband(
+    true_step_phys: torch.Tensor,
+    previous_features: torch.Tensor,
+    feature_index: dict[str, int],
+    target_deadband: dict[str, Any] | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not target_deadband or not bool(target_deadband.get("enabled", False)):
+        return true_step_phys, torch.zeros_like(true_step_phys[..., 0], dtype=torch.bool)
+    threshold_px = float(target_deadband["displacement_px"])
+    previous_xy = previous_features[:, :, [feature_index["x"], feature_index["y"]]]
+    target_xy = true_step_phys[..., :2]
+    finite = torch.isfinite(previous_xy).all(dim=-1) & torch.isfinite(target_xy).all(dim=-1)
+    displacement = torch.linalg.vector_norm(target_xy - previous_xy, dim=-1)
+    deadband_mask = finite & (displacement < threshold_px)
+    if not deadband_mask.any():
+        return true_step_phys, deadband_mask
+    adjusted = true_step_phys.clone()
+    adjusted[..., 0] = torch.where(deadband_mask, previous_xy[..., 0], adjusted[..., 0])
+    adjusted[..., 1] = torch.where(deadband_mask, previous_xy[..., 1], adjusted[..., 1])
+    return adjusted, deadband_mask
+
+
+def event_exclusion_mask_for_step(batch: dict[str, torch.Tensor], step_index: int, base_mask: torch.Tensor, event_exclusion: EventExclusion | None, dataset) -> torch.Tensor:
+    mask = torch.zeros_like(base_mask, dtype=torch.bool)
+    if event_exclusion is None or not event_exclusion.enabled:
+        return mask
+    droplet_ids = batch["droplet_ids"].detach().cpu().numpy()
+    frame_starts = batch["frame_start"].detach().cpu().numpy()
+    t_history = int(getattr(dataset, "T_history", 1))
+    B, M = droplet_ids.shape
+    for batch_index in range(B):
+        frame = int(frame_starts[batch_index]) + t_history + int(step_index)
+        for slot_index in range(M):
+            track_id = int(droplet_ids[batch_index, slot_index])
+            if track_id < 0:
+                continue
+            intervals = event_exclusion.intervals_by_track.get(track_id)
+            if not intervals:
+                continue
+            if any(start <= frame <= end for start, end, _reason in intervals):
+                mask[batch_index, slot_index] = True
+    return mask & base_mask
 
 
 def runtime_prediction_from_model_target(
@@ -1879,6 +2165,10 @@ def print_epoch_summary(epoch, train_summary, val_summary):
         f"train_geometry_loss={train_summary.get('geometry_loss', 0.0):.6f} "
         f"val_geometry_loss={val_summary.get('geometry_loss', 0.0):.6f} "
         f"val_geometry_violation={val_summary.get('geometry_violation_fraction', 0.0):.6f} "
+        f"train_target_deadband={train_summary.get('target_deadband_fraction', 0.0):.6f} "
+        f"val_target_deadband={val_summary.get('target_deadband_fraction', 0.0):.6f} "
+        f"train_event_excluded={train_summary.get('event_excluded_fraction', 0.0):.6f} "
+        f"val_event_excluded={val_summary.get('event_excluded_fraction', 0.0):.6f} "
         f"val_base_dir_fallback={val_summary.get('base_direction_fallback_fraction', 0.0):.6f} "
         f"val_rmse_angle={val_summary.get('rmse_angular_correction', np.nan):.6f} "
         f"val_rmse_target_x={val_summary.get('rmse_target_x', np.nan):.6f} "
@@ -2067,6 +2357,10 @@ def append_curves_csv(path, epoch, train_summary, val_summary):
                 val_summary.get("geometry_outside_p95", 0.0),
                 train_summary.get("geometry_violation_fraction", 0.0),
                 val_summary.get("geometry_violation_fraction", 0.0),
+                train_summary.get("target_deadband_fraction", 0.0),
+                val_summary.get("target_deadband_fraction", 0.0),
+                train_summary.get("event_excluded_fraction", 0.0),
+                val_summary.get("event_excluded_fraction", 0.0),
                 train_summary.get("base_direction_fallback_fraction", 0.0),
                 val_summary.get("base_direction_fallback_fraction", 0.0),
                 val_summary.get("rmse_target_speed", np.nan),
