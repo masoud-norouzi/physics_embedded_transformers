@@ -69,6 +69,12 @@ training:
     tolerance: 0.005
     num_samples_x: 48
     num_samples_y: 48
+  event_exclusion:
+    enabled: true
+    split_events_csv: outputs/evaluation/split_event_scan/split_child_track_events.csv
+    parent_pre_frames: 10
+    parent_post_frames: 25
+    nearby_radius_px: 70.0
   adaptive_target_fusion:
     enabled: false
     mode: causal_rollout
