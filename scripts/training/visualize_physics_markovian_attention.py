@@ -10,16 +10,21 @@ import torch
 from torch.utils.data import default_collate
 
 from scripts.training.train_physics_markovian import (
+    build_stale_refresh_frame,
     denormalize_features,
     denormalize_targets,
+    load_config,
     move_batch_to_device,
     normalize_features,
-    refresh_observed_non_target_features,
+    runtime_prediction_from_model_target,
+    runtime_prediction_mode,
+    runtime_step_batch,
     rollout_weights,
-    velocity_mm_s_to_px_frame_scale,
+    target_parameterization_from_config,
 )
 from src.datasets.canonical_window_dataset import CanonicalWindowDataset
 from src.models.canonical_rollout_transformer import CanonicalRolloutTransformer
+from src.physics.runtime import load_physics_runtime_context
 
 
 CSV_COLUMNS = [
@@ -48,6 +53,9 @@ def main() -> None:
     model = CanonicalRolloutTransformer(**checkpoint["model_config"]).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
+    config = load_config(args.config)
+    config["model"]["target_features"] = [str(name) for name in checkpoint.get("target_features", config["model"]["target_features"])]
+    target_parameterization = target_parameterization_from_config(config)
 
     dataset = build_validation_dataset(
         npz_path=args.npz_path,
@@ -58,6 +66,11 @@ def main() -> None:
         history_length=int(checkpoint["model_config"]["T_history"]),
         max_droplets=int(checkpoint["model_config"]["max_droplets"]),
         experiment_config=args.experiment_config,
+    )
+    runtime_context = load_physics_runtime_context(
+        experiment_config_path=args.experiment_config,
+        cfd_library_path=args.cfd_library,
+        feature_names=dataset.feature_names,
     )
     video_path = resolve_video_path(args.video_path)
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -93,12 +106,14 @@ def main() -> None:
                 weights=weights,
                 target_slot=target_slot,
                 device=device,
+                runtime_context=runtime_context,
+                target_parameterization=target_parameterization,
             )
         assert_no_nan_payload(render_payload)
         frame_start = int(sample["frame_start"])
         track_id = int(sample["droplet_ids"][target_slot])
         stem = f"attention_validation_sample_{rank:02d}_window_{window_index:05d}_track_{track_id}"
-        video_output = args.output_dir / f"{stem}.mp4"
+        video_output = args.output_dir / f"{stem}.{args.video_format}"
         csv_output = args.output_dir / f"{stem}.csv"
         write_csv(csv_output, rows)
         write_attention_video(video_path, video_output, args, render_payload)
@@ -114,16 +129,19 @@ def main() -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Overlay physics Markovian Transformer attention on video.")
     parser.add_argument("--checkpoint", type=Path, default=Path("outputs/models/physics_markovian_v1/best_checkpoint.pt"))
+    parser.add_argument("--config", type=Path, default=Path("configs/experiments/physics_markovian_v1.yml"))
     parser.add_argument("--npz-path", type=Path, default=Path("outputs/processed/2/canonical_dataset_v2/canonical_dataset_v2.npz"))
     parser.add_argument("--video-path", type=Path, default=Path("D:/Microfluidic loop projct/new loop experiments/confined droplets 2/2.avi"))
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/models/physics_markovian_v1/attention"))
     parser.add_argument("--experiment-config", type=Path, default=Path("configs/experiments/video_2.yml"))
+    parser.add_argument("--cfd-library", type=Path, default=Path("outputs/physics/full_device_cfd/library"))
     parser.add_argument("--num-videos", type=int, default=5)
     parser.add_argument("--window-index", type=int, default=None)
     parser.add_argument("--target-slot", type=int, default=None)
     parser.add_argument("--length", type=int, default=50)
     parser.add_argument("--stride", type=int, default=5)
     parser.add_argument("--fps", type=int, default=10)
+    parser.add_argument("--video-format", choices=("mp4", "avi"), default="mp4")
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--layer", default="final")
     parser.add_argument("--head", default="mean")
@@ -200,7 +218,19 @@ def select_validation_windows(dataset, num_videos: int, horizon: int) -> list[tu
     return sorted(selected)
 
 
-def collect_attention_rollout(args, sample_rank, model, batch, dataset, normalization_stats, weights, target_slot, device):
+def collect_attention_rollout(
+    args,
+    sample_rank,
+    model,
+    batch,
+    dataset,
+    normalization_stats,
+    weights,
+    target_slot,
+    device,
+    runtime_context,
+    target_parameterization,
+):
     history = batch["history_x"].clone()
     history_mask = batch["history_mask"].clone()
     frame_start = int(batch["frame_start"][0].detach().cpu())
@@ -230,19 +260,46 @@ def collect_attention_rollout(args, sample_rank, model, batch, dataset, normaliz
         pred_step_phys_raw = denormalize_targets(pred_step_norm_raw[:, None, :, :], normalization_stats, device)[:, 0, :, :]
 
         last_frame = history_phys[:, -1, :, :]
-        velocity_to_px_frame = velocity_mm_s_to_px_frame_scale(dataset, device)
-        new_frame_phys = last_frame.clone()
-        new_frame_phys[:, :, feature_index["x"]] = last_frame[:, :, feature_index["x"]] + pred_step_phys_raw[:, :, 0] * velocity_to_px_frame
-        new_frame_phys[:, :, feature_index["y"]] = last_frame[:, :, feature_index["y"]] + pred_step_phys_raw[:, :, 1] * velocity_to_px_frame
-        new_frame_phys[:, :, feature_index["vx"]] = pred_step_phys_raw[:, :, 0]
-        new_frame_phys[:, :, feature_index["vy"]] = pred_step_phys_raw[:, :, 1]
-
         previous_last_mask = history_mask[:, -1, :]
         true_step_features = true_future_features[:, step_index, :, :]
         true_step_features_finite = torch.isfinite(true_step_features).all(dim=-1)
-        boundary_mask = new_mask & ~previous_last_mask & true_step_features_finite
+        continuing_mask = new_mask & previous_last_mask
+        entering_mask = new_mask & ~previous_last_mask
+        boundary_mask = entering_mask & true_step_features_finite
+        pred_step_runtime_phys, _pred_step_velocity, _pred_base_fallback_mask = runtime_prediction_from_model_target(
+            pred_step_phys_raw,
+            last_frame,
+            feature_index,
+            target_parameterization,
+            dataset,
+        )
+        new_frame_phys = torch.zeros_like(last_frame)
+        refreshed_phys, runtime_success = runtime_step_batch(
+            last_frame,
+            pred_step_runtime_phys,
+            continuing_mask,
+            runtime_context,
+            prediction_mode=runtime_prediction_mode(target_parameterization),
+        )
+        runtime_mask = continuing_mask & runtime_success[:, None]
+        new_frame_phys = torch.where(runtime_mask[:, :, None], refreshed_phys, new_frame_phys)
+        runtime_fallback_rows = continuing_mask.any(dim=1) & ~runtime_success
+        if runtime_fallback_rows.any():
+            stale_frame_phys = build_stale_refresh_frame(
+                last_frame,
+                pred_step_runtime_phys,
+                true_step_features,
+                new_mask,
+                boundary_mask,
+                feature_index,
+                dataset,
+                device,
+                target_parameterization=target_parameterization,
+                refresh_observed_non_target=False,
+            )
+            fallback_mask = new_mask & runtime_fallback_rows[:, None]
+            new_frame_phys = torch.where(fallback_mask[:, :, None], stale_frame_phys, new_frame_phys)
         new_frame_phys[boundary_mask] = true_step_features[boundary_mask]
-        refresh_observed_non_target_features(new_frame_phys, true_step_features, new_mask, feature_index)
 
         pred_position = new_frame_phys[0, :, [feature_index["x"], feature_index["y"]]].detach().cpu().numpy()
         true_position = true_step_features[0, :, [feature_index["x"], feature_index["y"]]].detach().cpu().numpy()
@@ -388,7 +445,8 @@ def write_attention_video(video_path: Path, output_path: Path, args, render_payl
         raise RuntimeError(f"Unable to open video: {video_path}")
     width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), args.fps, (width, height))
+    codec = "MJPG" if output_path.suffix.lower() == ".avi" else "mp4v"
+    writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*codec), args.fps, (width, height))
     if not writer.isOpened():
         capture.release()
         raise RuntimeError(f"Unable to create video: {output_path}")
@@ -456,10 +514,13 @@ def assert_no_nan_payload(render_payload) -> None:
 
 
 def write_csv(path: Path, rows) -> None:
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=CSV_COLUMNS)
-        writer.writeheader()
-        writer.writerows(rows)
+    try:
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=CSV_COLUMNS)
+            writer.writeheader()
+            writer.writerows(rows)
+    except PermissionError:
+        print(f"warning: could not overwrite locked csv: {path}")
 
 
 def draw_text_box(frame, lines, origin) -> None:
