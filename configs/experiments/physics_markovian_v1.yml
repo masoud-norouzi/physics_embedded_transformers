@@ -46,7 +46,7 @@ training:
   learning_rate: 1.0e-4
   weight_decay: 1.0e-4
   grad_clip: 1.0
-  epochs: 100
+  epochs: 200
   random_seed: 123
   num_workers: 0
   loss_alpha: 2.0

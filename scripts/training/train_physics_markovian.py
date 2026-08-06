@@ -328,6 +328,30 @@ def main(argv: list[str] | None = None) -> None:
         lr=float(config["training"]["learning_rate"]),
         weight_decay=float(config["training"]["weight_decay"]),
     )
+    resume_checkpoint = None
+    start_epoch = 1
+    if args.resume is not None:
+        if args.smoke_test:
+            raise ValueError("--resume is not supported with --smoke-test")
+        resume_checkpoint = load_resume_checkpoint(
+            args.resume,
+            model=model,
+            optimizer=optimizer,
+            model_config=model_config,
+            config=config,
+            device=device,
+        )
+        start_epoch = int(args.start_epoch) if args.start_epoch is not None else int(resume_checkpoint.get("epoch", 0)) + 1
+        if start_epoch < 1:
+            raise ValueError(f"--start-epoch must be >= 1, got {start_epoch}")
+        if start_epoch > int(config["training"]["epochs"]):
+            raise ValueError(
+                f"Resume start_epoch={start_epoch} is after configured training.epochs={config['training']['epochs']}"
+            )
+        print(
+            f"Resumed checkpoint: {args.resume} "
+            f"checkpoint_epoch={int(resume_checkpoint.get('epoch', -1))} start_epoch={start_epoch}"
+        )
     weights = rollout_weights(
         int(config["model"]["rollout_horizon"]),
         float(config["training"]["loss_alpha"]),
@@ -398,6 +422,7 @@ def main(argv: list[str] | None = None) -> None:
         event_exclusion=event_exclusion,
         model_config=model_config,
         output_dir=output_dir,
+        start_epoch=start_epoch,
     )
 
 
@@ -405,6 +430,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the physics-enabled Markovian rollout Transformer.")
     parser.add_argument("--config", required=True)
     parser.add_argument("--smoke-test", action="store_true")
+    parser.add_argument("--resume", type=Path, default=None, help="Resume model and optimizer state from a training checkpoint.")
+    parser.add_argument(
+        "--start-epoch",
+        type=int,
+        default=None,
+        help="Epoch number to start from when resuming. Defaults to checkpoint epoch + 1.",
+    )
     return parser.parse_args(argv)
 
 
@@ -416,6 +448,51 @@ def load_config(path: str | Path) -> dict[str, Any]:
         raise ValueError(f"Training config is empty or malformed: {config_path}")
     config["config_path"] = str(config_path)
     return config
+
+
+def load_resume_checkpoint(
+    path: str | Path,
+    *,
+    model,
+    optimizer,
+    model_config: dict[str, Any],
+    config: dict[str, Any],
+    device,
+) -> dict[str, Any]:
+    checkpoint_path = Path(path)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Resume checkpoint does not exist: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    validate_resume_checkpoint(checkpoint, checkpoint_path, model_config, config)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    move_optimizer_state_to_device(optimizer, device)
+    return checkpoint
+
+
+def validate_resume_checkpoint(
+    checkpoint: dict[str, Any],
+    checkpoint_path: Path,
+    model_config: dict[str, Any],
+    config: dict[str, Any],
+) -> None:
+    for key in ("model_state_dict", "optimizer_state_dict", "model_config", "normalization_stats"):
+        if key not in checkpoint:
+            raise KeyError(f"Resume checkpoint {checkpoint_path} is missing required key: {key}")
+    checkpoint_model_config = dict(checkpoint["model_config"])
+    if checkpoint_model_config != dict(model_config):
+        raise ValueError(
+            f"Resume checkpoint model_config does not match current config.\n"
+            f"Checkpoint: {checkpoint_model_config}\nCurrent: {model_config}"
+        )
+    checkpoint_targets = tuple(str(name) for name in checkpoint.get("target_features", ()))
+    current_targets = tuple(str(name) for name in config["model"]["target_features"])
+    if checkpoint_targets and checkpoint_targets != current_targets:
+        raise ValueError(f"Resume checkpoint target_features={checkpoint_targets} but current config uses {current_targets}")
+    checkpoint_inputs = tuple(str(name) for name in checkpoint.get("input_feature_names", ()))
+    current_inputs = tuple(str(name) for name in config["model"]["input_feature_names"])
+    if checkpoint_inputs and checkpoint_inputs != current_inputs:
+        raise ValueError(f"Resume checkpoint input_feature_names={checkpoint_inputs} but current config uses {current_inputs}")
 
 
 def apply_smoke_test_overrides(config: dict[str, Any]) -> None:
@@ -855,6 +932,7 @@ def train_full(
     event_exclusion,
     model_config,
     output_dir: Path,
+    start_epoch: int = 1,
 ) -> None:
     curves_csv_path = output_dir / "training_curves.csv"
     initialize_curves_csv(curves_csv_path)
@@ -876,7 +954,7 @@ def train_full(
     stage_best_path: Path | None = None
     previous_rollout_horizon: int | None = None
 
-    for epoch in range(1, int(config["training"]["epochs"]) + 1):
+    for epoch in range(int(start_epoch), int(config["training"]["epochs"]) + 1):
         active_rollout_horizon = rollout_horizon_for_epoch(config, epoch, full_rollout_horizon)
         if previous_rollout_horizon is not None and active_rollout_horizon != previous_rollout_horizon:
             maybe_restore_stage_best(
