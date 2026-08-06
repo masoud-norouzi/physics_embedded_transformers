@@ -46,7 +46,7 @@ training:
   learning_rate: 1.0e-4
   weight_decay: 1.0e-4
   grad_clip: 1.0
-  epochs: 200
+  epochs: 160
   random_seed: 123
   num_workers: 0
   loss_alpha: 2.0
@@ -65,11 +65,11 @@ training:
       horizon: 30
     - start_epoch: 121
       horizon: 35
-    - start_epoch: 141
+    - start_epoch: 131
       horizon: 40
-    - start_epoch: 161
+    - start_epoch: 141
       horizon: 45
-    - start_epoch: 181
+    - start_epoch: 151
       horizon: 50
   log_every_n_batches: 25
   output_dir: outputs/models/physics_markovian_v1

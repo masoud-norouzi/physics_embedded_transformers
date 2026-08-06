@@ -54,6 +54,7 @@ def main() -> None:
         horizon=args.length,
         stride=int(checkpoint.get("stride", args.stride)),
         normalization_stats=checkpoint["normalization_stats"],
+        target_features=tuple(str(name) for name in checkpoint.get("target_features", ("vx", "vy"))),
         history_length=int(checkpoint["model_config"]["T_history"]),
         max_droplets=int(checkpoint["model_config"]["max_droplets"]),
         experiment_config=args.experiment_config,
@@ -135,7 +136,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_validation_dataset(npz_path, horizon, stride, normalization_stats, history_length, max_droplets, experiment_config):
+def build_validation_dataset(npz_path, horizon, stride, normalization_stats, target_features, history_length, max_droplets, experiment_config):
     data = np.load(npz_path, allow_pickle=False)
     T = len(data["frames"])
     total_window = history_length + horizon
@@ -149,6 +150,7 @@ def build_validation_dataset(npz_path, horizon, stride, normalization_stats, his
         T_history=history_length,
         T_future=horizon,
         max_droplets=max_droplets,
+        target_features=target_features,
         normalization_stats=normalization_stats,
         experiment_config=experiment_config,
     )
