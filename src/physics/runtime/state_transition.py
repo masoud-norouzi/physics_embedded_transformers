@@ -12,6 +12,7 @@ from src.config.velocity import load_velocity_conversion_from_experiment
 from src.physics.enrichment.coordinate_mapping import build_coordinate_transform
 from src.physics.enrichment.tracking_enricher import compute_inlet_superficial_velocity_mm_s
 from src.physics.geometry.coordinates import CoordinateConvention
+from src.physics.geometry.wall_sdf import WallSDF, build_wall_sdf, clamp_to_channel_numpy
 from src.physics.hydraulics import (
     compute_frame_baseline_hydraulics_from_occupancies,
     compute_isolated_droplet_equivalent_length_um,
@@ -63,6 +64,7 @@ class PhysicsRuntimeContext:
     coordinate_convention: CoordinateConvention
     superficial_velocity_mm_s: float
     minimum_physical_coverage: float = 0.95
+    wall_sdf: WallSDF | None = None
 
     @property
     def feature_index(self) -> dict[str, int]:
@@ -101,6 +103,7 @@ def load_physics_runtime_context(
         coordinate_convention=transform.convention,
         superficial_velocity_mm_s=compute_inlet_superficial_velocity_mm_s(experiment_path),
         minimum_physical_coverage=minimum_physical_coverage,
+        wall_sdf=build_wall_sdf(region_labels > 0),
     )
 
 
@@ -186,8 +189,17 @@ def update_positions(
         if np.any(prediction[active_mask, 2:] <= 0.0):
             raise ValueError("Predicted bbox_w and bbox_h must be positive for active droplets")
         if prediction_mode == "velocity":
-            state[active_mask, idx["x"]] += prediction[active_mask, 0] / scale
-            state[active_mask, idx["y"]] += prediction[active_mask, 1] / scale
+            candidate_x = state[active_mask, idx["x"]] + prediction[active_mask, 0] / scale
+            candidate_y = state[active_mask, idx["y"]] + prediction[active_mask, 1] / scale
+            if context.wall_sdf is not None:
+                candidate_xy = clamp_to_channel_numpy(
+                    np.stack([candidate_x, candidate_y], axis=-1),
+                    prediction[active_mask, 2:4],
+                    context.wall_sdf,
+                )
+                candidate_x, candidate_y = candidate_xy[..., 0], candidate_xy[..., 1]
+            state[active_mask, idx["x"]] = candidate_x
+            state[active_mask, idx["y"]] = candidate_y
             state[active_mask, idx["vx"]] = prediction[active_mask, 0]
             state[active_mask, idx["vy"]] = prediction[active_mask, 1]
         elif prediction_mode == "position":

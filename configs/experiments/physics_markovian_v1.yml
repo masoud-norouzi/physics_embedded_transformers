@@ -81,6 +81,8 @@ training:
     tolerance: 0.005
     num_samples_x: 48
     num_samples_y: 48
+  hard_wall_containment:
+    enabled: true
   event_exclusion:
     enabled: true
     split_events_csv: outputs/evaluation/split_event_scan/split_child_track_events.csv

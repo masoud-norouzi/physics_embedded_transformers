@@ -26,7 +26,8 @@ except ModuleNotFoundError as exc:  # pragma: no cover - exercised by environmen
 
 from src.datasets.canonical_window_dataset import create_train_val_test_datasets
 from src.models.canonical_rollout_transformer import CanonicalRolloutTransformer
-from src.physics.constraints import compute_ellipse_outside_fraction_torch
+from src.physics.constraints import clamp_to_channel_torch, compute_ellipse_outside_fraction_torch, wall_sdf_to_torch
+from src.physics.geometry import build_wall_sdf
 from src.physics.runtime import load_physics_runtime_context, step as physics_runtime_step
 from src.physics.targets import (
     SPEED_ANGLE_TARGET_FEATURES,
@@ -133,6 +134,14 @@ class GeometryConstraint:
     tolerance: float
     num_samples_x: int
     num_samples_y: int
+
+
+@dataclass(frozen=True)
+class HardWallContainment:
+    enabled: bool
+    sdf: torch.Tensor
+    grad_x: torch.Tensor
+    grad_y: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -363,6 +372,7 @@ def main(argv: list[str] | None = None) -> None:
         feature_names=tuple(config["model"]["input_feature_names"]),
     )
     geometry_constraint = create_geometry_constraint(config, runtime_context, device)
+    hard_wall_containment = create_hard_wall_containment(config, runtime_context, device)
 
     initial_runtime_context = runtime_context_for_epoch(config, 1, runtime_context)
     print(f"shape_test physics_refresh={physics_refresh_mode(initial_runtime_context)}")
@@ -375,6 +385,7 @@ def main(argv: list[str] | None = None) -> None:
         device,
         initial_runtime_context,
         geometry_constraint,
+        hard_wall_containment,
         target_parameterization,
         target_deadband,
         event_exclusion,
@@ -394,6 +405,7 @@ def main(argv: list[str] | None = None) -> None:
             config=config,
             runtime_context=runtime_context,
             geometry_constraint=geometry_constraint,
+            hard_wall_containment=hard_wall_containment,
             target_parameterization=target_parameterization,
             target_deadband=target_deadband,
             event_exclusion=event_exclusion,
@@ -417,6 +429,7 @@ def main(argv: list[str] | None = None) -> None:
         config=config,
         runtime_context=runtime_context,
         geometry_constraint=geometry_constraint,
+        hard_wall_containment=hard_wall_containment,
         target_parameterization=target_parameterization,
         target_deadband=target_deadband,
         event_exclusion=event_exclusion,
@@ -535,6 +548,25 @@ def create_geometry_constraint(config: dict[str, Any], runtime_context, device) 
         f"enabled weight={constraint.weight:.6g} tolerance={constraint.tolerance:.6g} "
         f"samples={constraint.num_samples_x}x{constraint.num_samples_y}"
     )
+    return constraint
+
+
+def create_hard_wall_containment(config: dict[str, Any], runtime_context, device) -> HardWallContainment | None:
+    hard_wall = config.get("training", {}).get("hard_wall_containment", {})
+    if not bool(hard_wall.get("enabled", False)):
+        return None
+    if runtime_context is not None and hasattr(runtime_context, "region_labels"):
+        channel_mask_np = np.asarray(runtime_context.region_labels) > 0
+    else:
+        mask_path = hard_wall.get("channel_mask_path")
+        if mask_path is None:
+            raise ValueError("hard_wall_containment enabled, but no runtime region_labels or channel_mask_path is available")
+        channel_mask_np = np.load(mask_path).astype(bool)
+    if channel_mask_np.ndim != 2 or not bool(channel_mask_np.any()):
+        raise ValueError("hard_wall_containment channel mask must be a non-empty 2D mask")
+    sdf, grad_x, grad_y = wall_sdf_to_torch(build_wall_sdf(channel_mask_np), device=device)
+    constraint = HardWallContainment(enabled=True, sdf=sdf, grad_x=grad_x, grad_y=grad_y)
+    print("Hard wall containment: enabled (Euclidean SDF + ellipse clamp on the velocity-mode position update)")
     return constraint
 
 
@@ -786,6 +818,7 @@ def run_shape_test(
     device,
     runtime_context=None,
     geometry_constraint: GeometryConstraint | None = None,
+    hard_wall_containment: HardWallContainment | None = None,
     target_parameterization: dict[str, Any] | None = None,
     target_deadband: dict[str, Any] | None = None,
     event_exclusion: EventExclusion | None = None,
@@ -801,6 +834,7 @@ def run_shape_test(
             weights=weights,
             runtime_context=runtime_context,
             geometry_constraint=geometry_constraint,
+            hard_wall_containment=hard_wall_containment,
             target_parameterization=target_parameterization,
             target_deadband=target_deadband,
             event_exclusion=event_exclusion,
@@ -830,6 +864,7 @@ def run_smoke_test(
     config,
     runtime_context,
     geometry_constraint,
+    hard_wall_containment,
     target_parameterization,
     target_deadband,
     event_exclusion,
@@ -851,6 +886,7 @@ def run_smoke_test(
         runtime_context=runtime_context,
         adaptive_fusion=adaptive_fusion,
         geometry_constraint=geometry_constraint,
+        hard_wall_containment=hard_wall_containment,
         target_parameterization=target_parameterization,
         target_deadband=target_deadband,
         event_exclusion=event_exclusion,
@@ -867,6 +903,7 @@ def run_smoke_test(
         runtime_context=runtime_context,
         adaptive_fusion=adaptive_fusion,
         geometry_constraint=geometry_constraint,
+        hard_wall_containment=hard_wall_containment,
         target_parameterization=target_parameterization,
         target_deadband=target_deadband,
         event_exclusion=event_exclusion,
@@ -897,6 +934,7 @@ def run_smoke_test(
             runtime_context=runtime_context,
             adaptive_fusion=adaptive_fusion,
             geometry_constraint=geometry_constraint,
+            hard_wall_containment=hard_wall_containment,
             target_parameterization=target_parameterization,
             target_deadband=target_deadband,
             event_exclusion=event_exclusion,
@@ -927,6 +965,7 @@ def train_full(
     config,
     runtime_context,
     geometry_constraint,
+    hard_wall_containment,
     target_parameterization,
     target_deadband,
     event_exclusion,
@@ -1003,6 +1042,7 @@ def train_full(
             runtime_context=active_runtime_context,
             adaptive_fusion=active_fusion,
             geometry_constraint=geometry_constraint,
+            hard_wall_containment=hard_wall_containment,
             target_parameterization=target_parameterization,
             target_deadband=target_deadband,
             event_exclusion=event_exclusion,
@@ -1019,6 +1059,7 @@ def train_full(
             runtime_context=active_runtime_context,
             adaptive_fusion=active_fusion,
             geometry_constraint=geometry_constraint,
+            hard_wall_containment=hard_wall_containment,
             target_parameterization=target_parameterization,
             target_deadband=target_deadband,
             event_exclusion=event_exclusion,
@@ -1043,6 +1084,7 @@ def train_full(
                 runtime_context=active_runtime_context,
                 adaptive_fusion=pure_validation_fusion,
                 geometry_constraint=geometry_constraint,
+                hard_wall_containment=hard_wall_containment,
                 target_parameterization=target_parameterization,
                 target_deadband=target_deadband,
                 event_exclusion=event_exclusion,
@@ -1102,6 +1144,7 @@ def train_one_epoch(
     runtime_context=None,
     adaptive_fusion: AdaptiveTargetFusion | None = None,
     geometry_constraint: GeometryConstraint | None = None,
+    hard_wall_containment: HardWallContainment | None = None,
     target_parameterization: dict[str, Any] | None = None,
     target_deadband: dict[str, Any] | None = None,
     event_exclusion: EventExclusion | None = None,
@@ -1138,6 +1181,7 @@ def train_one_epoch(
             runtime_context=runtime_context,
             adaptive_fusion=adaptive_fusion,
             geometry_constraint=geometry_constraint,
+            hard_wall_containment=hard_wall_containment,
             target_parameterization=target_parameterization,
             target_deadband=target_deadband,
             event_exclusion=event_exclusion,
@@ -1213,6 +1257,7 @@ def evaluate(
     runtime_context=None,
     adaptive_fusion: AdaptiveTargetFusion | None = None,
     geometry_constraint: GeometryConstraint | None = None,
+    hard_wall_containment: HardWallContainment | None = None,
     target_parameterization: dict[str, Any] | None = None,
     target_deadband: dict[str, Any] | None = None,
     event_exclusion: EventExclusion | None = None,
@@ -1251,6 +1296,7 @@ def evaluate(
                 runtime_context=runtime_context,
                 adaptive_fusion=adaptive_fusion,
                 geometry_constraint=geometry_constraint,
+                hard_wall_containment=hard_wall_containment,
                 target_parameterization=target_parameterization,
                 target_deadband=target_deadband,
                 event_exclusion=event_exclusion,
@@ -1385,6 +1431,7 @@ def boundary_conditioned_rollout(
     runtime_context=None,
     adaptive_fusion: AdaptiveTargetFusion | None = None,
     geometry_constraint: GeometryConstraint | None = None,
+    hard_wall_containment: HardWallContainment | None = None,
     target_parameterization: dict[str, Any] | None = None,
     target_deadband: dict[str, Any] | None = None,
     event_exclusion: EventExclusion | None = None,
@@ -1401,6 +1448,7 @@ def boundary_conditioned_rollout(
     true_velocity_phys = []
     base_direction_fallback_masks = []
     pred_positions = []
+    pred_positions_raw = []
     true_positions = []
     pred_states = []
     step_masks = []
@@ -1478,8 +1526,9 @@ def boundary_conditioned_rollout(
             None if target_parameterization.get("mode") == "speed_angle_correction" else alpha_for_step,
         )
 
+        position_index = [feature_index["x"], feature_index["y"]]
         if runtime_context is None:
-            new_frame_phys = build_stale_refresh_frame(
+            new_frame_phys, raw_position_phys = build_stale_refresh_frame(
                 last_frame,
                 target_for_rollout_phys,
                 true_step_features,
@@ -1489,9 +1538,11 @@ def boundary_conditioned_rollout(
                 dataset,
                 device,
                 target_parameterization=target_parameterization,
+                hard_wall_containment=hard_wall_containment,
             )
         else:
             new_frame_phys = torch.zeros_like(last_frame)
+            raw_position_phys = last_frame[:, :, position_index].clone()
             refreshed_phys, runtime_success = runtime_step_batch(
                 last_frame,
                 target_for_rollout_phys,
@@ -1506,8 +1557,14 @@ def boundary_conditioned_rollout(
 
             runtime_mask = continuing_mask & runtime_success[:, None]
             new_frame_phys = torch.where(runtime_mask[:, :, None], refreshed_phys, new_frame_phys)
+            # The numpy runtime-refresh path (physics_runtime_step / state_transition.py) is
+            # already detached from autograd, so there is no meaningful "raw" prediction to
+            # recover here; its own hard clamp (see state_transition.py) is the relevant one.
+            raw_position_phys = torch.where(
+                runtime_mask[:, :, None], refreshed_phys[:, :, position_index], raw_position_phys
+            )
             if runtime_fallback_rows.any():
-                stale_frame_phys = build_stale_refresh_frame(
+                stale_frame_phys, stale_raw_position = build_stale_refresh_frame(
                     last_frame,
                     target_for_rollout_phys,
                     true_step_features,
@@ -1518,10 +1575,13 @@ def boundary_conditioned_rollout(
                     device,
                     target_parameterization=target_parameterization,
                     refresh_observed_non_target=False,
+                    hard_wall_containment=hard_wall_containment,
                 )
                 fallback_mask = new_mask & runtime_fallback_rows[:, None]
                 new_frame_phys = torch.where(fallback_mask[:, :, None], stale_frame_phys, new_frame_phys)
+                raw_position_phys = torch.where(fallback_mask[:, :, None], stale_raw_position, raw_position_phys)
             new_frame_phys[boundary_mask] = true_step_features[boundary_mask]
+            raw_position_phys[boundary_mask] = true_step_features[boundary_mask][:, position_index]
 
         pred_step_norm = pred_step_norm_raw.clone()
         pred_step_phys = pred_step_phys_raw.clone()
@@ -1564,6 +1624,7 @@ def boundary_conditioned_rollout(
         base_direction_fallback_masks.append(pred_base_fallback_mask | base_fallback_mask)
         pred_states.append(new_frame_phys)
         pred_positions.append(new_frame_phys[:, :, [feature_index["x"], feature_index["y"]]])
+        pred_positions_raw.append(raw_position_phys)
         true_positions.append(true_future_xy[:, step_index, :, :])
         step_masks.append(new_mask)
         supervision_masks.append(supervision_mask)
@@ -1584,9 +1645,14 @@ def boundary_conditioned_rollout(
     base_fallback_tensor = torch.stack(base_direction_fallback_masks, dim=1)
     pred_state_tensor = torch.stack(pred_states, dim=1)
     pred_position_tensor = torch.stack(pred_positions, dim=1)
+    pred_position_raw_tensor = torch.stack(pred_positions_raw, dim=1)
+    # geometry_constraint is evaluated against the raw, pre-clamp position so it keeps
+    # shaping gradients toward not predicting wall-crossing velocities in the first place;
+    # pred_position_tensor (post hard-wall-containment clamp) is what actually propagates
+    # into rollout_history / next-step conditioning and what diagnostics report.
     geometry_loss, geometry_payload = compute_rollout_geometry_loss(
         pred_state=pred_state_tensor,
-        pred_position=pred_position_tensor,
+        pred_position=pred_position_raw_tensor,
         supervision_mask=supervision_mask_tensor,
         feature_index=feature_index,
         geometry_constraint=geometry_constraint,
@@ -1947,8 +2013,10 @@ def build_stale_refresh_frame(
     device,
     target_parameterization: dict[str, Any] | None = None,
     refresh_observed_non_target: bool = True,
+    hard_wall_containment: "HardWallContainment | None" = None,
 ):
     mode = (target_parameterization or {"mode": "velocity"}).get("mode")
+    position_index = [feature_index["x"], feature_index["y"]]
 
     new_frame_phys = last_frame.clone()
     if mode == "position":
@@ -1957,21 +2025,39 @@ def build_stale_refresh_frame(
         new_frame_phys[:, :, feature_index["y"]] = pred_step_phys_raw[:, :, 1]
         new_frame_phys[:, :, feature_index["vx"]] = velocity[:, :, 0]
         new_frame_phys[:, :, feature_index["vy"]] = velocity[:, :, 1]
+        raw_position = new_frame_phys[:, :, position_index].clone()
     else:
         velocity_to_px_frame = velocity_mm_s_to_px_frame_scale(dataset, device)
         x_next = last_frame[:, :, feature_index["x"]] + pred_step_phys_raw[:, :, 0] * velocity_to_px_frame
         y_next = last_frame[:, :, feature_index["y"]] + pred_step_phys_raw[:, :, 1] * velocity_to_px_frame
-        new_frame_phys[:, :, feature_index["x"]] = x_next
-        new_frame_phys[:, :, feature_index["y"]] = y_next
+        raw_position = torch.stack([x_next, y_next], dim=-1)
+        contained_position = raw_position
+        if (
+            hard_wall_containment is not None
+            and hard_wall_containment.enabled
+            and pred_step_phys_raw.shape[-1] >= 4
+            and "bbox_w" in feature_index
+            and "bbox_h" in feature_index
+        ):
+            contained_position = clamp_to_channel_torch(
+                raw_position,
+                pred_step_phys_raw[:, :, 2:4],
+                hard_wall_containment.sdf,
+                hard_wall_containment.grad_x,
+                hard_wall_containment.grad_y,
+            )
+        new_frame_phys[:, :, feature_index["x"]] = contained_position[..., 0]
+        new_frame_phys[:, :, feature_index["y"]] = contained_position[..., 1]
         new_frame_phys[:, :, feature_index["vx"]] = pred_step_phys_raw[:, :, 0]
         new_frame_phys[:, :, feature_index["vy"]] = pred_step_phys_raw[:, :, 1]
     if pred_step_phys_raw.shape[-1] >= 4 and "bbox_w" in feature_index and "bbox_h" in feature_index:
         new_frame_phys[:, :, feature_index["bbox_w"]] = pred_step_phys_raw[:, :, 2]
         new_frame_phys[:, :, feature_index["bbox_h"]] = pred_step_phys_raw[:, :, 3]
     new_frame_phys[boundary_mask] = true_step_features[boundary_mask]
+    raw_position[boundary_mask] = true_step_features[boundary_mask][:, position_index]
     if refresh_observed_non_target:
         refresh_observed_non_target_features(new_frame_phys, true_step_features, new_mask, feature_index)
-    return new_frame_phys
+    return new_frame_phys, raw_position
 
 
 def refresh_observed_non_target_features(new_frame_phys, true_step_features, new_mask, feature_index) -> None:
