@@ -63,15 +63,21 @@ def clamp_to_channel_torch(
     grad_x_value = _sample_bilinear_torch(grad_x, in_bounds)
     grad_y_value = _sample_bilinear_torch(grad_y, in_bounds)
 
-    grad_norm = torch.sqrt(grad_x_value**2 + grad_y_value**2)
-    safe_norm = grad_norm.clamp_min(_GRADIENT_EPS)
-    has_gradient = grad_norm > _GRADIENT_EPS
-    direction_x = torch.where(has_gradient, grad_x_value / safe_norm, torch.zeros_like(grad_x_value))
-    direction_y = torch.where(has_gradient, grad_y_value / safe_norm, torch.zeros_like(grad_y_value))
+    # sqrt's own gradient (0.5/sqrt(x)) is +inf at x == 0, and that poisons the result with
+    # NaN even through a torch.where/clamp_min that only masks the *forward* value -- the
+    # unused branch's backward is still computed, and 0 * inf/nan is nan in IEEE arithmetic.
+    # Clamping the squared magnitude *before* the sqrt (not the sqrt's output after) keeps
+    # sqrt's argument bounded away from zero, so its gradient stays finite everywhere,
+    # including at true medial-axis points where the sdf gradient is genuinely (0, 0).
+    grad_norm_sq = (grad_x_value**2 + grad_y_value**2).clamp_min(_GRADIENT_EPS**2)
+    safe_norm = torch.sqrt(grad_norm_sq)
+    direction_x = grad_x_value / safe_norm
+    direction_y = grad_y_value / safe_norm
 
     half_width = bbox_wh[..., 0] / 2.0
     half_height = bbox_wh[..., 1] / 2.0
-    r_eff = torch.sqrt((half_width * direction_x) ** 2 + (half_height * direction_y) ** 2)
+    r_eff_sq = ((half_width * direction_x) ** 2 + (half_height * direction_y) ** 2).clamp_min(_GRADIENT_EPS**2)
+    r_eff = torch.sqrt(r_eff_sq)
     deficit = (r_eff - sdf_value).clamp_min(0.0)
 
     new_x = in_bounds_x + deficit * direction_x
