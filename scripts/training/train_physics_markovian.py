@@ -1581,7 +1581,9 @@ def boundary_conditioned_rollout(
                 new_frame_phys = torch.where(fallback_mask[:, :, None], stale_frame_phys, new_frame_phys)
                 raw_position_phys = torch.where(fallback_mask[:, :, None], stale_raw_position, raw_position_phys)
             new_frame_phys[boundary_mask] = true_step_features[boundary_mask]
-            raw_position_phys[boundary_mask] = true_step_features[boundary_mask][:, position_index]
+            raw_position_phys = torch.where(
+                boundary_mask[:, :, None], true_step_features[:, :, position_index], raw_position_phys
+            )
 
         pred_step_norm = pred_step_norm_raw.clone()
         pred_step_phys = pred_step_phys_raw.clone()
@@ -2054,7 +2056,7 @@ def build_stale_refresh_frame(
         new_frame_phys[:, :, feature_index["bbox_w"]] = pred_step_phys_raw[:, :, 2]
         new_frame_phys[:, :, feature_index["bbox_h"]] = pred_step_phys_raw[:, :, 3]
     new_frame_phys[boundary_mask] = true_step_features[boundary_mask]
-    raw_position[boundary_mask] = true_step_features[boundary_mask][:, position_index]
+    raw_position = torch.where(boundary_mask[:, :, None], true_step_features[:, :, position_index], raw_position)
     if refresh_observed_non_target:
         refresh_observed_non_target_features(new_frame_phys, true_step_features, new_mask, feature_index)
     return new_frame_phys, raw_position

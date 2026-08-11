@@ -389,6 +389,42 @@ def test_geometry_constraint_excludes_boundary_injected_droplets(tmp_path: Path)
     assert rollout["geometry_mask"][0, 0, 1].item() is False
 
 
+def test_hard_wall_containment_backward_survives_boundary_injected_droplets(tmp_path: Path) -> None:
+    # Regression test: raw_position was previously mutated in place (via boundary_mask
+    # indexing) after being passed into clamp_to_channel_torch, which only trips PyTorch's
+    # autograd version check when boundary_mask actually has a True entry and a real
+    # parameterized model is used -- a tiny constant-prediction / no-boundary-injection
+    # smoke test does not exercise this path, which is how it slipped through originally.
+    dataset, batch = _v2_four_target_batch(tmp_path)
+    batch["history_mask"][0, :, 1] = False
+    model = _small_model(input_dim=16, horizon=1, max_droplets=4, target_dim=4)
+    stats = _identity_stats(16, target_dim=4)
+    weights = trainer.rollout_weights(3, 2.0, torch.device("cpu"))
+    mask = np.ones((64, 64), dtype=bool)
+    mask[63, :] = False
+    mask[:, 63] = False
+    from src.physics.constraints import wall_sdf_to_torch
+    from src.physics.geometry.wall_sdf import build_wall_sdf
+
+    sdf, grad_x, grad_y = wall_sdf_to_torch(build_wall_sdf(mask))
+    hard_wall_containment = trainer.HardWallContainment(enabled=True, sdf=sdf, grad_x=grad_x, grad_y=grad_y)
+
+    rollout = trainer.boundary_conditioned_rollout(
+        model,
+        batch,
+        dataset,
+        stats,
+        weights,
+        runtime_context=None,
+        hard_wall_containment=hard_wall_containment,
+    )
+    rollout["total_loss"].backward()
+
+    assert all(
+        param.grad is None or torch.isfinite(param.grad).all() for param in model.parameters()
+    )
+
+
 def test_adaptive_fusion_alpha_decreases_with_lower_prediction_variance() -> None:
     fusion = trainer.AdaptiveTargetFusion(
         horizon=2,
