@@ -290,23 +290,11 @@ def test_runtime_failure_falls_back_to_stale_physics_for_that_step(tmp_path: Pat
     )
 
 
-def test_adaptive_fusion_uses_truth_for_rollout_but_loss_uses_raw_prediction(tmp_path: Path) -> None:
+def test_scheduled_sampling_p_truth_1_uses_truth_for_rollout_but_loss_uses_raw_prediction(tmp_path: Path) -> None:
     dataset, batch = _v2_four_target_batch(tmp_path)
     model = _ConstantPredictionModel([10.0, 20.0, 31.0, 17.0])
     stats = _identity_stats(16, target_dim=4)
     weights = trainer.rollout_weights(1, 2.0, torch.device("cpu"))
-    fusion = trainer.AdaptiveTargetFusion(
-        horizon=1,
-        target_dim=4,
-        enabled=True,
-        ema_beta=0.0,
-        initial_prediction_variance=100.0,
-        measurement_variance=1.0e-9,
-        min_alpha=0.0,
-        max_alpha=1.0,
-        mode="global_ema",
-        device=torch.device("cpu"),
-    )
 
     rollout = trainer.boundary_conditioned_rollout(
         model,
@@ -315,13 +303,15 @@ def test_adaptive_fusion_uses_truth_for_rollout_but_loss_uses_raw_prediction(tmp
         stats,
         weights,
         runtime_context=None,
-        adaptive_fusion=fusion,
+        p_truth=1.0,
     )
 
     idx = dataset.feature_indices
+    # The primary loss still compares the model's raw prediction to ground truth...
     assert rollout["pred_target"][0, 0, 0, 0].item() == pytest.approx(10.0)
     assert rollout["true_target"][0, 0, 0, 0].item() == pytest.approx(1.0)
     assert rollout["weighted_loss_internal_only"].item() > 0.0
+    # ...but with p_truth=1.0, every continuing droplet's propagated state is ground truth, not the raw prediction.
     assert rollout["pred_state"][0, 0, 0, idx["vx"]].item() == pytest.approx(1.0)
     assert rollout["pred_state"][0, 0, 0, idx["bbox_w"]].item() == pytest.approx(20.0)
 
@@ -425,93 +415,70 @@ def test_hard_wall_containment_backward_survives_boundary_injected_droplets(tmp_
     )
 
 
-def test_adaptive_fusion_alpha_decreases_with_lower_prediction_variance() -> None:
-    fusion = trainer.AdaptiveTargetFusion(
-        horizon=2,
-        target_dim=4,
+def test_p_truth_for_epoch_follows_piecewise_schedule() -> None:
+    sampling = trainer.ScheduledSampling(
         enabled=True,
-        ema_beta=0.0,
-        initial_prediction_variance=4.0,
-        measurement_variance=4.0,
-        min_alpha=0.0,
-        max_alpha=0.8,
-        mode="global_ema",
-        device=torch.device("cpu"),
+        schedule=((1, 1.0), (20, 0.5), (60, 0.2), (120, 0.05)),
     )
-    assert fusion.alpha_tensor()[0, 0].item() == pytest.approx(0.5)
-
-    mse = torch.zeros(2, 4)
-    counts = torch.ones(2, 4)
-    fusion.update(mse, counts)
-
-    assert fusion.alpha_tensor()[0, 0].item() == pytest.approx(0.0)
-
-
-def test_adaptive_measurement_variance_uses_detection_noise_and_target_scale() -> None:
-    dataset = SimpleNamespace(velocity_mm_s_per_px_frame=10.0)
-    stats = {
-        "target_std": np.asarray([5.0, 10.0, 2.0, 4.0], dtype=np.float32),
-    }
-    variance = trainer.adaptive_measurement_variance(
-        {"detection_position_variance_px2": 0.2},
-        dataset,
-        stats,
-        torch.device("cpu"),
-    )
-
-    expected = torch.tensor(
-        [
-            (np.sqrt(0.4) * 10.0 / 5.0) ** 2,
-            (np.sqrt(0.4) * 10.0 / 10.0) ** 2,
-            (np.sqrt(0.4) / 2.0) ** 2,
-            (np.sqrt(0.4) / 4.0) ** 2,
-        ],
-        dtype=torch.float32,
-    )
-    assert torch.allclose(variance, expected)
+    assert trainer.p_truth_for_epoch(sampling, 1) == pytest.approx(1.0)
+    assert trainer.p_truth_for_epoch(sampling, 19) == pytest.approx(1.0)
+    assert trainer.p_truth_for_epoch(sampling, 20) == pytest.approx(0.5)
+    assert trainer.p_truth_for_epoch(sampling, 59) == pytest.approx(0.5)
+    assert trainer.p_truth_for_epoch(sampling, 120) == pytest.approx(0.05)
+    assert trainer.p_truth_for_epoch(sampling, 10_000) == pytest.approx(0.05)
 
 
-def test_causal_adaptive_fusion_uses_previous_step_error_for_next_alpha(tmp_path: Path) -> None:
-    dataset, batch = _v2_four_target_batch(tmp_path)
-    model = _ConstantPredictionModel([10.0, 10.0, 30.0, 30.0])
-    stats = _identity_stats(16, target_dim=4)
-    weights = trainer.rollout_weights(3, 2.0, torch.device("cpu"))
-    fusion = trainer.AdaptiveTargetFusion(
-        horizon=3,
-        target_dim=4,
-        enabled=True,
-        ema_beta=0.0,
-        initial_prediction_variance=0.0,
-        measurement_variance=1.0,
-        min_alpha=0.0,
-        max_alpha=1.0,
-        mode="causal_rollout",
-        device=torch.device("cpu"),
-    )
-
-    rollout = trainer.boundary_conditioned_rollout(
-        model,
-        batch,
-        dataset,
-        stats,
-        weights,
-        runtime_context=None,
-        adaptive_fusion=fusion,
-    )
-
-    alpha_used = rollout["adaptive_alpha_used"]
-    assert alpha_used[0, 0].item() == pytest.approx(0.0)
-    assert alpha_used[1, 0].item() > alpha_used[0, 0].item()
-    assert alpha_used[2, 0].item() > 0.0
+def test_p_truth_for_epoch_returns_none_when_disabled_or_absent() -> None:
+    disabled = trainer.ScheduledSampling(enabled=False, schedule=((1, 1.0),))
+    assert trainer.p_truth_for_epoch(disabled, 50) is None
+    assert trainer.p_truth_for_epoch(None, 50) is None
 
 
-def test_zero_adaptive_fusion_forces_pure_prediction_rollout() -> None:
-    fusion = trainer.ZeroAdaptiveTargetFusion(horizon=3, target_dim=4, device=torch.device("cpu"))
-    assert fusion.enabled is True
-    assert torch.equal(fusion.alpha_tensor(), torch.zeros(3, 4))
+def test_create_scheduled_sampling_validates_p_truth_range() -> None:
+    with pytest.raises(ValueError, match=r"\[0, 1\]"):
+        trainer.create_scheduled_sampling(
+            {"training": {"scheduled_sampling": {"enabled": True, "schedule": [{"start_epoch": 1, "p_truth": 1.5}]}}}
+        )
 
 
-def test_training_curves_include_step_rmse_and_adaptive_alpha(tmp_path: Path) -> None:
+def test_sample_rollout_targets_is_hard_select_not_a_blend() -> None:
+    pred = torch.zeros(4, 5, 4)
+    true = torch.ones(4, 5, 4)
+    continuing_mask = torch.ones(4, 5, dtype=torch.bool)
+
+    torch.manual_seed(0)
+    result = trainer.sample_rollout_targets(pred, true, continuing_mask, 0.5)
+
+    # Every selected entry is exactly one tensor or the other -- never an in-between blend.
+    is_pred = torch.isclose(result, pred)
+    is_true = torch.isclose(result, true)
+    assert torch.all(is_pred | is_true)
+    # With p_truth=0.5 over 20 independent draws, expect a genuine mix, not all-one-value.
+    assert bool(is_true.any()) and bool(is_pred.any())
+
+
+def test_sample_rollout_targets_p_truth_none_is_pure_self_conditioning() -> None:
+    pred = torch.zeros(2, 3, 4)
+    true = torch.ones(2, 3, 4)
+    continuing_mask = torch.ones(2, 3, dtype=torch.bool)
+    result = trainer.sample_rollout_targets(pred, true, continuing_mask, None)
+    assert torch.equal(result, pred)
+
+
+def test_sample_rollout_targets_respects_continuing_mask_and_nan_truth() -> None:
+    pred = torch.full((1, 3, 4), 2.0)
+    true = torch.ones(1, 3, 4)
+    true[0, 1, 0] = float("nan")  # not finite -> must not be selected even at p_truth=1.0
+    continuing_mask = torch.tensor([[True, True, False]])  # slot 2 is not continuing
+
+    result = trainer.sample_rollout_targets(pred, true, continuing_mask, 1.0)
+
+    assert torch.equal(result[0, 0], true[0, 0])  # continuing + finite -> truth
+    assert torch.equal(result[0, 1], pred[0, 1])  # continuing but non-finite truth -> prediction
+    assert torch.equal(result[0, 2], pred[0, 2])  # not continuing -> prediction
+
+
+def test_training_curves_include_step_rmse_and_scheduled_sampling_p_truth(tmp_path: Path) -> None:
     path = tmp_path / "training_curves.csv"
     train_summary = {
         "active_rollout_horizon": 50.0,
@@ -520,11 +487,7 @@ def test_training_curves_include_step_rmse_and_adaptive_alpha(tmp_path: Path) ->
         "runtime_step_attempts": 2.0,
         "runtime_step_fallbacks": 0.0,
         "runtime_step_fallback_fraction": 0.0,
-        "adaptive_fusion": {
-            "alpha_by_step_feature": [[0.1, 0.2, 0.3, 0.4] for _ in range(50)],
-            "alpha_by_step_mean": [0.1] * 50,
-            "alpha_mean": 0.1,
-        },
+        "scheduled_sampling_p_truth": 0.35,
     }
     val_summary = {
         "weighted_loss_internal_only": 2.0,
@@ -566,15 +529,13 @@ def test_training_curves_include_step_rmse_and_adaptive_alpha(tmp_path: Path) ->
     assert "val_pure_rmse_bbox_h" in lines[0]
     assert "val_rmse_position_s50" in lines[0]
     assert "val_pure_rmse_position_s50" in lines[0]
-    assert "adaptive_fusion_alpha_s50" in lines[0]
-    assert "adaptive_fusion_alpha_bbox_h_s50" in lines[0]
+    assert "scheduled_sampling_p_truth" in lines[0]
     assert lines[1].split(",")[trainer.CURVES_COLUMNS.index("active_rollout_horizon")] == "50.0"
     assert lines[1].split(",")[trainer.CURVES_COLUMNS.index("val_rmse_bbox_w")] == "3.5"
     assert lines[1].split(",")[trainer.CURVES_COLUMNS.index("val_pure_rmse_bbox_h")] == "6.6"
     assert lines[1].split(",")[trainer.CURVES_COLUMNS.index("val_rmse_position_s50")] == "50.0"
     assert lines[1].split(",")[trainer.CURVES_COLUMNS.index("val_pure_rmse_position_s50")] == "500.0"
-    assert lines[1].split(",")[trainer.CURVES_COLUMNS.index("adaptive_fusion_alpha_s50")] == "0.1"
-    assert lines[1].split(",")[trainer.CURVES_COLUMNS.index("adaptive_fusion_alpha_bbox_h_s50")] == "0.4"
+    assert lines[1].split(",")[trainer.CURVES_COLUMNS.index("scheduled_sampling_p_truth")] == "0.35"
 
 
 def test_rollout_horizon_schedule_uses_latest_started_entry() -> None:

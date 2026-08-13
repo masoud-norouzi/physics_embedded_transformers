@@ -161,3 +161,29 @@ def test_clamp_to_channel_torch_never_leaves_the_channel_under_adversarial_pushe
         position = clamp_to_channel_torch(position + push, bbox, sdf_t, grad_x_t, grad_y_t)
         sdf_value, _, _ = sample_wall_sdf_numpy(wall_sdf, position.numpy())
         assert sdf_value[0] >= 2.0 - 1.0e-3
+
+
+def test_clamp_to_channel_torch_gradient_is_finite_at_a_medial_axis_point() -> None:
+    # Regression test: torch.sqrt(x) has an infinite/undefined derivative at x == 0, and a
+    # real device's wall SDF has genuine (0, 0)-gradient points (medial axis / channel
+    # centerline). Masking the *forward* value with torch.where/clamp_min is not enough --
+    # PyTorch still computes gradients through the unused branch, and 0 * inf/nan is nan in
+    # IEEE arithmetic, so it silently poisons every model weight the next time .backward()
+    # runs. This previously produced permanent NaN losses partway through real training,
+    # not caught by the adversarial-push test above because it never happened to land
+    # exactly on a zero-gradient point.
+    torch = pytest.importorskip("torch")
+    from src.physics.constraints import clamp_to_channel_torch, wall_sdf_to_torch
+
+    wall_sdf = build_wall_sdf(_band_mask(shape=(40, 40), band=(10, 30)))
+    sdf_t, grad_x_t, grad_y_t = wall_sdf_to_torch(wall_sdf)
+    grad_x_t[20, 20] = 0.0
+    grad_y_t[20, 20] = 0.0
+
+    candidate = torch.tensor([[20.0, 20.0]], dtype=torch.float32, requires_grad=True)
+    bbox = torch.tensor([[4.0, 4.0]], dtype=torch.float32, requires_grad=True)
+    result = clamp_to_channel_torch(candidate, bbox, sdf_t, grad_x_t, grad_y_t)
+    result.sum().backward()
+
+    assert torch.isfinite(candidate.grad).all()
+    assert torch.isfinite(bbox.grad).all()

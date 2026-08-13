@@ -1,6 +1,18 @@
 experiment:
-  id: physics_markovian_v1
-  description: Physics-enabled Markovian rollout Transformer using canonical_dataset_v2
+  id: physics_markovian_v1_decision_conditioned
+  description: >
+    Phase 2/3: same joint from-scratch recipe as physics_markovian_v1_decision_joint.yml
+    (rollout-horizon curriculum, decision_stop_gradient=true protecting the trunk from the
+    decision head's own BCE loss), plus model.architecture.condition_velocity_on_decision=true --
+    velocity_head now reads concat([h_last, decision_prob]), gated to the pre-junction window via
+    live occupancy features (Axis 2/4), with decision_prob itself scheduled between the true
+    branch label and the model's own self-prediction using the same p_truth anneal as
+    scheduled_sampling (Axis 3). decision_stop_gradient still isolates the TRUNK from any
+    decision-related gradient (whether from decision_loss or from motion loss flowing back through
+    decision_head via the new conditioning path) -- see the Phase 2/3 design note in memory /
+    docs/models/physics_markovian.tex for the four-axis design and the
+    decision_confidence_crossing_gap validation metric this run should be watched against before
+    considering the self-fulfilling-prophecy risk closed.
 
 dataset:
   path: outputs/processed/2/canonical_dataset_v2/canonical_dataset_v2.npz
@@ -40,6 +52,9 @@ model:
     num_layers: 4
     dim_feedforward: 512
     dropout: 0.1
+    predict_branch_decision: true
+    decision_stop_gradient: true  # trunk still isolated from all decision-related gradient
+    condition_velocity_on_decision: true  # Axis 1: velocity_head input = concat([h_last, decision_prob])
 
 training:
   batch_size: 4
@@ -72,7 +87,7 @@ training:
     - start_epoch: 151
       horizon: 50
   log_every_n_batches: 25
-  output_dir: outputs/models/physics_markovian_v1
+  output_dir: outputs/models/physics_markovian_v1_decision_conditioned
   physics_refresh:
     runtime_start_epoch: 2
   geometry_constraint:
@@ -93,6 +108,9 @@ training:
     enabled: true
     metric: active_horizon_position_rmse
   scheduled_sampling:
+    # Also drives Axis 3's decision-conditioning anneal (sample_decision_conditioning_signal) --
+    # one shared p_truth schedule for both position/velocity self-conditioning and decision
+    # self-conditioning, per the Phase 1 requirement that they stay in lockstep.
     enabled: true
     schedule:
       - start_epoch: 1
@@ -103,6 +121,11 @@ training:
         p_truth: 0.2
       - start_epoch: 120
         p_truth: 0.05
+  decision_head:
+    enabled: true
+    loss_weight: 1.0
+    labels_path: outputs/processed/2/canonical_dataset_v2/branch_decision_labels.npz
+    calibration_every_n_epochs: 5
 
 device:
   mode: auto

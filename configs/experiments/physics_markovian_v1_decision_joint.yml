@@ -1,6 +1,13 @@
 experiment:
-  id: physics_markovian_v1
-  description: Physics-enabled Markovian rollout Transformer using canonical_dataset_v2
+  id: physics_markovian_v1_decision_joint
+  description: >
+    Trains the motion trunk and the junction branch-decision head at the same time, from scratch,
+    using the same rollout-horizon curriculum as physics_markovian_v1. The decision head's loss
+    is gradient-isolated from the trunk (CanonicalRolloutTransformer.decision_stop_gradient=true):
+    the trunk trains only from the motion/geometry loss, exactly as in physics_markovian_v1, while
+    decision_head learns to decode whatever representation the trunk produces at each point in
+    training. See docs/models/physics_markovian.tex and the Phase 1 plan for background; this is
+    an alternative to the frozen-trunk warm-start recipe in physics_markovian_v1_decision.yml.
 
 dataset:
   path: outputs/processed/2/canonical_dataset_v2/canonical_dataset_v2.npz
@@ -40,6 +47,8 @@ model:
     num_layers: 4
     dim_feedforward: 512
     dropout: 0.1
+    predict_branch_decision: true
+    decision_stop_gradient: true  # trunk trains only from motion/geometry loss; decision_head rides along
 
 training:
   batch_size: 4
@@ -72,7 +81,7 @@ training:
     - start_epoch: 151
       horizon: 50
   log_every_n_batches: 25
-  output_dir: outputs/models/physics_markovian_v1
+  output_dir: outputs/models/physics_markovian_v1_decision_joint
   physics_refresh:
     runtime_start_epoch: 2
   geometry_constraint:
@@ -103,6 +112,11 @@ training:
         p_truth: 0.2
       - start_epoch: 120
         p_truth: 0.05
+  decision_head:
+    enabled: true
+    loss_weight: 1.0
+    labels_path: outputs/processed/2/canonical_dataset_v2/branch_decision_labels.npz
+    calibration_every_n_epochs: 5
 
 device:
   mode: auto

@@ -1,0 +1,106 @@
+experiment:
+  id: physics_markovian_v1_decision
+  description: >
+    Phase 1 junction branch-decision auxiliary head. Warm-starts the shared transformer trunk
+    from physics_markovian_v1's best motion checkpoint (frozen), trains only the new
+    decision_head. Does not feed the decision output into vx/vy or the physics engine -- see
+    docs/models/physics_markovian.tex and the Phase 1 plan for scope.
+
+dataset:
+  path: outputs/processed/2/canonical_dataset_v2/canonical_dataset_v2.npz
+  stride: 5
+
+model:
+  type: markovian
+  input_dim: 16
+  target_features:
+    - vx
+    - vy
+    - bbox_w
+    - bbox_h
+  input_feature_names:
+    - x
+    - y
+    - vx
+    - vy
+    - bbox_w
+    - bbox_h
+    - cfd_u_norm
+    - cfd_v_norm
+    - superficial_velocity
+    - left_flow_fraction
+    - occupancy_inlet_channel
+    - occupancy_inlet_junction
+    - occupancy_left_branch
+    - occupancy_right_branch
+    - occupancy_outlet_junction
+    - occupancy_outlet_channel
+  T_history: 1
+  rollout_horizon: 30
+  max_droplets: 64
+  architecture:
+    # Must match the warm_start_checkpoint's architecture exactly -- these are copied verbatim
+    # from physics_markovian_v1.yml so load_state_dict(strict=False) lines up shape-for-shape.
+    d_model: 128
+    n_heads: 4
+    num_layers: 4
+    dim_feedforward: 512
+    dropout: 0.1
+    predict_branch_decision: true
+
+training:
+  batch_size: 4
+  learning_rate: 1.0e-3  # only the small decision_head trains, so a larger LR than the motion model is fine
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  epochs: 60
+  random_seed: 123
+  num_workers: 0
+  loss_alpha: 2.0
+  log_every_n_batches: 25
+  output_dir: outputs/models/physics_markovian_v1_decision
+  physics_refresh:
+    runtime_start_epoch: 2
+  geometry_constraint:
+    enabled: false  # frozen trunk -> this loss would compute but contribute no gradient, pure overhead
+  hard_wall_containment:
+    enabled: true  # still needed to keep the propagated rollout state physically valid
+  event_exclusion:
+    enabled: true
+    split_events_csv: outputs/evaluation/split_event_scan/split_child_track_events.csv
+    parent_pre_frames: 10
+    parent_post_frames: 25
+    nearby_radius_px: 70.0
+  stage_handoff:
+    enabled: false  # rollout_horizon is fixed for this experiment, no stage transitions to handle
+  scheduled_sampling:
+    # Same annealed shape as physics_markovian_v1.yml (per Phase 1 requirement 4), rescaled to
+    # this experiment's shorter epoch count.
+    enabled: true
+    schedule:
+      - start_epoch: 1
+        p_truth: 1.0
+      - start_epoch: 10
+        p_truth: 0.5
+      - start_epoch: 25
+        p_truth: 0.2
+      - start_epoch: 45
+        p_truth: 0.05
+  decision_head:
+    enabled: true
+    loss_weight: 1.0
+    labels_path: outputs/processed/2/canonical_dataset_v2/branch_decision_labels.npz
+    warm_start_checkpoint: outputs/models/temp/best_stage_horizon_030.pt
+    freeze_trunk: true
+    calibration_every_n_epochs: 5
+
+device:
+  mode: auto
+
+smoke_test:
+  train_windows: 8
+  val_windows: 4
+  batch_size: 2
+  epochs: 1
+  optimization_steps: 2
+  rollout_horizon: 3

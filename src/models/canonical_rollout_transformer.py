@@ -20,8 +20,14 @@ class CanonicalRolloutTransformer(nn.Module):
         num_layers=4,
         dim_feedforward=512,
         dropout=0.1,
+        predict_branch_decision=False,
+        decision_stop_gradient=False,
+        condition_velocity_on_decision=False,
     ):
         super().__init__()
+
+        if condition_velocity_on_decision and not predict_branch_decision:
+            raise ValueError("condition_velocity_on_decision=True requires predict_branch_decision=True")
 
         self.input_dim = input_dim
         self.target_dim = target_dim
@@ -32,6 +38,9 @@ class CanonicalRolloutTransformer(nn.Module):
         self.num_layers = num_layers
         self.dim_feedforward = dim_feedforward
         self.dropout = dropout
+        self.predict_branch_decision = predict_branch_decision
+        self.decision_stop_gradient = decision_stop_gradient
+        self.condition_velocity_on_decision = condition_velocity_on_decision
 
         self.droplet_mlp = nn.Sequential(
             nn.Linear(input_dim, d_model),
@@ -58,11 +67,23 @@ class CanonicalRolloutTransformer(nn.Module):
             num_layers=num_layers,
         )
 
+        velocity_head_input_dim = d_model + 1 if condition_velocity_on_decision else d_model
         self.velocity_head = nn.Sequential(
-            nn.Linear(d_model, d_model),
+            nn.Linear(velocity_head_input_dim, d_model),
             nn.GELU(),
             nn.LayerNorm(d_model),
             nn.Linear(d_model, target_dim),
+        )
+
+        self.decision_head = (
+            nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.GELU(),
+                nn.LayerNorm(d_model),
+                nn.Linear(d_model, 1),
+            )
+            if predict_branch_decision
+            else None
         )
 
     def forward(
@@ -70,7 +91,10 @@ class CanonicalRolloutTransformer(nn.Module):
         history_x: torch.Tensor,
         history_mask: torch.Tensor,
         return_attention: bool = False,
+        return_decision: bool = False,
         attention_layer: str | int = "final",
+        decision_condition_signal: torch.Tensor | None = None,
+        decision_condition_gate: torch.Tensor | None = None,
     ) -> torch.Tensor | dict[str, torch.Tensor | list[torch.Tensor]]:
         B, T, M, F = history_x.shape
         assert T == self.T_history
@@ -106,16 +130,37 @@ class CanonicalRolloutTransformer(nn.Module):
         h = h.reshape(B, T, M, self.d_model)
         h_last = h[:, -1, :, :]
 
-        prediction = self.velocity_head(h_last)
-        if not return_attention:
+        decision_logit = None
+        if self.condition_velocity_on_decision or return_decision:
+            if self.decision_head is None:
+                raise ValueError("return_decision=True requires predict_branch_decision=True at construction")
+            decision_input = h_last.detach() if self.decision_stop_gradient else h_last
+            decision_logit = self.decision_head(decision_input).squeeze(-1)
+
+        if self.condition_velocity_on_decision:
+            effective_signal = torch.sigmoid(decision_logit)
+            if decision_condition_signal is not None:
+                effective_signal = torch.where(
+                    torch.isfinite(decision_condition_signal), decision_condition_signal, effective_signal
+                )
+            if decision_condition_gate is not None:
+                neutral = torch.full_like(effective_signal, 0.5)
+                effective_signal = torch.where(decision_condition_gate, effective_signal, neutral)
+            velocity_head_input = torch.cat([h_last, effective_signal.unsqueeze(-1)], dim=-1)
+        else:
+            velocity_head_input = h_last
+
+        prediction = self.velocity_head(velocity_head_input)
+        if not return_attention and not return_decision and not self.condition_velocity_on_decision:
             return prediction
 
-        selected_attention = select_attention_layer(attention_layers, attention_layer)
-        return {
-            "prediction": prediction,
-            "attention": selected_attention,
-            "attention_layers": attention_layers,
-        }
+        output: dict[str, torch.Tensor | list[torch.Tensor]] = {"prediction": prediction}
+        if return_attention:
+            output["attention"] = select_attention_layer(attention_layers, attention_layer)
+            output["attention_layers"] = attention_layers
+        if return_decision or self.condition_velocity_on_decision:
+            output["decision_logit"] = decision_logit
+        return output
 
 
 class AttentionRecordingTransformerEncoder(nn.Module):

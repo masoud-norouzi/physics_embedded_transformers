@@ -16,6 +16,7 @@ import yaml
 
 try:
     import torch
+    import torch.nn.functional as F
     from torch.optim import AdamW
     from torch.utils.data import DataLoader
 except ModuleNotFoundError as exc:  # pragma: no cover - exercised by environments without torch
@@ -116,13 +117,14 @@ CURVES_COLUMNS = [
     "val_pure_runtime_step_fallbacks",
     "val_pure_runtime_step_fallback_fraction",
     *[f"val_pure_rmse_position_s{step}" for step in DIAGNOSTIC_STEPS],
-    *[f"adaptive_fusion_alpha_s{step}" for step in DIAGNOSTIC_STEPS],
-    *[
-        f"adaptive_fusion_alpha_{feature}_s{step}"
-        for feature in RUNTIME_TARGET_FEATURES
-        for step in DIAGNOSTIC_STEPS
-    ],
-    "adaptive_fusion_alpha_mean",
+    "scheduled_sampling_p_truth",
+    "train_decision_loss",
+    "val_decision_loss",
+    "val_decision_count",
+    "val_decision_accuracy_near_commitment",
+    "val_decision_confidence_crossing_active",
+    "val_decision_confidence_crossing_pure",
+    "val_decision_confidence_crossing_gap",
 ]
 
 
@@ -154,106 +156,34 @@ class EventExclusion:
     parent_post_frames: int = 25
 
 
-class AdaptiveTargetFusion:
-    """EMA-driven measurement-weighted target fusion for recurrent rollout inputs."""
+@dataclass(frozen=True)
+class ScheduledSampling:
+    """Hard teacher-forcing schedule: p_truth is a pure function of epoch, never learned."""
 
-    def __init__(
-        self,
-        *,
-        horizon: int,
-        target_dim: int,
-        enabled: bool,
-        ema_beta: float,
-        initial_prediction_variance: float,
-        measurement_variance,
-        min_alpha: float,
-        max_alpha: float,
-        mode: str,
-        device,
-    ) -> None:
-        self.enabled = bool(enabled)
-        self.horizon = int(horizon)
-        self.target_dim = int(target_dim)
-        self.ema_beta = float(ema_beta)
-        self.measurement_variance = torch.as_tensor(measurement_variance, dtype=torch.float32, device=device)
-        self.min_alpha = float(min_alpha)
-        self.max_alpha = float(max_alpha)
-        self.mode = str(mode)
-        if self.mode not in {"global_ema", "causal_rollout"}:
-            raise ValueError(f"Unsupported adaptive_target_fusion mode: {self.mode!r}")
-        self.prediction_variance = torch.full(
-            (int(horizon), int(target_dim)),
-            float(initial_prediction_variance),
-            dtype=torch.float32,
-            device=device,
-        )
-        self.last_alpha = self.alpha_tensor().detach().cpu().numpy()
-
-    def alpha_tensor(self) -> torch.Tensor:
-        if not self.enabled:
-            return torch.zeros_like(self.prediction_variance)
-        denominator = self.prediction_variance + self.measurement_variance
-        alpha = self.prediction_variance / torch.clamp_min(denominator, 1.0e-12)
-        return torch.clamp(alpha, self.min_alpha, self.max_alpha)
-
-    def alpha_from_variance(self, variance: torch.Tensor) -> torch.Tensor:
-        if not self.enabled:
-            return torch.zeros_like(variance)
-        denominator = variance + self.measurement_variance
-        alpha = variance / torch.clamp_min(denominator, 1.0e-12)
-        return torch.clamp(alpha, self.min_alpha, self.max_alpha)
-
-    def initial_rollout_variance(self, device) -> torch.Tensor:
-        return self.prediction_variance[0].detach().clone().to(device)
-
-    def update_rollout_variance(
-        self,
-        current_variance: torch.Tensor,
-        prediction: torch.Tensor,
-        target: torch.Tensor,
-        mask: torch.Tensor,
-    ) -> torch.Tensor:
-        if not self.enabled:
-            return current_variance
-        mse, count = target_error_mse_for_step(prediction, target, mask)
-        valid = count > 0
-        updated = self.ema_beta * current_variance + (1.0 - self.ema_beta) * mse
-        return torch.where(valid, updated, current_variance).detach()
-
-    def update(self, mse_by_step_feature: torch.Tensor, count_by_step_feature: torch.Tensor) -> None:
-        if not self.enabled:
-            return
-        valid = count_by_step_feature > 0
-        if not bool(valid.any().item()):
-            return
-        mse = torch.where(valid, mse_by_step_feature, self.prediction_variance)
-        self.prediction_variance = torch.where(
-            valid,
-            self.ema_beta * self.prediction_variance + (1.0 - self.ema_beta) * mse,
-            self.prediction_variance,
-        )
-        self.last_alpha = self.alpha_tensor().detach().cpu().numpy()
-
-    def summary(self) -> dict[str, Any]:
-        alpha = self.last_alpha if self.enabled else np.zeros_like(self.last_alpha)
-        return {
-            "enabled": self.enabled,
-            "mode": self.mode,
-            "alpha_by_step_feature": alpha.tolist(),
-            "alpha_by_step_mean": alpha.mean(axis=1).tolist(),
-            "alpha_mean": float(alpha.mean()),
-        }
+    enabled: bool
+    schedule: tuple[tuple[int, float], ...]  # (start_epoch, p_truth), sorted ascending by start_epoch
 
 
-class ZeroAdaptiveTargetFusion:
-    enabled = True
-    mode = "zero"
+def p_truth_for_epoch(sampling: ScheduledSampling | None, epoch: int) -> float | None:
+    """Look up p_truth for an epoch using the same piecewise-schedule convention as rollout_horizon_for_epoch."""
+    if sampling is None or not sampling.enabled or not sampling.schedule:
+        return None
+    p_truth = float(sampling.schedule[0][1])
+    for start_epoch, value in sampling.schedule:
+        if int(epoch) >= int(start_epoch):
+            p_truth = float(value)
+    return p_truth
 
-    def __init__(self, horizon: int, target_dim: int, device) -> None:
-        self._alpha = torch.zeros((int(horizon), int(target_dim)), dtype=torch.float32, device=device)
 
-    def alpha_tensor(self) -> torch.Tensor:
-        return self._alpha
+@dataclass(frozen=True)
+class BranchDecisionTraining:
+    """Phase 1 junction branch-decision auxiliary head config + precomputed ground-truth labels."""
+
+    enabled: bool
+    loss_weight: float
+    branch_label: np.ndarray  # (n_tracks, n_frames) float32, NaN outside the pre-junction window
+    in_window: np.ndarray  # (n_tracks, n_frames) bool
+    frames_until_commit: np.ndarray  # (n_tracks, n_frames) int32, -1 outside the window
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -289,10 +219,10 @@ def main(argv: list[str] | None = None) -> None:
     target_deadband = target_deadband_from_config(config)
     event_exclusion = event_exclusion_from_config(config)
     save_json(output_dir / "event_exclusion_resolved.json", event_exclusion_summary(event_exclusion))
-    if target_parameterization["mode"] == "speed_angle_correction" and adaptive_target_fusion_enabled(config):
-        raise ValueError("adaptive_target_fusion is not implemented for speed_angle_correction targets")
-    if target_parameterization["mode"] == "position" and adaptive_target_fusion_enabled(config):
-        raise ValueError("adaptive_target_fusion is not implemented for position targets")
+    if target_parameterization["mode"] == "speed_angle_correction" and scheduled_sampling_enabled(config):
+        raise ValueError("scheduled_sampling is not implemented for speed_angle_correction targets")
+    if target_parameterization["mode"] == "position" and scheduled_sampling_enabled(config):
+        raise ValueError("scheduled_sampling is not implemented for position targets")
     if args.smoke_test:
         train_ds = SubsetByIndex(train_ds, int(config["smoke_test"]["train_windows"]))
         val_ds = SubsetByIndex(val_ds, int(config["smoke_test"]["val_windows"]))
@@ -373,6 +303,13 @@ def main(argv: list[str] | None = None) -> None:
     )
     geometry_constraint = create_geometry_constraint(config, runtime_context, device)
     hard_wall_containment = create_hard_wall_containment(config, runtime_context, device)
+    branch_decision = create_branch_decision_training(config)
+    if branch_decision is not None and branch_decision.enabled:
+        print(
+            f"Branch decision labels: {branch_decision.branch_label.shape} "
+            f"loss_weight={branch_decision.loss_weight} "
+            f"decision_stop_gradient={getattr(model, 'decision_stop_gradient', None)}"
+        )
 
     initial_runtime_context = runtime_context_for_epoch(config, 1, runtime_context)
     print(f"shape_test physics_refresh={physics_refresh_mode(initial_runtime_context)}")
@@ -389,6 +326,11 @@ def main(argv: list[str] | None = None) -> None:
         target_parameterization,
         target_deadband,
         event_exclusion,
+        branch_decision=branch_decision,
+    )
+
+    decision_calibration_every_n_epochs = int(
+        config.get("training", {}).get("decision_head", {}).get("calibration_every_n_epochs", 5)
     )
 
     start_time = time.perf_counter()
@@ -411,6 +353,7 @@ def main(argv: list[str] | None = None) -> None:
             event_exclusion=event_exclusion,
             model_config=model_config,
             output_dir=output_dir,
+            branch_decision=branch_decision,
         )
         smoke_summary["runtime_seconds"] = time.perf_counter() - start_time
         save_json(output_dir / "smoke_test_summary.json", smoke_summary)
@@ -436,6 +379,8 @@ def main(argv: list[str] | None = None) -> None:
         model_config=model_config,
         output_dir=output_dir,
         start_epoch=start_epoch,
+        branch_decision=branch_decision,
+        decision_calibration_every_n_epochs=decision_calibration_every_n_epochs,
     )
 
 
@@ -822,6 +767,7 @@ def run_shape_test(
     target_parameterization: dict[str, Any] | None = None,
     target_deadband: dict[str, Any] | None = None,
     event_exclusion: EventExclusion | None = None,
+    branch_decision: "BranchDecisionTraining | None" = None,
 ) -> None:
     model.eval()
     batch = move_batch_to_device(next(iter(train_loader)), device)
@@ -838,6 +784,7 @@ def run_shape_test(
             target_parameterization=target_parameterization,
             target_deadband=target_deadband,
             event_exclusion=event_exclusion,
+            branch_decision=branch_decision,
         )
     print(f"history_x:       {tuple(batch['history_x'].shape)}")
     print(f"history_mask:    {tuple(batch['history_mask'].shape)}")
@@ -847,6 +794,9 @@ def run_shape_test(
     print(f"pred_target:     {tuple(rollout['pred_target'].shape)}")
     print(f"weighted_loss_internal_only: {float(rollout['weighted_loss_internal_only']):.6f}")
     print(f"geometry_loss:   {float(rollout['geometry_loss']):.6f}")
+    if branch_decision is not None and branch_decision.enabled:
+        print(f"decision_count:  {int(rollout['decision_count'])}")
+        print(f"decision_loss:   {float(rollout['decision_loss']):.6f}")
     assert rollout["pred_target"].shape == batch["future_y"].shape
     assert rollout["mask"].shape == batch["future_mask"].shape
     assert rollout["supervision_mask"].shape == batch["cfd_loss_mask"].shape
@@ -870,8 +820,11 @@ def run_smoke_test(
     event_exclusion,
     model_config,
     output_dir: Path,
+    branch_decision: "BranchDecisionTraining | None" = None,
+    loss_key: str = "total_loss",
 ) -> dict[str, Any]:
-    adaptive_fusion = create_adaptive_target_fusion(config, weights, model_config, device, dataset, normalization_stats)
+    scheduled_sampling = create_scheduled_sampling(config)
+    p_truth = p_truth_for_epoch(scheduled_sampling, epoch=1)
     train_summary = train_one_epoch(
         model=model,
         loader=train_loader,
@@ -884,9 +837,11 @@ def run_smoke_test(
         log_every=int(config["training"]["log_every_n_batches"]),
         max_batches=int(config["smoke_test"]["optimization_steps"]),
         runtime_context=runtime_context,
-        adaptive_fusion=adaptive_fusion,
+        p_truth=p_truth,
         geometry_constraint=geometry_constraint,
         hard_wall_containment=hard_wall_containment,
+        branch_decision=branch_decision,
+        loss_key=loss_key,
         target_parameterization=target_parameterization,
         target_deadband=target_deadband,
         event_exclusion=event_exclusion,
@@ -901,9 +856,10 @@ def run_smoke_test(
         log_every=0,
         max_batches=1,
         runtime_context=runtime_context,
-        adaptive_fusion=adaptive_fusion,
+        p_truth=p_truth,
         geometry_constraint=geometry_constraint,
         hard_wall_containment=hard_wall_containment,
+        branch_decision=branch_decision,
         target_parameterization=target_parameterization,
         target_deadband=target_deadband,
         event_exclusion=event_exclusion,
@@ -932,16 +888,17 @@ def run_smoke_test(
             normalization_stats,
             weights,
             runtime_context=runtime_context,
-            adaptive_fusion=adaptive_fusion,
+            p_truth=p_truth,
             geometry_constraint=geometry_constraint,
             hard_wall_containment=hard_wall_containment,
+            branch_decision=branch_decision,
             target_parameterization=target_parameterization,
             target_deadband=target_deadband,
             event_exclusion=event_exclusion,
         )
     assert torch.isfinite(rollout["weighted_loss_internal_only"])
     assert torch.isfinite(rollout["total_loss"])
-    return {
+    result = {
         "train_loss": train_summary["weighted_loss_internal_only"],
         "train_total_loss": train_summary["total_loss"],
         "val_loss": val_summary["weighted_loss_internal_only"],
@@ -951,6 +908,10 @@ def run_smoke_test(
         "finite_losses": True,
         "rollout_shape": list(rollout["pred_target"].shape),
     }
+    if branch_decision is not None and branch_decision.enabled:
+        result["decision_count"] = int(rollout["decision_count"])
+        result["decision_loss"] = float(rollout["decision_loss"])
+    return result
 
 
 def train_full(
@@ -972,22 +933,15 @@ def train_full(
     model_config,
     output_dir: Path,
     start_epoch: int = 1,
+    branch_decision: BranchDecisionTraining | None = None,
+    loss_key: str = "total_loss",
+    decision_calibration_every_n_epochs: int = 5,
 ) -> None:
     curves_csv_path = output_dir / "training_curves.csv"
     initialize_curves_csv(curves_csv_path)
     best_val_loss = float("inf")
     full_rollout_horizon = int(weights.numel())
-    if rollout_horizon_schedule_enabled(config) and adaptive_target_fusion_enabled(config):
-        raise ValueError("rollout_horizon_schedule is a no-fusion ablation; set adaptive_target_fusion.enabled=false")
-    adaptive_fusion = create_adaptive_target_fusion(
-        config,
-        weights,
-        model_config,
-        device,
-        dataset,
-        normalization_stats,
-    )
-    alpha_history: list[dict[str, Any]] = []
+    scheduled_sampling = create_scheduled_sampling(config)
     stage_handoff = stage_handoff_from_config(config)
     stage_best_metric = float("inf")
     stage_best_path: Path | None = None
@@ -1013,21 +967,12 @@ def train_full(
             device,
         )
         active_runtime_context = runtime_context_for_epoch(config, epoch, runtime_context)
-        active_fusion = adaptive_fusion if active_runtime_context is not None and adaptive_fusion.enabled else None
-        if adaptive_fusion is not None and adaptive_fusion.horizon != active_rollout_horizon:
-            adaptive_fusion = create_adaptive_target_fusion(
-                config,
-                active_weights,
-                model_config,
-                device,
-                dataset,
-                normalization_stats,
-            )
-            active_fusion = adaptive_fusion if active_runtime_context is not None and adaptive_fusion.enabled else None
+        active_p_truth = p_truth_for_epoch(scheduled_sampling, epoch)
         print(
             f"epoch {epoch:03d} "
             f"physics_refresh={physics_refresh_mode(active_runtime_context)} "
-            f"rollout_horizon={active_rollout_horizon}"
+            f"rollout_horizon={active_rollout_horizon} "
+            f"p_truth={active_p_truth if active_p_truth is not None else 'n/a'}"
         )
         train_summary = train_one_epoch(
             model=model,
@@ -1040,14 +985,17 @@ def train_full(
             grad_clip=float(config["training"]["grad_clip"]),
             log_every=int(config["training"]["log_every_n_batches"]),
             runtime_context=active_runtime_context,
-            adaptive_fusion=active_fusion,
+            p_truth=active_p_truth,
             geometry_constraint=geometry_constraint,
             hard_wall_containment=hard_wall_containment,
+            branch_decision=branch_decision,
+            loss_key=loss_key,
             target_parameterization=target_parameterization,
             target_deadband=target_deadband,
             event_exclusion=event_exclusion,
         )
         train_summary["active_rollout_horizon"] = float(active_rollout_horizon)
+        train_summary["scheduled_sampling_p_truth"] = float(active_p_truth) if active_p_truth is not None else 0.0
         val_summary = evaluate(
             model=model,
             loader=val_loader,
@@ -1057,22 +1005,20 @@ def train_full(
             device=device,
             log_every=int(config["training"]["log_every_n_batches"]),
             runtime_context=active_runtime_context,
-            adaptive_fusion=active_fusion,
+            p_truth=active_p_truth,
             geometry_constraint=geometry_constraint,
             hard_wall_containment=hard_wall_containment,
+            branch_decision=branch_decision,
             target_parameterization=target_parameterization,
             target_deadband=target_deadband,
             event_exclusion=event_exclusion,
         )
         val_summary["active_rollout_horizon"] = float(active_rollout_horizon)
-        if active_fusion is None:
+        if active_p_truth is None:
             val_pure_summary = dict(val_summary)
         else:
-            pure_validation_fusion = ZeroAdaptiveTargetFusion(
-                active_rollout_horizon,
-                model_config["target_dim"],
-                device,
-            )
+            # Free rollout (p_truth=0): the diagnostic that actually matters -- how the model
+            # behaves under full self-conditioning, not the fused/teacher-forced trajectory.
             val_pure_summary = evaluate(
                 model=model,
                 loader=val_loader,
@@ -1082,23 +1028,41 @@ def train_full(
                 device=device,
                 log_every=0,
                 runtime_context=active_runtime_context,
-                adaptive_fusion=pure_validation_fusion,
+                p_truth=0.0,
                 geometry_constraint=geometry_constraint,
                 hard_wall_containment=hard_wall_containment,
+                branch_decision=branch_decision,
                 target_parameterization=target_parameterization,
                 target_deadband=target_deadband,
                 event_exclusion=event_exclusion,
             )
             val_pure_summary["active_rollout_horizon"] = float(active_rollout_horizon)
-        fusion_summary = train_summary.get("adaptive_fusion")
-        if fusion_summary is None:
-            fusion_summary = adaptive_fusion.summary() if active_fusion is not None else inactive_adaptive_fusion_summary(adaptive_fusion)
-            train_summary["adaptive_fusion"] = fusion_summary
         val_summary["pure"] = val_pure_summary
-        alpha_history.append({"epoch": epoch, **fusion_summary})
+        if branch_decision is not None and branch_decision.enabled:
+            crossing_active = decision_confidence_crossing_frame(val_summary.get("decision_calibration", {}))
+            crossing_pure = decision_confidence_crossing_frame(val_pure_summary.get("decision_calibration", {}))
+            val_summary["decision_confidence_crossing_active"] = crossing_active
+            val_summary["decision_confidence_crossing_pure"] = crossing_pure
+            val_summary["decision_confidence_crossing_gap"] = (
+                crossing_pure - crossing_active
+                if np.isfinite(crossing_active) and np.isfinite(crossing_pure)
+                else float("nan")
+            )
         print_epoch_summary(epoch, train_summary, val_summary)
         append_curves_csv(curves_csv_path, epoch, train_summary, val_summary)
-        save_adaptive_fusion_alpha_plot(alpha_history, output_dir / "adaptive_fusion_alpha_by_epoch.png")
+        if (
+            branch_decision is not None
+            and branch_decision.enabled
+            and val_summary.get("decision_calibration")
+            and epoch % max(int(decision_calibration_every_n_epochs), 1) == 0
+        ):
+            save_decision_calibration_plot(
+                val_summary["decision_calibration"],
+                output_dir / f"decision_calibration_epoch_{epoch:03d}.png",
+                epoch=epoch,
+                accuracy_near_commitment=val_summary.get("decision_accuracy_near_commitment", float("nan")),
+                pure_calibration=val_pure_summary.get("decision_calibration"),
+            )
 
         checkpoint = build_checkpoint(model, optimizer, epoch, val_pure_summary, normalization_stats, config, model_config)
         latest_path = output_dir / "latest_checkpoint.pt"
@@ -1142,9 +1106,11 @@ def train_one_epoch(
     log_every: int,
     max_batches: int | None = None,
     runtime_context=None,
-    adaptive_fusion: AdaptiveTargetFusion | None = None,
+    p_truth: float | None = None,
     geometry_constraint: GeometryConstraint | None = None,
     hard_wall_containment: HardWallContainment | None = None,
+    branch_decision: BranchDecisionTraining | None = None,
+    loss_key: str = "total_loss",
     target_parameterization: dict[str, Any] | None = None,
     target_deadband: dict[str, Any] | None = None,
     event_exclusion: EventExclusion | None = None,
@@ -1163,8 +1129,8 @@ def train_one_epoch(
     total_target_speed_sse = 0.0
     total_angular_sse = 0.0
     total_target_diagnostic_count = 0
-    alpha_sum = None
-    alpha_count = 0
+    total_decision_loss = 0.0
+    total_decision_count = 0
     target_sse_by_feature = None
     target_count_by_feature = None
     num_batches = 0
@@ -1179,20 +1145,24 @@ def train_one_epoch(
             normalization_stats,
             weights,
             runtime_context=runtime_context,
-            adaptive_fusion=adaptive_fusion,
+            p_truth=p_truth,
             geometry_constraint=geometry_constraint,
             hard_wall_containment=hard_wall_containment,
+            branch_decision=branch_decision,
             target_parameterization=target_parameterization,
             target_deadband=target_deadband,
             event_exclusion=event_exclusion,
         )
-        loss = rollout["total_loss"]
+        loss = rollout[loss_key]
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
 
         total_optimization_loss += float(loss.detach().cpu())
         total_loss += float(rollout["weighted_loss_internal_only"].detach().cpu())
+        if int(rollout["decision_count"]) > 0:
+            total_decision_loss += float(rollout["decision_loss"].detach().cpu()) * int(rollout["decision_count"])
+            total_decision_count += int(rollout["decision_count"])
         update_geometry_accumulator(geometry_accumulator, rollout)
         total_supervised += int(rollout["supervision_mask"].sum().detach().cpu())
         total_present += int(rollout["mask"].sum().detach().cpu())
@@ -1210,14 +1180,6 @@ def train_one_epoch(
             target_count_by_feature,
             rollout,
         )
-        if adaptive_fusion is not None:
-            adaptive_fusion.update(
-                rollout["target_error_mse_by_step_feature"],
-                rollout["target_error_count_by_step_feature"],
-            )
-        if "adaptive_alpha_used" in rollout:
-            alpha_sum = accumulate_alpha_used(alpha_sum, rollout["adaptive_alpha_used"])
-            alpha_count += 1
         num_batches += 1
         if log_every > 0 and (num_batches % log_every == 0 or num_batches == total_batches):
             print_progress("train", num_batches, total_batches, total_optimization_loss / max(num_batches, 1))
@@ -1237,11 +1199,11 @@ def train_one_epoch(
         "base_direction_fallback_fraction": total_base_fallbacks / max(total_supervised, 1),
         "rmse_target_speed": safe_rmse(total_target_speed_sse, total_target_diagnostic_count),
         "rmse_angular_correction": safe_rmse(total_angular_sse, total_target_diagnostic_count),
+        "decision_loss": total_decision_loss / max(total_decision_count, 1),
+        "decision_count": float(total_decision_count),
     }
     summary.update(target_rmse_summary(normalization_stats, target_sse_by_feature, target_count_by_feature))
     summary.update(geometry_summary_from_accumulator(geometry_accumulator, num_batches))
-    if adaptive_fusion is not None and alpha_sum is not None:
-        summary["adaptive_fusion"] = alpha_used_summary(alpha_sum, alpha_count, adaptive_fusion)
     return summary
 
 
@@ -1255,9 +1217,10 @@ def evaluate(
     log_every: int = 0,
     max_batches: int | None = None,
     runtime_context=None,
-    adaptive_fusion: AdaptiveTargetFusion | None = None,
+    p_truth: float | None = None,
     geometry_constraint: GeometryConstraint | None = None,
     hard_wall_containment: HardWallContainment | None = None,
+    branch_decision: BranchDecisionTraining | None = None,
     target_parameterization: dict[str, Any] | None = None,
     target_deadband: dict[str, Any] | None = None,
     event_exclusion: EventExclusion | None = None,
@@ -1276,8 +1239,11 @@ def evaluate(
     total_target_speed_sse = 0.0
     total_angular_sse = 0.0
     total_target_diagnostic_count = 0
-    alpha_sum = None
-    alpha_count = 0
+    total_decision_loss = 0.0
+    total_decision_count = 0
+    decision_probs_all = []
+    decision_labels_all = []
+    decision_frames_until_commit_all = []
     target_sse_by_feature = None
     target_count_by_feature = None
     num_batches = 0
@@ -1294,15 +1260,22 @@ def evaluate(
                 normalization_stats,
                 weights,
                 runtime_context=runtime_context,
-                adaptive_fusion=adaptive_fusion,
+                p_truth=p_truth,
                 geometry_constraint=geometry_constraint,
                 hard_wall_containment=hard_wall_containment,
+                branch_decision=branch_decision,
                 target_parameterization=target_parameterization,
                 target_deadband=target_deadband,
                 event_exclusion=event_exclusion,
             )
             total_optimization_loss += float(rollout["total_loss"].detach().cpu())
             total_loss += float(rollout["weighted_loss_internal_only"].detach().cpu())
+            if int(rollout["decision_count"]) > 0:
+                total_decision_loss += float(rollout["decision_loss"].detach().cpu()) * int(rollout["decision_count"])
+                total_decision_count += int(rollout["decision_count"])
+                decision_probs_all.append(rollout["decision_probs"].cpu())
+                decision_labels_all.append(rollout["decision_labels"].cpu())
+                decision_frames_until_commit_all.append(rollout["decision_frames_until_commit"].cpu())
             update_geometry_accumulator(geometry_accumulator, rollout)
             total_supervised += int(rollout["supervision_mask"].sum().detach().cpu())
             total_present += int(rollout["mask"].sum().detach().cpu())
@@ -1320,9 +1293,6 @@ def evaluate(
                 target_count_by_feature,
                 rollout,
             )
-            if "adaptive_alpha_used" in rollout:
-                alpha_sum = accumulate_alpha_used(alpha_sum, rollout["adaptive_alpha_used"])
-                alpha_count += 1
             update_metric_accumulators(accumulators, rollout)
             num_batches += 1
             if log_every > 0 and (num_batches % log_every == 0 or num_batches == total_batches):
@@ -1350,76 +1320,153 @@ def evaluate(
         for accumulator in accumulators["steps"]
     ]
     summary.update(geometry_summary_from_accumulator(geometry_accumulator, num_batches))
-    if adaptive_fusion is not None and alpha_sum is not None:
-        summary["adaptive_fusion"] = alpha_used_summary(alpha_sum, alpha_count, adaptive_fusion)
+    summary["decision_loss"] = total_decision_loss / max(total_decision_count, 1)
+    summary["decision_count"] = float(total_decision_count)
+    summary.update(
+        decision_validation_metrics(decision_probs_all, decision_labels_all, decision_frames_until_commit_all)
+    )
     return summary
 
 
-def create_adaptive_target_fusion(config: dict[str, Any], weights, model_config: dict[str, Any], device, dataset=None, normalization_stats=None):
-    fusion = config.get("training", {}).get("adaptive_target_fusion", {})
-    measurement_variance = adaptive_measurement_variance(fusion, dataset, normalization_stats, device)
-    return AdaptiveTargetFusion(
-        horizon=int(weights.numel()),
-        target_dim=int(model_config["target_dim"]),
-        enabled=bool(fusion.get("enabled", False)),
-        ema_beta=float(fusion.get("ema_beta", 0.95)),
-        initial_prediction_variance=float(fusion.get("initial_prediction_variance", 1.0)),
-        measurement_variance=measurement_variance,
-        min_alpha=float(fusion.get("min_alpha", 0.0)),
-        max_alpha=float(fusion.get("max_alpha", 0.8)),
-        mode=str(fusion.get("mode", "causal_rollout")),
-        device=device,
+def decision_validation_metrics(probs_parts, labels_parts, frames_until_commit_parts) -> dict[str, Any]:
+    """Accuracy near the decision point plus a frames-until-commitment calibration table --
+    the two Phase 1 validation targets (see the plan)."""
+    if not probs_parts:
+        return {"decision_accuracy_near_commitment": float("nan"), "decision_calibration": {}}
+    probs = torch.cat(probs_parts)
+    labels = torch.cat(labels_parts)
+    frames_until_commit = torch.cat(frames_until_commit_parts)
+
+    near_commitment = frames_until_commit == 1
+    if bool(near_commitment.any()):
+        predicted = (probs[near_commitment] > 0.5).float()
+        accuracy = float((predicted == labels[near_commitment]).float().mean())
+    else:
+        accuracy = float("nan")
+
+    calibration: dict[str, dict[str, float]] = {}
+    for bin_value in sorted(int(v) for v in torch.unique(frames_until_commit).tolist() if v >= 0):
+        bin_mask = frames_until_commit == bin_value
+        calibration[str(bin_value)] = {
+            "mean_predicted_p_short": float(probs[bin_mask].mean()),
+            "observed_frequency_short": float(labels[bin_mask].mean()),
+            "count": int(bin_mask.sum()),
+        }
+    return {"decision_accuracy_near_commitment": accuracy, "decision_calibration": calibration}
+
+
+def decision_confidence_crossing_frame(calibration: dict[str, dict[str, float]], threshold: float = 0.3) -> float:
+    """First (largest) frames_until_commit, scanning from far to near, where the mean predicted
+    probability is confidently away from 0.5 (|p - 0.5| >= threshold). NaN if it never crosses.
+
+    Phase 2/3 validation: compare this computed on the active-p_truth regime vs. the fully
+    self-conditioned (val_pure, p_truth=0) regime. A self-conditioned crossing frame well past
+    (larger than) the teacher-forced one means the decision head is bootstrapping confidence from
+    its own earlier output rather than tracking real physical evidence -- see
+    decision_confidence_crossing_gap in train_full, which is the actual pass/fail signal, not
+    position RMSE alone.
+    """
+    if not calibration:
+        return float("nan")
+    for bin_value in sorted((int(key) for key in calibration), reverse=True):
+        mean_p = calibration[str(bin_value)]["mean_predicted_p_short"]
+        if abs(mean_p - 0.5) >= threshold:
+            return float(bin_value)
+    return float("nan")
+
+
+def save_decision_calibration_plot(
+    calibration: dict[str, dict[str, float]],
+    path: Path,
+    *,
+    epoch: int,
+    accuracy_near_commitment: float,
+    pure_calibration: dict[str, dict[str, float]] | None = None,
+) -> None:
+    """Predicted P(short) and observed frequency vs. frames-until-commitment -- the calibration
+    target from the Phase 1 plan, structured the same way as the Ch. 3 baseline's own tables.
+
+    When pure_calibration is given (the p_truth=0, fully self-conditioned regime), it is overlaid
+    against the active-p_truth curve -- the visual counterpart of
+    decision_confidence_crossing_frame's numeric gap (Phase 2/3 feedback-loop validation)."""
+    if not calibration:
+        return
+    try:
+        import matplotlib.pyplot as plt
+    except ModuleNotFoundError:
+        return
+    bins = sorted(int(key) for key in calibration)
+    predicted = [calibration[str(b)]["mean_predicted_p_short"] for b in bins]
+    observed = [calibration[str(b)]["observed_frequency_short"] for b in bins]
+    counts = [calibration[str(b)]["count"] for b in bins]
+
+    fig, (ax_curve, ax_count) = plt.subplots(2, 1, figsize=(8, 6), sharex=True, height_ratios=[3, 1])
+    ax_curve.plot(bins, predicted, marker="o", color="tab:blue", label="mean predicted P(short) [active p_truth]")
+    ax_curve.plot(bins, observed, marker="o", color="tab:orange", label="observed frequency (short)")
+    if pure_calibration:
+        pure_bins = sorted(int(key) for key in pure_calibration)
+        pure_predicted = [pure_calibration[str(b)]["mean_predicted_p_short"] for b in pure_bins]
+        ax_curve.plot(
+            pure_bins,
+            pure_predicted,
+            marker="x",
+            linestyle="--",
+            color="tab:green",
+            label="mean predicted P(short) [self-conditioned, p_truth=0]",
+        )
+    ax_curve.invert_xaxis()  # frames_until_commit descends toward 0 (commitment) left-to-right
+    ax_curve.set_ylabel("probability")
+    ax_curve.set_ylim(-0.02, 1.02)
+    ax_curve.set_title(f"epoch {epoch} | accuracy near commitment = {accuracy_near_commitment:.4f}")
+    ax_curve.legend(loc="best", fontsize=8)
+    ax_curve.grid(True, alpha=0.3)
+
+    ax_count.bar(bins, counts, width=0.8, color="#888888")
+    ax_count.invert_xaxis()
+    ax_count.set_xlabel("frames until commitment")
+    ax_count.set_ylabel("sample count")
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
+def create_scheduled_sampling(config: dict[str, Any]) -> ScheduledSampling | None:
+    sampling = config.get("training", {}).get("scheduled_sampling", {})
+    if not bool(sampling.get("enabled", False)):
+        return None
+    raw_schedule = sampling.get("schedule", [])
+    if not raw_schedule:
+        raise ValueError("scheduled_sampling enabled, but no schedule entries were provided")
+    schedule = tuple(sorted((int(item["start_epoch"]), float(item["p_truth"])) for item in raw_schedule))
+    for _, p_truth in schedule:
+        if not 0.0 <= p_truth <= 1.0:
+            raise ValueError(f"scheduled_sampling p_truth values must be in [0, 1], got {p_truth}")
+    return ScheduledSampling(enabled=True, schedule=schedule)
+
+
+def scheduled_sampling_enabled(config: dict[str, Any]) -> bool:
+    return bool(config.get("training", {}).get("scheduled_sampling", {}).get("enabled", False))
+
+
+def create_branch_decision_training(config: dict[str, Any]) -> BranchDecisionTraining | None:
+    section = config.get("training", {}).get("decision_head", {})
+    if not bool(section.get("enabled", False)):
+        return None
+    labels_path = section.get("labels_path")
+    if labels_path is None:
+        raise ValueError("decision_head enabled, but no labels_path is configured")
+    with np.load(labels_path) as loaded:
+        branch_label = loaded["branch_label"]
+        in_window = loaded["in_window"]
+        frames_until_commit = loaded["frames_until_commit"]
+    return BranchDecisionTraining(
+        enabled=True,
+        loss_weight=float(section.get("loss_weight", 1.0)),
+        branch_label=branch_label,
+        in_window=in_window,
+        frames_until_commit=frames_until_commit,
     )
-
-
-def adaptive_measurement_variance(fusion_config: dict[str, Any], dataset, normalization_stats, device):
-    if "detection_position_variance_px2" not in fusion_config:
-        return float(fusion_config.get("measurement_variance", 4.0))
-    if dataset is None or normalization_stats is None:
-        return float(fusion_config.get("measurement_variance", 4.0))
-
-    detection_variance_px2 = float(fusion_config["detection_position_variance_px2"])
-    if detection_variance_px2 < 0.0 or not np.isfinite(detection_variance_px2):
-        raise ValueError(f"detection_position_variance_px2 must be finite and non-negative, got {detection_variance_px2}")
-    target_std = torch.as_tensor(normalization_stats["target_std"], dtype=torch.float32, device=device)
-    if target_std.numel() != len(RUNTIME_TARGET_FEATURES):
-        raise ValueError(f"Expected {len(RUNTIME_TARGET_FEATURES)} target std values, got {target_std.numel()}")
-    velocity_std_px_frame = float(np.sqrt(2.0 * detection_variance_px2))
-    velocity_std = velocity_std_px_frame * float(getattr(dataset, "velocity_mm_s_per_px_frame", 1.0))
-    bbox_std = float(np.sqrt(2.0 * detection_variance_px2))
-    measurement_std = torch.as_tensor(
-        [velocity_std, velocity_std, bbox_std, bbox_std],
-        dtype=torch.float32,
-        device=device,
-    )
-    return (measurement_std / torch.clamp_min(target_std, 1.0e-12)) ** 2
-
-
-def inactive_adaptive_fusion_summary(adaptive_fusion: AdaptiveTargetFusion) -> dict[str, Any]:
-    alpha = np.zeros_like(adaptive_fusion.last_alpha)
-    return {
-        "enabled": False,
-        "mode": "inactive",
-        "alpha_by_step_feature": alpha.tolist(),
-        "alpha_by_step_mean": alpha.mean(axis=1).tolist(),
-        "alpha_mean": 0.0,
-    }
-
-
-def accumulate_alpha_used(alpha_sum, alpha_used: torch.Tensor):
-    value = alpha_used.detach()
-    return value.clone() if alpha_sum is None else alpha_sum + value
-
-
-def alpha_used_summary(alpha_sum: torch.Tensor, alpha_count: int, adaptive_fusion) -> dict[str, Any]:
-    alpha = (alpha_sum / max(int(alpha_count), 1)).detach().cpu().numpy()
-    return {
-        "enabled": bool(getattr(adaptive_fusion, "enabled", False)),
-        "mode": str(getattr(adaptive_fusion, "mode", "unknown")),
-        "alpha_by_step_feature": alpha.tolist(),
-        "alpha_by_step_mean": alpha.mean(axis=1).tolist(),
-        "alpha_mean": float(alpha.mean()),
-    }
 
 
 def boundary_conditioned_rollout(
@@ -1429,9 +1476,10 @@ def boundary_conditioned_rollout(
     normalization_stats,
     weights,
     runtime_context=None,
-    adaptive_fusion: AdaptiveTargetFusion | None = None,
+    p_truth: float | None = None,
     geometry_constraint: GeometryConstraint | None = None,
     hard_wall_containment: HardWallContainment | None = None,
+    branch_decision: "BranchDecisionTraining | None" = None,
     target_parameterization: dict[str, Any] | None = None,
     target_deadband: dict[str, Any] | None = None,
     event_exclusion: EventExclusion | None = None,
@@ -1462,29 +1510,58 @@ def boundary_conditioned_rollout(
     target_dim = int(len(normalization_stats["target_mean"]))
     target_error_sse_by_step_feature = torch.zeros((int(weights.numel()), target_dim), device=device)
     target_error_count_by_step_feature = torch.zeros_like(target_error_sse_by_step_feature)
-    adaptive_alpha_used = torch.zeros_like(target_error_sse_by_step_feature)
-    rollout_variance = (
-        adaptive_fusion.initial_rollout_variance(device)
-        if adaptive_fusion is not None and adaptive_fusion.enabled and adaptive_fusion.mode == "causal_rollout"
-        else None
-    )
 
     feature_index = dataset.feature_indices
     target_parameterization = target_parameterization or {"mode": "velocity"}
     true_future_features = get_true_future_features(batch, dataset, device, weights.numel())
     true_future_xy = true_future_features[:, :, :, [feature_index["x"], feature_index["y"]]]
 
+    decision_enabled = (
+        branch_decision is not None and branch_decision.enabled and getattr(model, "decision_head", None) is not None
+    )
+    condition_velocity_on_decision = decision_enabled and bool(
+        getattr(model, "condition_velocity_on_decision", False)
+    )
+    if decision_enabled:
+        true_branch_label, true_in_window, true_frames_until_commit = get_true_branch_labels(
+            batch, dataset, device, weights.numel(), branch_decision
+        )
+        decision_loss_sum = torch.zeros((), device=device)
+        decision_loss_count = 0
+        decision_probs_list = []
+        decision_labels_list = []
+        decision_frames_until_commit_list = []
+
     for step_index in range(weights.numel()):
         previous_last_mask = history_mask[:, -1, :]
-        pred_step_norm_raw = model(rollout_history, history_mask)
+        history_phys = denormalize_features(rollout_history, normalization_stats, device)
+        last_frame = history_phys[:, -1, :, :]
+        if decision_enabled:
+            if condition_velocity_on_decision:
+                conditioning_signal = sample_decision_conditioning_signal(
+                    true_branch_label[:, step_index, :], p_truth
+                )
+                conditioning_gate = pre_junction_gate(last_frame, feature_index)
+                model_output = model(
+                    rollout_history,
+                    history_mask,
+                    return_decision=True,
+                    decision_condition_signal=conditioning_signal,
+                    decision_condition_gate=conditioning_gate,
+                )
+            else:
+                model_output = model(rollout_history, history_mask, return_decision=True)
+            pred_step_norm_raw = model_output["prediction"]
+            decision_logit_step = model_output["decision_logit"]
+        else:
+            pred_step_norm_raw = model(rollout_history, history_mask)
+            decision_logit_step = None
         pred_step_phys_raw = denormalize_targets(
             pred_step_norm_raw[:, None, :, :],
             normalization_stats,
             device,
         )[:, 0, :, :]
 
-        history_phys = denormalize_features(rollout_history, normalization_stats, device)
-        last_frame = history_phys[:, -1, :, :]
         true_step_features = true_future_features[:, step_index, :, :]
         previous_target_features = last_frame if step_index == 0 else true_future_features[:, step_index - 1, :, :]
         true_step_phys, true_step_norm, true_step_velocity, base_fallback_mask, deadband_mask = target_tensors_for_step(
@@ -1510,20 +1587,34 @@ def boundary_conditioned_rollout(
         entering_mask = new_mask & ~previous_last_mask
         true_step_features_finite = torch.isfinite(true_step_features).all(dim=-1)
         boundary_mask = entering_mask & true_step_features_finite
-        alpha_for_step = alpha_for_rollout_step(adaptive_fusion, step_index, pred_step_phys_raw.device, rollout_variance)
-        if alpha_for_step is not None:
-            adaptive_alpha_used[step_index] = alpha_for_step
+
+        if decision_enabled:
+            step_branch_label = true_branch_label[:, step_index, :]
+            step_in_window = true_in_window[:, step_index, :]
+            decision_mask = continuing_mask & step_in_window & torch.isfinite(step_branch_label)
+            if bool(decision_mask.any()):
+                step_decision_loss_sum = F.binary_cross_entropy_with_logits(
+                    decision_logit_step[decision_mask], step_branch_label[decision_mask], reduction="sum"
+                )
+                decision_loss_sum = decision_loss_sum + step_decision_loss_sum
+                decision_loss_count += int(decision_mask.sum())
+                decision_probs_list.append(torch.sigmoid(decision_logit_step[decision_mask]).detach())
+                decision_labels_list.append(step_branch_label[decision_mask].detach())
+                decision_frames_until_commit_list.append(
+                    true_frames_until_commit[:, step_index, :][decision_mask].detach()
+                )
+
         true_rollout_target_phys = true_rollout_target_for_parameterization(
             true_step_features,
             true_step_velocity,
             feature_index,
             target_parameterization,
         )
-        target_for_rollout_phys = fuse_rollout_targets(
+        target_for_rollout_phys = sample_rollout_targets(
             pred_step_runtime_phys,
             true_rollout_target_phys,
             continuing_mask,
-            None if target_parameterization.get("mode") == "speed_angle_correction" else alpha_for_step,
+            None if target_parameterization.get("mode") == "speed_angle_correction" else p_truth,
         )
 
         position_index = [feature_index["x"], feature_index["y"]]
@@ -1604,14 +1695,6 @@ def boundary_conditioned_rollout(
             true_step_norm,
             supervision_mask,
         )
-        if rollout_variance is not None:
-            rollout_variance = adaptive_fusion.update_rollout_variance(
-                rollout_variance,
-                pred_step_norm_raw,
-                true_step_norm,
-                supervision_mask,
-            )
-
         new_frame_norm = normalize_features(new_frame_phys, normalization_stats, device)
         new_frame_norm = torch.where(new_mask[:, :, None], new_frame_norm, torch.zeros_like(new_frame_norm))
         rollout_history = torch.cat([rollout_history[:, 1:, :, :], new_frame_norm[:, None, :, :]], dim=1)
@@ -1659,11 +1742,39 @@ def boundary_conditioned_rollout(
         feature_index=feature_index,
         geometry_constraint=geometry_constraint,
     )
-    total_loss = weighted_loss_internal_only + geometry_loss
+    if decision_enabled:
+        decision_loss = (
+            decision_loss_sum / decision_loss_count
+            if decision_loss_count > 0
+            else decision_loss_sum
+        )
+        weighted_decision_loss = float(branch_decision.loss_weight) * decision_loss
+        decision_probs_tensor = torch.cat(decision_probs_list) if decision_probs_list else decision_loss_sum.new_zeros((0,))
+        decision_labels_tensor = torch.cat(decision_labels_list) if decision_labels_list else decision_loss_sum.new_zeros((0,))
+        decision_frames_until_commit_tensor = (
+            torch.cat(decision_frames_until_commit_list)
+            if decision_frames_until_commit_list
+            else torch.zeros((0,), dtype=torch.int32, device=device)
+        )
+    else:
+        decision_loss = torch.zeros((), device=device)
+        weighted_decision_loss = torch.zeros((), device=device)
+        decision_loss_count = 0
+        decision_probs_tensor = torch.zeros((0,), device=device)
+        decision_labels_tensor = torch.zeros((0,), device=device)
+        decision_frames_until_commit_tensor = torch.zeros((0,), dtype=torch.int32, device=device)
+
+    total_loss = weighted_loss_internal_only + geometry_loss + weighted_decision_loss
     return {
         "weighted_loss": total_loss,
         "total_loss": total_loss,
         "weighted_loss_internal_only": weighted_loss_internal_only,
+        "decision_loss": decision_loss,
+        "weighted_decision_loss": weighted_decision_loss,
+        "decision_count": decision_loss_count,
+        "decision_probs": decision_probs_tensor,
+        "decision_labels": decision_labels_tensor,
+        "decision_frames_until_commit": decision_frames_until_commit_tensor,
         "geometry_loss": geometry_payload["unweighted_loss"],
         "weighted_geometry_loss": geometry_loss,
         "geometry_count": geometry_payload["count"],
@@ -1698,7 +1809,6 @@ def boundary_conditioned_rollout(
             target_error_count_by_step_feature,
         ).detach(),
         "target_error_count_by_step_feature": target_error_count_by_step_feature.detach(),
-        "adaptive_alpha_used": adaptive_alpha_used.detach(),
     }
 
 
@@ -1913,21 +2023,56 @@ def runtime_prediction_mode(target_parameterization: dict[str, Any]) -> str:
     return "position" if target_parameterization.get("mode") == "position" else "velocity"
 
 
-def alpha_for_rollout_step(adaptive_fusion, step_index: int, device, rollout_variance=None):
-    if adaptive_fusion is None or not adaptive_fusion.enabled:
-        return None
-    if getattr(adaptive_fusion, "mode", "global_ema") == "causal_rollout" and rollout_variance is not None:
-        return adaptive_fusion.alpha_from_variance(rollout_variance).to(device)
-    return adaptive_fusion.alpha_tensor()[int(step_index)].to(device)
+def sample_rollout_targets(
+    pred_step_phys_raw: torch.Tensor,
+    true_step_phys: torch.Tensor,
+    continuing_mask: torch.Tensor,
+    p_truth: float | None,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Hard per-(batch, droplet) teacher-forcing select -- no blending.
 
-
-def fuse_rollout_targets(pred_step_phys_raw, true_step_phys, continuing_mask, alpha):
-    if alpha is None:
+    Each continuing droplet independently uses ground truth with probability p_truth,
+    redrawn at every step, and its own prior prediction otherwise.
+    """
+    if p_truth is None:
         return pred_step_phys_raw
     true_finite = torch.isfinite(true_step_phys).all(dim=-1)
-    fusion_mask = continuing_mask & true_finite
-    fused = (1.0 - alpha.view(1, 1, -1)) * pred_step_phys_raw + alpha.view(1, 1, -1) * true_step_phys
-    return torch.where(fusion_mask[:, :, None], fused, pred_step_phys_raw)
+    use_truth = torch.rand(continuing_mask.shape, device=continuing_mask.device, generator=generator) < p_truth
+    select_mask = continuing_mask & true_finite & use_truth
+    return torch.where(select_mask[:, :, None], true_step_phys, pred_step_phys_raw)
+
+
+def sample_decision_conditioning_signal(
+    true_branch_label_step: torch.Tensor,
+    p_truth: float | None,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Per-(batch, droplet) hard select between the true branch label and NaN ("condition on the
+    model's own decision_prob instead") -- same pattern as sample_rollout_targets, applied to the
+    scalar branch-decision conditioning signal (Phase 2/3 Axis 3) instead of physical state.
+    """
+    if p_truth is None:
+        return torch.full_like(true_branch_label_step, float("nan"))
+    true_finite = torch.isfinite(true_branch_label_step)
+    use_truth = (
+        torch.rand(true_branch_label_step.shape, device=true_branch_label_step.device, generator=generator) < p_truth
+    )
+    select_mask = true_finite & use_truth
+    return torch.where(select_mask, true_branch_label_step, torch.full_like(true_branch_label_step, float("nan")))
+
+
+def pre_junction_gate(last_frame: torch.Tensor, feature_index: dict[str, int]) -> torch.Tensor:
+    """True where the live (possibly self-conditioned) state is upstream of the junction and not
+    yet resolved into a branch (Phase 2/3 Axis 2/4). Derived from the occupancy features already in
+    the model's input -- NOT from ground-truth region labels -- so training-time gating matches
+    exactly what is available at real closed-loop inference time.
+    """
+    inlet_channel = last_frame[..., feature_index["occupancy_inlet_channel"]]
+    inlet_junction = last_frame[..., feature_index["occupancy_inlet_junction"]]
+    left_branch = last_frame[..., feature_index["occupancy_left_branch"]]
+    right_branch = last_frame[..., feature_index["occupancy_right_branch"]]
+    return ((inlet_channel > 0) | (inlet_junction > 0)) & (left_branch <= 0) & (right_branch <= 0)
 
 
 def update_target_error_stats(
@@ -2181,6 +2326,37 @@ def get_true_future_features(batch, dataset, device, horizon):
     return torch.as_tensor(true_features, dtype=torch.float32, device=device)
 
 
+def get_true_branch_labels(batch, dataset, device, horizon: int, branch_decision: BranchDecisionTraining):
+    """Same droplet_ids/frame_start alignment as get_true_future_features, applied to the
+    precomputed branch_label/in_window/frames_until_commit arrays instead of dataset.Z."""
+    droplet_ids = batch["droplet_ids"].detach().cpu().numpy()
+    frame_starts = batch["frame_start"].detach().cpu().numpy()
+    track_id_to_index = {int(track_id): index for index, track_id in enumerate(dataset.track_ids)}
+
+    B, M = droplet_ids.shape
+    branch_label = np.full((B, horizon, M), np.nan, dtype=np.float32)
+    in_window = np.zeros((B, horizon, M), dtype=bool)
+    frames_until_commit = np.full((B, horizon, M), -1, dtype=np.int32)
+    for batch_index in range(B):
+        start = int(frame_starts[batch_index]) + dataset.T_history
+        end = start + horizon
+        for slot_index in range(M):
+            track_id = int(droplet_ids[batch_index, slot_index])
+            if track_id < 0:
+                continue
+            droplet_index = track_id_to_index.get(track_id)
+            if droplet_index is None:
+                continue
+            branch_label[batch_index, :, slot_index] = branch_decision.branch_label[droplet_index, start:end]
+            in_window[batch_index, :, slot_index] = branch_decision.in_window[droplet_index, start:end]
+            frames_until_commit[batch_index, :, slot_index] = branch_decision.frames_until_commit[droplet_index, start:end]
+    return (
+        torch.as_tensor(branch_label, dtype=torch.float32, device=device),
+        torch.as_tensor(in_window, dtype=torch.bool, device=device),
+        torch.as_tensor(frames_until_commit, dtype=torch.int32, device=device),
+    )
+
+
 def move_batch_to_device(batch, device):
     return {key: value.to(device) if torch.is_tensor(value) else value for key, value in batch.items()}
 
@@ -2389,21 +2565,26 @@ def print_epoch_summary(epoch, train_summary, val_summary):
             if step <= pure_available_steps
         )
         print(
-            f"  pure_alpha0_val "
+            f"  pure_p_truth0_val "
             f"weighted_loss_internal_only={pure['weighted_loss_internal_only']:.6f} "
             f"rmse_position={pure['rmse_position']:.6f} "
             f"runtime_fallback={pure.get('runtime_step_fallback_fraction', 0.0):.6f}"
         )
-        print(f"  pure_alpha0_stepwise_val_rmse_position {pure_step_text}")
-    fusion = train_summary.get("adaptive_fusion", {})
-    if fusion.get("enabled"):
-        alpha_values = fusion.get("alpha_by_step_mean", [])
-        alpha_text = " ".join(
-            f"a{step}={alpha_values[step - 1]:.6f}"
-            for step in DIAGNOSTIC_STEPS
-            if step <= len(alpha_values)
+        print(f"  pure_p_truth0_stepwise_val_rmse_position {pure_step_text}")
+    if "scheduled_sampling_p_truth" in train_summary:
+        print(f"  scheduled_sampling_p_truth {train_summary['scheduled_sampling_p_truth']:.6f}")
+    if val_summary.get("decision_count", 0.0) > 0:
+        print(
+            f"  decision_head val_loss={val_summary['decision_loss']:.6f} "
+            f"count={int(val_summary['decision_count'])} "
+            f"accuracy_near_commitment={val_summary.get('decision_accuracy_near_commitment', float('nan')):.4f}"
         )
-        print(f"  adaptive_fusion_alpha_measurement_weight {alpha_text}")
+    if "decision_confidence_crossing_gap" in val_summary:
+        print(
+            f"  decision_confidence_crossing active={val_summary['decision_confidence_crossing_active']:.1f} "
+            f"pure={val_summary['decision_confidence_crossing_pure']:.1f} "
+            f"gap={val_summary['decision_confidence_crossing_gap']:.1f}"
+        )
 
 
 def runtime_context_for_epoch(config: dict[str, Any], epoch: int, runtime_context):
@@ -2493,9 +2674,6 @@ def move_optimizer_state_to_device(optimizer, device) -> None:
                 state[key] = value.to(device)
 
 
-def adaptive_target_fusion_enabled(config: dict[str, Any]) -> bool:
-    fusion = config.get("training", {}).get("adaptive_target_fusion", {})
-    return bool(fusion.get("enabled", False))
 
 
 def physics_refresh_mode(runtime_context) -> str:
@@ -2541,21 +2719,6 @@ def diagnostic_step_value(summary: dict[str, Any], step: int) -> float:
     return float(values[step - 1]) if step <= len(values) else np.nan
 
 
-def diagnostic_alpha_value(summary: dict[str, Any], step: int) -> float:
-    fusion = summary.get("adaptive_fusion", {})
-    values = fusion.get("alpha_by_step_mean", [])
-    return float(values[step - 1]) if step <= len(values) else 0.0
-
-
-def diagnostic_alpha_feature_value(summary: dict[str, Any], feature_index: int, step: int) -> float:
-    fusion = summary.get("adaptive_fusion", {})
-    values = fusion.get("alpha_by_step_feature", [])
-    if step > len(values):
-        return 0.0
-    step_values = values[step - 1]
-    return float(step_values[feature_index]) if feature_index < len(step_values) else 0.0
-
-
 def pure_summary_value(summary: dict[str, Any], key: str) -> float:
     return float(summary.get("pure", {}).get(key, summary.get(key, np.nan)))
 
@@ -2563,30 +2726,6 @@ def pure_summary_value(summary: dict[str, Any], key: str) -> float:
 def pure_diagnostic_step_value(summary: dict[str, Any], step: int) -> float:
     pure = summary.get("pure", summary)
     return diagnostic_step_value(pure, step)
-
-
-def save_adaptive_fusion_alpha_plot(alpha_history: list[dict[str, Any]], path: Path) -> None:
-    if not alpha_history:
-        return
-    try:
-        import matplotlib.pyplot as plt
-    except ModuleNotFoundError:
-        return
-    plt.figure(figsize=(8, 5))
-    for item in alpha_history:
-        values = item.get("alpha_by_step_mean", [])
-        if not values:
-            continue
-        steps = np.arange(1, len(values) + 1)
-        plt.plot(steps, values, alpha=0.35, linewidth=1.0, label=f"epoch {item['epoch']}")
-    plt.xlabel("rollout step")
-    plt.ylabel("alpha (measurement weight)")
-    plt.ylim(0.0, 1.0)
-    if len(alpha_history) <= 8:
-        plt.legend(loc="best", fontsize=8)
-    plt.tight_layout()
-    plt.savefig(path, dpi=160)
-    plt.close()
 
 
 def append_curves_csv(path, epoch, train_summary, val_summary):
@@ -2650,13 +2789,14 @@ def append_curves_csv(path, epoch, train_summary, val_summary):
                 pure_summary_value(val_summary, "runtime_step_fallbacks"),
                 pure_summary_value(val_summary, "runtime_step_fallback_fraction"),
                 *[pure_diagnostic_step_value(val_summary, step) for step in DIAGNOSTIC_STEPS],
-                *[diagnostic_alpha_value(train_summary, step) for step in DIAGNOSTIC_STEPS],
-                *[
-                    diagnostic_alpha_feature_value(train_summary, feature_index, step)
-                    for feature_index, _feature in enumerate(RUNTIME_TARGET_FEATURES)
-                    for step in DIAGNOSTIC_STEPS
-                ],
-                train_summary.get("adaptive_fusion", {}).get("alpha_mean", 0.0),
+                train_summary.get("scheduled_sampling_p_truth", 0.0),
+                train_summary.get("decision_loss", 0.0),
+                val_summary.get("decision_loss", 0.0),
+                val_summary.get("decision_count", 0.0),
+                val_summary.get("decision_accuracy_near_commitment", np.nan),
+                val_summary.get("decision_confidence_crossing_active", np.nan),
+                val_summary.get("decision_confidence_crossing_pure", np.nan),
+                val_summary.get("decision_confidence_crossing_gap", np.nan),
             ]
         )
 

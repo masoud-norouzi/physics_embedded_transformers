@@ -85,14 +85,8 @@ training:
     parent_pre_frames: 10
     parent_post_frames: 25
     nearby_radius_px: 70.0
-  adaptive_target_fusion:
-    enabled: false
-    mode: causal_rollout
-    ema_beta: 0.95
-    initial_prediction_variance: 1.0
-    detection_position_variance_px2: 0.2
-    min_alpha: 0.0
-    max_alpha: 0.8
+  scheduled_sampling:
+    enabled: false  # not supported for speed_angle_correction targets
 
 device:
   mode: auto
