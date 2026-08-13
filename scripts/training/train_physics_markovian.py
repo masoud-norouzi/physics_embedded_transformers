@@ -303,6 +303,8 @@ def main(argv: list[str] | None = None) -> None:
     )
     geometry_constraint = create_geometry_constraint(config, runtime_context, device)
     hard_wall_containment = create_hard_wall_containment(config, runtime_context, device)
+    if getattr(model, "bbox_stop_gradient", False):
+        print("bbox_stop_gradient: enabled (bbox_w/bbox_h trained on a detached trunk copy)")
     branch_decision = create_branch_decision_training(config)
     if branch_decision is not None and branch_decision.enabled:
         print(

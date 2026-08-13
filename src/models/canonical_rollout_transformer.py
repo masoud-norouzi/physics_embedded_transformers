@@ -23,11 +23,16 @@ class CanonicalRolloutTransformer(nn.Module):
         predict_branch_decision=False,
         decision_stop_gradient=False,
         condition_velocity_on_decision=False,
+        bbox_stop_gradient=False,
     ):
         super().__init__()
 
         if condition_velocity_on_decision and not predict_branch_decision:
             raise ValueError("condition_velocity_on_decision=True requires predict_branch_decision=True")
+        if bbox_stop_gradient and target_dim <= 2:
+            raise ValueError(
+                "bbox_stop_gradient=True requires target_dim > 2 (the last two target dims must be bbox_w, bbox_h)"
+            )
 
         self.input_dim = input_dim
         self.target_dim = target_dim
@@ -41,6 +46,7 @@ class CanonicalRolloutTransformer(nn.Module):
         self.predict_branch_decision = predict_branch_decision
         self.decision_stop_gradient = decision_stop_gradient
         self.condition_velocity_on_decision = condition_velocity_on_decision
+        self.bbox_stop_gradient = bbox_stop_gradient
 
         self.droplet_mlp = nn.Sequential(
             nn.Linear(input_dim, d_model),
@@ -67,13 +73,37 @@ class CanonicalRolloutTransformer(nn.Module):
             num_layers=num_layers,
         )
 
-        velocity_head_input_dim = d_model + 1 if condition_velocity_on_decision else d_model
-        self.velocity_head = nn.Sequential(
-            nn.Linear(velocity_head_input_dim, d_model),
-            nn.GELU(),
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, target_dim),
-        )
+        motion_head_input_dim = d_model + 1 if condition_velocity_on_decision else d_model
+        if bbox_stop_gradient:
+            # bbox_w/bbox_h (always the last two target dims -- confirmed across the velocity,
+            # speed_angle_correction, and position target parameterizations) are known to carry
+            # label noise/outright-wrong labels during extreme droplet deformation (e.g. head-on
+            # collisions the axis-aligned bbox can't represent). bbox_head is trained on h_last.detach()
+            # so those bad labels can never reshape the trunk that motion_head (and everything
+            # downstream) relies on -- same isolation mechanism as decision_stop_gradient, pointed
+            # at a different split.
+            self.velocity_head = None
+            self.motion_head = nn.Sequential(
+                nn.Linear(motion_head_input_dim, d_model),
+                nn.GELU(),
+                nn.LayerNorm(d_model),
+                nn.Linear(d_model, target_dim - 2),
+            )
+            self.bbox_head = nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.GELU(),
+                nn.LayerNorm(d_model),
+                nn.Linear(d_model, 2),
+            )
+        else:
+            self.motion_head = None
+            self.bbox_head = None
+            self.velocity_head = nn.Sequential(
+                nn.Linear(motion_head_input_dim, d_model),
+                nn.GELU(),
+                nn.LayerNorm(d_model),
+                nn.Linear(d_model, target_dim),
+            )
 
         self.decision_head = (
             nn.Sequential(
@@ -146,11 +176,16 @@ class CanonicalRolloutTransformer(nn.Module):
             if decision_condition_gate is not None:
                 neutral = torch.full_like(effective_signal, 0.5)
                 effective_signal = torch.where(decision_condition_gate, effective_signal, neutral)
-            velocity_head_input = torch.cat([h_last, effective_signal.unsqueeze(-1)], dim=-1)
+            motion_input = torch.cat([h_last, effective_signal.unsqueeze(-1)], dim=-1)
         else:
-            velocity_head_input = h_last
+            motion_input = h_last
 
-        prediction = self.velocity_head(velocity_head_input)
+        if self.bbox_stop_gradient:
+            motion_prediction = self.motion_head(motion_input)
+            bbox_prediction = self.bbox_head(h_last.detach())
+            prediction = torch.cat([motion_prediction, bbox_prediction], dim=-1)
+        else:
+            prediction = self.velocity_head(motion_input)
         if not return_attention and not return_decision and not self.condition_velocity_on_decision:
             return prediction
 
