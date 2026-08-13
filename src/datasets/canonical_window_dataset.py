@@ -32,6 +32,26 @@ except ModuleNotFoundError:
     torch = _TorchFallback()  # type: ignore[assignment]
 
 
+def load_canonical_dataset_arrays(npz_path) -> dict:
+    """Load the raw arrays backing CanonicalWindowDataset exactly once.
+
+    Z is a (n_tracks, n_frames, n_features) float32 array that can run into multiple GB for the
+    full canonical dataset. create_train_val_test_datasets uses this to share a single in-memory
+    copy across the train/val/test splits, instead of each independently reloading and
+    materializing its own full copy (three splits x full Z was enough to blow through a
+    memory-constrained training container's cgroup limit in practice).
+    """
+    dataset = np.load(Path(npz_path), allow_pickle=False)
+    return {
+        "Z": dataset["Z"],
+        "mask": dataset["mask"],
+        "track_ids": dataset["track_ids"],
+        "frames": dataset["frames"],
+        "feature_names": [str(name) for name in dataset["feature_names"]],
+        "velocity_units": str(dataset["velocity_units"]) if "velocity_units" in dataset.files else "px/frame",
+    }
+
+
 class CanonicalWindowDataset(Dataset):
     """Canonical history/future window dataset, compatible with v1 and v2 tensors."""
 
@@ -46,6 +66,7 @@ class CanonicalWindowDataset(Dataset):
         normalization_stats=None,
         fit_normalization=False,
         experiment_config=DEFAULT_EXPERIMENT_CONFIG,
+        shared_arrays=None,
     ):
         self.npz_path = Path(npz_path)
         self.start_frames = np.asarray(start_frames, dtype=np.int64)
@@ -55,13 +76,14 @@ class CanonicalWindowDataset(Dataset):
         self.max_droplets = int(max_droplets)
         self.target_features = tuple(target_features)
 
-        dataset = np.load(self.npz_path, allow_pickle=False)
-        self.Z = dataset["Z"]
-        self.mask = dataset["mask"]
-        self.track_ids = dataset["track_ids"]
-        self.frames = dataset["frames"]
-        self.feature_names = [str(name) for name in dataset["feature_names"]]
-        self.velocity_units = str(dataset["velocity_units"]) if "velocity_units" in dataset.files else "px/frame"
+        if shared_arrays is None:
+            shared_arrays = load_canonical_dataset_arrays(self.npz_path)
+        self.Z = shared_arrays["Z"]
+        self.mask = shared_arrays["mask"]
+        self.track_ids = shared_arrays["track_ids"]
+        self.frames = shared_arrays["frames"]
+        self.feature_names = shared_arrays["feature_names"]
+        self.velocity_units = shared_arrays["velocity_units"]
         self.experiment_config = Path(experiment_config)
         self.velocity_mm_s_per_px_frame = self._runtime_velocity_conversion()
 
@@ -267,8 +289,8 @@ def create_train_val_test_datasets(
     target_features=("vx", "vy"),
     experiment_config=DEFAULT_EXPERIMENT_CONFIG,
 ):
-    dataset = np.load(npz_path, allow_pickle=False)
-    T = len(dataset["frames"])
+    shared_arrays = load_canonical_dataset_arrays(npz_path)
+    T = len(shared_arrays["frames"])
     T_total = T_history + T_future
     all_start_frames = np.arange(0, T - T_total + 1, stride, dtype=np.int64)
 
@@ -288,6 +310,7 @@ def create_train_val_test_datasets(
         target_features=target_features,
         fit_normalization=True,
         experiment_config=experiment_config,
+        shared_arrays=shared_arrays,
     )
     normalization_stats = train_dataset.normalization_stats
 
@@ -300,6 +323,7 @@ def create_train_val_test_datasets(
         target_features=target_features,
         normalization_stats=normalization_stats,
         experiment_config=experiment_config,
+        shared_arrays=shared_arrays,
     )
     test_dataset = CanonicalWindowDataset(
         npz_path=npz_path,
@@ -310,6 +334,7 @@ def create_train_val_test_datasets(
         target_features=target_features,
         normalization_stats=normalization_stats,
         experiment_config=experiment_config,
+        shared_arrays=shared_arrays,
     )
 
     return train_dataset, val_dataset, test_dataset, normalization_stats

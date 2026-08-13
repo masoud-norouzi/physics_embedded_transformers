@@ -58,6 +58,32 @@ def test_v2_loader_keeps_previous_window_counts_splits_and_indexing(tmp_path: Pa
     assert sample["cfd_loss_mask"].shape == (2, 3)
 
 
+def test_train_val_test_datasets_share_a_single_z_array(tmp_path: Path) -> None:
+    # Regression test: create_train_val_test_datasets must NOT let each split independently
+    # reload/materialize its own full copy of Z/mask from disk -- Z can be multiple GB for the
+    # real dataset, and three independent copies (one per split) was enough to exceed a
+    # memory-constrained training container's cgroup limit in practice. `is` (identity), not just
+    # array-equality, is the actual thing being guaranteed here.
+    npz = _write_npz(tmp_path / "canonical_v2.npz", V2_FEATURES)
+
+    train, val, test, _ = create_train_val_test_datasets(npz, stride=2, T_history=2, T_future=2, max_droplets=3)
+
+    assert train.Z is val.Z is test.Z
+    assert train.mask is val.mask is test.mask
+
+
+def test_canonical_window_dataset_direct_construction_still_loads_independently(tmp_path: Path) -> None:
+    # Backward compatibility: callers that construct CanonicalWindowDataset directly (not via
+    # create_train_val_test_datasets) without shared_arrays must keep working exactly as before.
+    npz = _write_npz(tmp_path / "canonical_v2.npz", V2_FEATURES)
+
+    first = CanonicalWindowDataset(npz, start_frames=[0], T_history=1, T_future=2, max_droplets=3)
+    second = CanonicalWindowDataset(npz, start_frames=[0], T_history=1, T_future=2, max_droplets=3)
+
+    assert first.Z is not second.Z  # independently loaded, as before
+    assert np.array_equal(first.Z, second.Z, equal_nan=True)  # but with identical content
+
+
 def test_v2_has_no_cfd_valid_feature_or_mask(tmp_path: Path) -> None:
     npz = _write_npz(tmp_path / "canonical_v2.npz", V2_FEATURES)
     dataset = CanonicalWindowDataset(
