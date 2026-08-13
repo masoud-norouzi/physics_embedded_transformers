@@ -39,7 +39,7 @@ def main() -> None:
     )
 
     branch_label, in_window, frames_until_commit = derive_branch_decision_labels(
-        Z, mask, feature_index, runtime_context.region_labels
+        Z, mask, feature_index, runtime_context.region_labels, max_frames_until_commit=args.max_frames_until_commit
     )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -68,6 +68,7 @@ def main() -> None:
         "window_length_mean": float(window_lengths.mean()) if window_lengths.size else float("nan"),
         "window_length_median": float(np.median(window_lengths)) if window_lengths.size else float("nan"),
         "window_length_max": int(window_lengths.max()) if window_lengths.size else 0,
+        "max_frames_until_commit": args.max_frames_until_commit,
     }
     args.metadata_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
@@ -83,6 +84,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cfd-library", type=Path, default=DEFAULT_CFD_LIBRARY)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--metadata-json", type=Path, default=None)
+    parser.add_argument(
+        "--max-frames-until-commit",
+        type=int,
+        default=None,
+        help="Cap the pre-junction window to frames_until_commit <= N (default: unbounded).",
+    )
     return parser.parse_args()
 
 

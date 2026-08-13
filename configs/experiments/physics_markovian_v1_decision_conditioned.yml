@@ -124,7 +124,7 @@ training:
   decision_head:
     enabled: true
     loss_weight: 1.0
-    labels_path: outputs/processed/2/canonical_dataset_v2/branch_decision_labels.npz
+    labels_path: outputs/processed/2/canonical_dataset_v2/branch_decision_labels_max20.npz
     calibration_every_n_epochs: 5
 
 device:

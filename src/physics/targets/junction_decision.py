@@ -43,8 +43,17 @@ def derive_branch_decision_labels(
     mask: np.ndarray,
     feature_index: dict[str, int],
     region_labels: np.ndarray,
+    max_frames_until_commit: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Derive per-(track, frame) junction branch-decision labels and pre-junction window mask.
+
+    max_frames_until_commit: if given, caps the window to only frames with
+    frames_until_commit <= max_frames_until_commit -- frames further out are excluded from
+    in_window/branch_label entirely (not just from downstream reporting). Sample counts get very
+    sparse past ~25-30 frames out (most windows are shorter than that to begin with), and a
+    droplet that far from the junction is governed by plain channel flow rather than junction
+    dynamics, so there is little for the decision head to learn there anyway. None (default) keeps
+    the full window, unbounded, matching the original behavior.
 
     branch_label: float32 (n_tracks, n_frames). 1.0 = short/right branch, 0.0 = long/left branch,
     NaN outside any track's pre-junction window (including tracks that never reach a branch, or
@@ -93,5 +102,11 @@ def derive_branch_decision_labels(
         in_window[track_index, window] = mask[track_index, window]
         branch_label[track_index, window] = label_value
         frames_until_commit[track_index, window] = commit_frame - np.arange(first_pre_frame, commit_frame)
+
+    if max_frames_until_commit is not None:
+        beyond_cap = frames_until_commit > int(max_frames_until_commit)
+        in_window = in_window & ~beyond_cap
+        branch_label = np.where(beyond_cap, np.nan, branch_label).astype(np.float32)
+        frames_until_commit = np.where(beyond_cap, -1, frames_until_commit).astype(np.int32)
 
     return branch_label, in_window, frames_until_commit

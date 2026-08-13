@@ -128,6 +128,63 @@ def test_derive_branch_decision_labels_commit_without_prior_pre_junction_observa
     assert np.all(np.isnan(branch_label))
 
 
+def test_derive_branch_decision_labels_max_frames_until_commit_caps_window() -> None:
+    # 1 row x 15 col strip: cols 0-11 inlet_channel (12 frames), 12-13 inlet_junction, 14 right_branch.
+    region_labels = np.zeros((1, 15), dtype=np.int64)
+    region_labels[0, 0:12] = INLET_CHANNEL
+    region_labels[0, 12:14] = INLET_JUNCTION
+    region_labels[0, 14] = RIGHT_BRANCH
+
+    n_frames = 15
+    x = np.arange(n_frames, dtype=np.float32)  # walks straight through columns 0..14
+    y = np.zeros(n_frames, dtype=np.float32)
+    Z = np.zeros((1, n_frames, 2), dtype=np.float32)
+    Z[0, :, 0] = x
+    Z[0, :, 1] = y
+    mask = np.ones((1, n_frames), dtype=bool)
+    feature_index = {"x": 0, "y": 1}
+
+    uncapped_label, uncapped_window, uncapped_fuc = derive_branch_decision_labels(Z, mask, feature_index, region_labels)
+    # Commit at frame 14 -> uncapped window is frames [0, 14), 14 frames, frames_until_commit 14..1.
+    assert uncapped_window[0].sum() == 14
+    assert uncapped_fuc[0, 0] == 14
+
+    capped_label, capped_window, capped_fuc = derive_branch_decision_labels(
+        Z, mask, feature_index, region_labels, max_frames_until_commit=5
+    )
+    # Only frames with frames_until_commit <= 5 survive: frames 9..13 (values 5,4,3,2,1).
+    assert capped_window[0].sum() == 5
+    np.testing.assert_array_equal(np.flatnonzero(capped_window[0]), [9, 10, 11, 12, 13])
+    assert np.all(capped_fuc[0, capped_window[0]] <= 5)
+    assert np.all(capped_fuc[0, ~capped_window[0]] == -1)
+    assert np.all(np.isnan(capped_label[0, ~capped_window[0]]))
+    # The surviving frames keep the same label/fuc values they had uncapped -- capping only excludes.
+    np.testing.assert_array_equal(capped_fuc[0, capped_window[0]], uncapped_fuc[0, capped_window[0]])
+    np.testing.assert_array_equal(capped_label[0, capped_window[0]], uncapped_label[0, capped_window[0]])
+
+
+def test_derive_branch_decision_labels_max_frames_until_commit_none_matches_uncapped() -> None:
+    region_labels = _region_grid()
+    n_frames = 8
+    x = np.arange(n_frames, dtype=np.float32)
+    y = np.zeros(n_frames, dtype=np.float32)
+    Z = np.zeros((1, n_frames, 2), dtype=np.float32)
+    Z[0, :, 0] = x
+    Z[0, :, 1] = y
+    mask = np.ones((1, n_frames), dtype=bool)
+    feature_index = {"x": 0, "y": 1}
+
+    default_result = derive_branch_decision_labels(Z, mask, feature_index, region_labels)
+    explicit_none_result = derive_branch_decision_labels(
+        Z, mask, feature_index, region_labels, max_frames_until_commit=None
+    )
+    branch_label_a, in_window_a, fuc_a = default_result
+    branch_label_b, in_window_b, fuc_b = explicit_none_result
+    np.testing.assert_array_equal(in_window_a, in_window_b)
+    np.testing.assert_array_equal(fuc_a, fuc_b)
+    assert np.array_equal(branch_label_a, branch_label_b, equal_nan=True)
+
+
 # ---------------------------------------------------------------------------
 # CanonicalRolloutTransformer -- decision head construction and forward pass
 # ---------------------------------------------------------------------------
