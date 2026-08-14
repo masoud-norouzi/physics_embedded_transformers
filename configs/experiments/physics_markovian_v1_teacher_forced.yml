@@ -1,0 +1,115 @@
+experiment:
+  id: physics_markovian_v1_teacher_forced
+  description: >
+    Diagnostic-only training track, not a deployment candidate. Two changes from
+    physics_markovian_v1_decision_conditioned_bbox_isolated.yml:
+
+    1. training.literal_teacher_forcing.enabled=true: the next-step history frame is always the
+       raw ground-truth row (get_true_future_features), never the model's own (integrated/
+       physics-refreshed) prediction. There is then no compounding rollout error to manage, so
+       geometry_constraint/hard_wall_containment/stage_handoff/rollout_horizon_schedule are all
+       dropped -- every step is an independent, equally-easy (true state -> predicted target)
+       example, trained at the full horizon from epoch 1. scheduled_sampling is kept at a
+       constant p_truth=1.0 purely so the decision-conditioning signal (condition_velocity_on_
+       decision) also sees the true branch label deterministically, matching the "always true
+       state" spirit everywhere else.
+
+    2. training.neighbor_key_dropout.enabled=true: each present droplet independently has a 20%
+       chance, redrawn per training window and held constant across that whole window (not
+       redrawn per step), of being hidden as an attention KEY for the rest of that window -- it
+       stays a full query (still supervised normally, still sees everyone else), it just can't be
+       attended TO by other droplets. Regularizes against the model over-relying on any one
+       neighbor's presence, and means a later leave-one-out ablation study on this checkpoint
+       ablates an in-distribution input rather than an out-of-distribution one.
+
+    Trained from scratch (not warm-started), since the point is to see what the model learns to
+    rely on absent the rollout-error confound and neighbor-presence crutch, not to reproduce the
+    closed-loop deployment model's behavior. Not meant to ever be rolled out closed-loop -- it has
+    never been trained to correct its own compounding error and would not be usable that way.
+
+dataset:
+  path: outputs/processed/2/canonical_dataset_v2/canonical_dataset_v2.npz
+  stride: 5
+
+model:
+  type: markovian
+  input_dim: 16
+  target_features:
+    - vx
+    - vy
+    - bbox_w
+    - bbox_h
+  input_feature_names:
+    - x
+    - y
+    - vx
+    - vy
+    - bbox_w
+    - bbox_h
+    - cfd_u_norm
+    - cfd_v_norm
+    - superficial_velocity
+    - left_flow_fraction
+    - occupancy_inlet_channel
+    - occupancy_inlet_junction
+    - occupancy_left_branch
+    - occupancy_right_branch
+    - occupancy_outlet_junction
+    - occupancy_outlet_channel
+  T_history: 1
+  rollout_horizon: 50
+  max_droplets: 64
+  architecture:
+    d_model: 128
+    n_heads: 4
+    num_layers: 4
+    dim_feedforward: 512
+    dropout: 0.1
+    predict_branch_decision: true
+    decision_stop_gradient: true  # trunk still isolated from all decision-related gradient
+    condition_velocity_on_decision: true  # Axis 1: motion_head input = concat([h_last, decision_prob])
+    bbox_stop_gradient: true  # bbox_head trains on h_last.detach() -- known-bad bbox labels can't reach the trunk
+
+training:
+  batch_size: 4
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  epochs: 160
+  random_seed: 123
+  num_workers: 0
+  loss_alpha: 0.0  # uniform step weighting -- no compounding rollout error to discount late steps for
+  log_every_n_batches: 25
+  output_dir: outputs/models/physics_markovian_v1_teacher_forced
+  literal_teacher_forcing:
+    enabled: true
+  neighbor_key_dropout:
+    enabled: true
+    probability: 0.2
+  event_exclusion:
+    enabled: true
+    split_events_csv: outputs/evaluation/split_event_scan/split_child_track_events.csv
+    parent_pre_frames: 10
+    parent_post_frames: 25
+    nearby_radius_px: 70.0
+  scheduled_sampling:
+    enabled: true
+    schedule:
+      - start_epoch: 1
+        p_truth: 1.0
+  decision_head:
+    enabled: true
+    loss_weight: 1.0
+    labels_path: outputs/processed/2/canonical_dataset_v2/branch_decision_labels_max20.npz
+    calibration_every_n_epochs: 5
+
+device:
+  mode: auto
+
+smoke_test:
+  train_windows: 8
+  val_windows: 4
+  batch_size: 2
+  epochs: 1
+  optimization_steps: 2
+  rollout_horizon: 3

@@ -18,6 +18,16 @@ import yaml
 from src.models.canonical_rollout_transformer import CanonicalRolloutTransformer
 from src.physics.runtime import load_physics_runtime_context, step as physics_runtime_step
 from src.physics.runtime.state_transition import CANONICAL_RUNTIME_FEATURE_NAMES
+from scripts.training.train_physics_markovian import (
+    build_stale_refresh_frame,
+    denormalize_features,
+    denormalize_targets,
+    get_true_future_features,
+    normalize_features,
+    runtime_prediction_from_model_target,
+    runtime_prediction_mode,
+    runtime_step_batch,
+)
 
 
 DEFAULT_CONFIG = Path("configs/experiments/physics_markovian_v1.yml")
@@ -325,7 +335,10 @@ def rollout_single_droplet(
             device=device,
         )
         with torch.no_grad():
-            pred_norm = model(history_norm.reshape(1, int(model.T_history), max_droplets, feature_dim), history_mask)[0]
+            model_output = model(history_norm.reshape(1, int(model.T_history), max_droplets, feature_dim), history_mask)
+            # Models with condition_velocity_on_decision=True always return a dict (prediction +
+            # decision_logit) even on a plain call; older checkpoints return a bare tensor.
+            pred_norm = (model_output["prediction"] if isinstance(model_output, dict) else model_output)[0]
             pred_phys = denormalize_target(pred_norm, normalization, torch, device).detach().cpu().numpy().astype(np.float32)
         try:
             next_state = physics_runtime_step(state, pred_phys, runtime_context, active_mask=active_mask, prediction_mode=prediction_mode)
@@ -339,6 +352,177 @@ def rollout_single_droplet(
         history = np.concatenate([history[1:], state[None, :, :]], axis=0)
         rows.append(row_from_state(step_index, state[0], feature_index, scenario, runtime_context, runtime_success, source))
     return rows
+
+
+def rollout_droplet_with_context(
+    *,
+    torch,
+    model,
+    batch,
+    dataset,
+    target_slot: int,
+    device,
+    normalization_stats,
+    rollout_length: int,
+    runtime_context,
+    target_parameterization: dict[str, Any],
+    scenario: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[list[dict[str, Any]]]]:
+    """Closed-loop rollout of a real dataset window, reporting per-step rows for one target slot
+    plus predicted-vs-true state for every real droplet present in the window.
+
+    Unlike rollout_single_droplet (which zeros out every other slot, simulating the target
+    completely alone -- a configuration the model essentially never saw during training, since
+    real windows are populated with whatever droplets actually share the frame), this rolls every
+    real droplet present in the window forward together, using the same mechanics
+    boundary_conditioned_rollout / collect_attention_rollout use during training and attention
+    visualization: runtime_step_batch for the closed-loop physics step, build_stale_refresh_frame
+    as a fallback when the runtime step fails, and boundary_mask to seed droplets that enter the
+    window mid-rollout with their true observed state (they have no prior prediction to build
+    from). Every droplet is evolving via its own model prediction and is available to the model's
+    attention exactly as it was during training.
+
+    Returns (rows, all_droplets_frames): rows is the target-slot-only row_from_state list (same
+    contract as before, used for the CSV/summary/crop-bounds pipeline); all_droplets_frames is a
+    parallel list (same length, index-aligned with rows) where each entry is a list of per-droplet
+    dicts (track_id, is_target, pred_x/y/bbox_w/bbox_h, true_x/y/bbox_w/bbox_h, has_ground_truth)
+    for every real, currently-visible droplet at that step.
+    """
+    history = batch["history_x"].clone()
+    history_mask = batch["history_mask"].clone()
+    feature_index = dataset.feature_indices
+    droplet_ids = batch["droplet_ids"][0].detach().cpu().numpy()
+    true_future_features = get_true_future_features(batch, dataset, device, rollout_length)
+
+    initial_phys_all = denormalize_features(history, normalization_stats, device)[0, -1, :, :].detach().cpu().numpy()
+    initial_active = history_mask[0, -1, :].detach().cpu().numpy()
+    initial_phys = initial_phys_all[target_slot]
+    rows = [row_from_state(0, initial_phys, feature_index, scenario, runtime_context, True, "initial_observed_state")]
+    all_droplets_frames = [
+        _multi_droplet_entries(initial_phys_all, initial_phys_all, initial_active, droplet_ids, feature_index, target_slot)
+    ]
+    last_known_target_state = initial_phys.copy()
+
+    for step_index in range(rollout_length):
+        history_phys = denormalize_features(history, normalization_stats, device)
+        last_frame = history_phys[:, -1, :, :]
+        previous_last_mask = history_mask[:, -1, :]
+        new_mask = batch["future_mask"][:, step_index, :]
+
+        with torch.no_grad():
+            model_output = model(history, history_mask)
+            pred_step_norm_raw = model_output["prediction"] if isinstance(model_output, dict) else model_output
+        pred_step_phys_raw = denormalize_targets(pred_step_norm_raw[:, None, :, :], normalization_stats, device)[:, 0, :, :]
+
+        true_step_features = true_future_features[:, step_index, :, :]
+        true_step_features_finite = torch.isfinite(true_step_features).all(dim=-1)
+        continuing_mask = new_mask & previous_last_mask
+        entering_mask = new_mask & ~previous_last_mask
+        boundary_mask = entering_mask & true_step_features_finite
+
+        pred_step_runtime_phys, _pred_step_velocity, _pred_base_fallback_mask = runtime_prediction_from_model_target(
+            pred_step_phys_raw, last_frame, feature_index, target_parameterization, dataset
+        )
+        new_frame_phys = torch.zeros_like(last_frame)
+        refreshed_phys, runtime_success = runtime_step_batch(
+            last_frame,
+            pred_step_runtime_phys,
+            continuing_mask,
+            runtime_context,
+            prediction_mode=runtime_prediction_mode(target_parameterization),
+        )
+        runtime_mask = continuing_mask & runtime_success[:, None]
+        new_frame_phys = torch.where(runtime_mask[:, :, None], refreshed_phys, new_frame_phys)
+        runtime_fallback_rows = continuing_mask.any(dim=1) & ~runtime_success
+        if runtime_fallback_rows.any():
+            stale_frame_phys, _raw_position = build_stale_refresh_frame(
+                last_frame,
+                pred_step_runtime_phys,
+                true_step_features,
+                new_mask,
+                boundary_mask,
+                feature_index,
+                dataset,
+                device,
+                target_parameterization=target_parameterization,
+                refresh_observed_non_target=False,
+            )
+            fallback_mask = new_mask & runtime_fallback_rows[:, None]
+            new_frame_phys = torch.where(fallback_mask[:, :, None], stale_frame_phys, new_frame_phys)
+        new_frame_phys[boundary_mask] = true_step_features[boundary_mask]
+
+        target_valid = bool(new_mask[0, target_slot].detach().cpu())
+        if target_valid:
+            target_state = new_frame_phys[0, target_slot, :].detach().cpu().numpy()
+            last_known_target_state = target_state.copy()
+            target_runtime_success = bool(runtime_mask[0, target_slot].detach().cpu())
+            if target_runtime_success:
+                source = "runtime_closed_loop"
+            elif bool(boundary_mask[0, target_slot].detach().cpu()):
+                source = "boundary_entry_true_state"
+            else:
+                source = "stale_fallback"
+        else:
+            target_state = last_known_target_state
+            target_runtime_success = False
+            source = "target_not_visible_holding_last_known_state"
+        rows.append(
+            row_from_state(step_index + 1, target_state, feature_index, scenario, runtime_context, target_runtime_success, source)
+        )
+        all_droplets_frames.append(
+            _multi_droplet_entries(
+                new_frame_phys[0].detach().cpu().numpy(),
+                true_step_features[0].detach().cpu().numpy(),
+                new_mask[0].detach().cpu().numpy(),
+                droplet_ids,
+                feature_index,
+                target_slot,
+            )
+        )
+
+        new_frame_norm = normalize_features(new_frame_phys, normalization_stats, device)
+        new_frame_norm = torch.where(new_mask[:, :, None], new_frame_norm, torch.zeros_like(new_frame_norm))
+        history = torch.cat([history[:, 1:, :, :], new_frame_norm[:, None, :, :]], dim=1)
+        history_mask = torch.cat([history_mask[:, 1:, :], new_mask[:, None, :]], dim=1)
+
+    return rows, all_droplets_frames
+
+
+def _multi_droplet_entries(
+    pred_phys_frame: np.ndarray,
+    true_phys_frame: np.ndarray,
+    active_mask_frame: np.ndarray,
+    droplet_ids: np.ndarray,
+    feature_index: dict[str, int],
+    target_slot: int,
+) -> list[dict[str, Any]]:
+    x_idx, y_idx, bw_idx, bh_idx = feature_index["x"], feature_index["y"], feature_index["bbox_w"], feature_index["bbox_h"]
+    entries = []
+    for slot in range(pred_phys_frame.shape[0]):
+        track_id = int(droplet_ids[slot])
+        if track_id < 0 or not bool(active_mask_frame[slot]):
+            continue
+        pred_x, pred_y = float(pred_phys_frame[slot, x_idx]), float(pred_phys_frame[slot, y_idx])
+        if not np.isfinite([pred_x, pred_y]).all():
+            continue
+        true_row = true_phys_frame[slot]
+        has_ground_truth = bool(np.isfinite([true_row[x_idx], true_row[y_idx]]).all())
+        entries.append(
+            {
+                "track_id": track_id,
+                "is_target": slot == target_slot,
+                "pred_x": pred_x,
+                "pred_y": pred_y,
+                "pred_bbox_w": float(pred_phys_frame[slot, bw_idx]),
+                "pred_bbox_h": float(pred_phys_frame[slot, bh_idx]),
+                "true_x": float(true_row[x_idx]) if has_ground_truth else float("nan"),
+                "true_y": float(true_row[y_idx]) if has_ground_truth else float("nan"),
+                "true_bbox_w": float(true_row[bw_idx]) if has_ground_truth else float("nan"),
+                "true_bbox_h": float(true_row[bh_idx]) if has_ground_truth else float("nan"),
+                "has_ground_truth": has_ground_truth,
+            }
+        )
+    return entries
 
 
 def normalize_state(history: np.ndarray, normalization: dict[str, Any], torch, device):

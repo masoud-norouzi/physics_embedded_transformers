@@ -125,6 +125,7 @@ class CanonicalRolloutTransformer(nn.Module):
         attention_layer: str | int = "final",
         decision_condition_signal: torch.Tensor | None = None,
         decision_condition_gate: torch.Tensor | None = None,
+        key_visibility_mask: torch.Tensor | None = None,
     ) -> torch.Tensor | dict[str, torch.Tensor | list[torch.Tensor]]:
         B, T, M, F = history_x.shape
         assert T == self.T_history
@@ -138,12 +139,25 @@ class CanonicalRolloutTransformer(nn.Module):
         slot_ids = torch.arange(M, device=history_x.device)
         time_embedding = self.time_embedding(time_ids).view(1, T, 1, self.d_model)
         slot_embedding = self.slot_embedding(slot_ids).view(1, 1, M, self.d_model)
+        # mask_embedding encodes presence only -- it is deliberately unaffected by
+        # key_visibility_mask, which controls attention visibility, not presence.
         mask_embedding = self.mask_embedding(history_mask.long())
 
         h = h + time_embedding + slot_embedding + mask_embedding
         h = h.reshape(B, T * M, self.d_model)
 
-        src_key_padding_mask = (~history_mask).reshape(B, T * M)
+        if key_visibility_mask is None:
+            effective_key_mask = history_mask
+        else:
+            assert key_visibility_mask.shape == (B, T, M)
+            effective_key_mask = history_mask & key_visibility_mask
+            # A droplet hidden as its own (and only) key would leave its query with zero valid
+            # keys -> an all -inf softmax row -> NaN. Fall back to full visibility for that
+            # (batch, timestep) only, rather than propagate NaNs through the rest of training.
+            no_valid_keys = ~effective_key_mask.any(dim=-1, keepdim=True)
+            effective_key_mask = torch.where(no_valid_keys, history_mask, effective_key_mask)
+
+        src_key_padding_mask = (~effective_key_mask).reshape(B, T * M)
         if return_attention:
             h, attention_layers = self.transformer(
                 h,

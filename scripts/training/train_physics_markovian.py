@@ -312,6 +312,21 @@ def main(argv: list[str] | None = None) -> None:
             f"loss_weight={branch_decision.loss_weight} "
             f"decision_stop_gradient={getattr(model, 'decision_stop_gradient', None)}"
         )
+    literal_teacher_forcing = literal_teacher_forcing_enabled(config)
+    neighbor_key_dropout_probability = neighbor_key_dropout_probability_from_config(config)
+    if literal_teacher_forcing:
+        print(
+            "literal_teacher_forcing: enabled (physics/integration bypassed -- next-step history "
+            "is always the raw ground-truth row)"
+        )
+        if geometry_constraint is not None or hard_wall_containment is not None:
+            raise ValueError(
+                "literal_teacher_forcing is enabled together with geometry_constraint/"
+                "hard_wall_containment, which act on integrated/clamped positions that this mode "
+                "never produces -- disable both in the config."
+            )
+    if neighbor_key_dropout_probability > 0.0:
+        print(f"neighbor_key_dropout: enabled probability={neighbor_key_dropout_probability}")
 
     initial_runtime_context = runtime_context_for_epoch(config, 1, runtime_context)
     print(f"shape_test physics_refresh={physics_refresh_mode(initial_runtime_context)}")
@@ -329,6 +344,7 @@ def main(argv: list[str] | None = None) -> None:
         target_deadband,
         event_exclusion,
         branch_decision=branch_decision,
+        literal_teacher_forcing=literal_teacher_forcing,
     )
 
     decision_calibration_every_n_epochs = int(
@@ -356,6 +372,8 @@ def main(argv: list[str] | None = None) -> None:
             model_config=model_config,
             output_dir=output_dir,
             branch_decision=branch_decision,
+            literal_teacher_forcing=literal_teacher_forcing,
+            neighbor_key_dropout_probability=neighbor_key_dropout_probability,
         )
         smoke_summary["runtime_seconds"] = time.perf_counter() - start_time
         save_json(output_dir / "smoke_test_summary.json", smoke_summary)
@@ -383,6 +401,8 @@ def main(argv: list[str] | None = None) -> None:
         start_epoch=start_epoch,
         branch_decision=branch_decision,
         decision_calibration_every_n_epochs=decision_calibration_every_n_epochs,
+        literal_teacher_forcing=literal_teacher_forcing,
+        neighbor_key_dropout_probability=neighbor_key_dropout_probability,
     )
 
 
@@ -770,6 +790,7 @@ def run_shape_test(
     target_deadband: dict[str, Any] | None = None,
     event_exclusion: EventExclusion | None = None,
     branch_decision: "BranchDecisionTraining | None" = None,
+    literal_teacher_forcing: bool = False,
 ) -> None:
     model.eval()
     batch = move_batch_to_device(next(iter(train_loader)), device)
@@ -787,6 +808,7 @@ def run_shape_test(
             target_deadband=target_deadband,
             event_exclusion=event_exclusion,
             branch_decision=branch_decision,
+            literal_teacher_forcing=literal_teacher_forcing,
         )
     print(f"history_x:       {tuple(batch['history_x'].shape)}")
     print(f"history_mask:    {tuple(batch['history_mask'].shape)}")
@@ -824,6 +846,8 @@ def run_smoke_test(
     output_dir: Path,
     branch_decision: "BranchDecisionTraining | None" = None,
     loss_key: str = "total_loss",
+    literal_teacher_forcing: bool = False,
+    neighbor_key_dropout_probability: float = 0.0,
 ) -> dict[str, Any]:
     scheduled_sampling = create_scheduled_sampling(config)
     p_truth = p_truth_for_epoch(scheduled_sampling, epoch=1)
@@ -847,6 +871,8 @@ def run_smoke_test(
         target_parameterization=target_parameterization,
         target_deadband=target_deadband,
         event_exclusion=event_exclusion,
+        literal_teacher_forcing=literal_teacher_forcing,
+        neighbor_key_dropout_probability=neighbor_key_dropout_probability,
     )
     val_summary = evaluate(
         model=model,
@@ -865,6 +891,7 @@ def run_smoke_test(
         target_parameterization=target_parameterization,
         target_deadband=target_deadband,
         event_exclusion=event_exclusion,
+        literal_teacher_forcing=literal_teacher_forcing,
     )
     checkpoint_path = output_dir / "latest_checkpoint.pt"
     checkpoint = build_checkpoint(
@@ -897,6 +924,7 @@ def run_smoke_test(
             target_parameterization=target_parameterization,
             target_deadband=target_deadband,
             event_exclusion=event_exclusion,
+            literal_teacher_forcing=literal_teacher_forcing,
         )
     assert torch.isfinite(rollout["weighted_loss_internal_only"])
     assert torch.isfinite(rollout["total_loss"])
@@ -938,6 +966,8 @@ def train_full(
     branch_decision: BranchDecisionTraining | None = None,
     loss_key: str = "total_loss",
     decision_calibration_every_n_epochs: int = 5,
+    literal_teacher_forcing: bool = False,
+    neighbor_key_dropout_probability: float = 0.0,
 ) -> None:
     curves_csv_path = output_dir / "training_curves.csv"
     initialize_curves_csv(curves_csv_path)
@@ -995,6 +1025,8 @@ def train_full(
             target_parameterization=target_parameterization,
             target_deadband=target_deadband,
             event_exclusion=event_exclusion,
+            literal_teacher_forcing=literal_teacher_forcing,
+            neighbor_key_dropout_probability=neighbor_key_dropout_probability,
         )
         train_summary["active_rollout_horizon"] = float(active_rollout_horizon)
         train_summary["scheduled_sampling_p_truth"] = float(active_p_truth) if active_p_truth is not None else 0.0
@@ -1014,9 +1046,13 @@ def train_full(
             target_parameterization=target_parameterization,
             target_deadband=target_deadband,
             event_exclusion=event_exclusion,
+            literal_teacher_forcing=literal_teacher_forcing,
         )
         val_summary["active_rollout_horizon"] = float(active_rollout_horizon)
-        if active_p_truth is None:
+        if active_p_truth is None or literal_teacher_forcing:
+            # Under literal_teacher_forcing there is no physics/integration step for p_truth=0
+            # to diverge through, so the free-rollout diagnostic below would just reproduce
+            # val_summary -- skip the redundant extra pass over val_loader.
             val_pure_summary = dict(val_summary)
         else:
             # Free rollout (p_truth=0): the diagnostic that actually matters -- how the model
@@ -1037,6 +1073,7 @@ def train_full(
                 target_parameterization=target_parameterization,
                 target_deadband=target_deadband,
                 event_exclusion=event_exclusion,
+                literal_teacher_forcing=literal_teacher_forcing,
             )
             val_pure_summary["active_rollout_horizon"] = float(active_rollout_horizon)
         val_summary["pure"] = val_pure_summary
@@ -1116,6 +1153,8 @@ def train_one_epoch(
     target_parameterization: dict[str, Any] | None = None,
     target_deadband: dict[str, Any] | None = None,
     event_exclusion: EventExclusion | None = None,
+    literal_teacher_forcing: bool = False,
+    neighbor_key_dropout_probability: float = 0.0,
 ) -> dict[str, float]:
     model.train()
     total_optimization_loss = 0.0
@@ -1140,6 +1179,12 @@ def train_one_epoch(
     for batch in loader:
         batch = move_batch_to_device(batch, device)
         optimizer.zero_grad(set_to_none=True)
+        key_visibility_mask = sample_neighbor_key_dropout_mask(
+            batch_size=batch["history_mask"].shape[0],
+            max_droplets=batch["history_mask"].shape[2],
+            probability=neighbor_key_dropout_probability,
+            device=device,
+        )
         rollout = boundary_conditioned_rollout(
             model,
             batch,
@@ -1154,6 +1199,8 @@ def train_one_epoch(
             target_parameterization=target_parameterization,
             target_deadband=target_deadband,
             event_exclusion=event_exclusion,
+            literal_teacher_forcing=literal_teacher_forcing,
+            key_visibility_mask=key_visibility_mask,
         )
         loss = rollout[loss_key]
         loss.backward()
@@ -1226,6 +1273,7 @@ def evaluate(
     target_parameterization: dict[str, Any] | None = None,
     target_deadband: dict[str, Any] | None = None,
     event_exclusion: EventExclusion | None = None,
+    literal_teacher_forcing: bool = False,
 ) -> dict[str, Any]:
     model.eval()
     total_optimization_loss = 0.0
@@ -1269,6 +1317,7 @@ def evaluate(
                 target_parameterization=target_parameterization,
                 target_deadband=target_deadband,
                 event_exclusion=event_exclusion,
+                literal_teacher_forcing=literal_teacher_forcing,
             )
             total_optimization_loss += float(rollout["total_loss"].detach().cpu())
             total_loss += float(rollout["weighted_loss_internal_only"].detach().cpu())
@@ -1451,6 +1500,41 @@ def scheduled_sampling_enabled(config: dict[str, Any]) -> bool:
     return bool(config.get("training", {}).get("scheduled_sampling", {}).get("enabled", False))
 
 
+def literal_teacher_forcing_enabled(config: dict[str, Any]) -> bool:
+    """True history/next-frame is always the raw ground-truth row, never the model's own
+    (integrated/physics-refreshed) prediction -- see boundary_conditioned_rollout's
+    literal_teacher_forcing param. Diagnostic-only training mode; not meant for closed-loop
+    deployment, so callers should not also enable hard_wall_containment/geometry_constraint."""
+    return bool(config.get("training", {}).get("literal_teacher_forcing", {}).get("enabled", False))
+
+
+def neighbor_key_dropout_probability_from_config(config: dict[str, Any]) -> float:
+    """Per-slot probability (train-only) that a droplet is hidden as an attention KEY for the
+    whole training window -- it stays a full query (still supervised, still sees everyone else),
+    it just can't be attended TO by others. Regularizes against over-relying on any one neighbor
+    being present. 0.0 (default) reproduces exactly today's behavior."""
+    section = config.get("training", {}).get("neighbor_key_dropout", {})
+    if not bool(section.get("enabled", False)):
+        return 0.0
+    probability = float(section.get("probability", 0.0))
+    if not 0.0 <= probability <= 1.0:
+        raise ValueError(f"neighbor_key_dropout probability must be in [0, 1], got {probability}")
+    return probability
+
+
+def sample_neighbor_key_dropout_mask(
+    batch_size: int, max_droplets: int, probability: float, device, generator: torch.Generator | None = None
+) -> torch.Tensor | None:
+    """(B, M) bool, True = usable as an attention key this window. Sampled once per training
+    batch and held constant across the whole rollout (see boundary_conditioned_rollout's
+    key_visibility_mask param) -- a droplet chosen to be hidden stays hidden for its whole
+    window, matching the "consistent per track" design rather than flickering every step."""
+    if probability <= 0.0:
+        return None
+    keep_probability = 1.0 - probability
+    return torch.rand((batch_size, max_droplets), device=device, generator=generator) < keep_probability
+
+
 def create_branch_decision_training(config: dict[str, Any]) -> BranchDecisionTraining | None:
     section = config.get("training", {}).get("decision_head", {})
     if not bool(section.get("enabled", False)):
@@ -1485,10 +1569,23 @@ def boundary_conditioned_rollout(
     target_parameterization: dict[str, Any] | None = None,
     target_deadband: dict[str, Any] | None = None,
     event_exclusion: EventExclusion | None = None,
+    literal_teacher_forcing: bool = False,
+    key_visibility_mask: torch.Tensor | None = None,
 ):
+    """literal_teacher_forcing bypasses the physics runtime/integration entirely: the next-step
+    history frame is always the raw ground-truth row (get_true_future_features), never the model's
+    own (clamped/integrated) prediction. There is then no compounding rollout error to manage, so
+    callers should pair this with geometry_constraint=None/hard_wall_containment=None.
+
+    key_visibility_mask, if given, is (B, M) bool (True = usable as an attention KEY), constant
+    across the whole rollout window -- it does not affect which droplets are valid queries/get
+    supervised, only which droplets other droplets can attend to."""
     device = batch["history_x"].device
     rollout_history = batch["history_x"].clone()
     history_mask = batch["history_mask"].clone()
+    key_visibility_mask_expanded = (
+        None if key_visibility_mask is None else key_visibility_mask[:, None, :].expand(-1, rollout_history.shape[1], -1)
+    )
 
     pred_targets_norm = []
     true_targets_norm = []
@@ -1550,13 +1647,16 @@ def boundary_conditioned_rollout(
                     return_decision=True,
                     decision_condition_signal=conditioning_signal,
                     decision_condition_gate=conditioning_gate,
+                    key_visibility_mask=key_visibility_mask_expanded,
                 )
             else:
-                model_output = model(rollout_history, history_mask, return_decision=True)
+                model_output = model(
+                    rollout_history, history_mask, return_decision=True, key_visibility_mask=key_visibility_mask_expanded
+                )
             pred_step_norm_raw = model_output["prediction"]
             decision_logit_step = model_output["decision_logit"]
         else:
-            pred_step_norm_raw = model(rollout_history, history_mask)
+            pred_step_norm_raw = model(rollout_history, history_mask, key_visibility_mask=key_visibility_mask_expanded)
             decision_logit_step = None
         pred_step_phys_raw = denormalize_targets(
             pred_step_norm_raw[:, None, :, :],
@@ -1620,7 +1720,22 @@ def boundary_conditioned_rollout(
         )
 
         position_index = [feature_index["x"], feature_index["y"]]
-        if runtime_context is None:
+        if literal_teacher_forcing:
+            # No physics/integration at all -- the next-step frame is exactly the ground-truth
+            # row wherever a droplet is present this step (new_mask), zero elsewhere (consistent
+            # with the zero-padding convention new_frame_phys/rollout_history use everywhere else).
+            # new_mask (future_mask) only guarantees the TARGET dims (vx, vy, bbox_w, bbox_h) are
+            # finite -- other input columns (CFD/occupancy) can still be NaN for a present droplet,
+            # so fall back to last_frame per-feature (guaranteed finite by induction: history is
+            # always either real data or zero-padding, never NaN) rather than propagate NaN into
+            # history, exactly mirroring refresh_observed_non_target_features's stale-hold pattern.
+            true_step_features_finite_per_feature = torch.isfinite(true_step_features)
+            safe_true_step_features = torch.where(
+                true_step_features_finite_per_feature, true_step_features, last_frame
+            )
+            new_frame_phys = torch.where(new_mask[:, :, None], safe_true_step_features, torch.zeros_like(true_step_features))
+            raw_position_phys = safe_true_step_features[:, :, position_index]
+        elif runtime_context is None:
             new_frame_phys, raw_position_phys = build_stale_refresh_frame(
                 last_frame,
                 target_for_rollout_phys,

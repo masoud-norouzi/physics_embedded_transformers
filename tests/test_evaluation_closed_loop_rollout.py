@@ -100,7 +100,7 @@ class _ConstantPredictionModel(torch.nn.Module):
         self.register_buffer("prediction", torch.as_tensor(prediction, dtype=torch.float32))
         self.seen_history = []
 
-    def forward(self, history_x, history_mask):
+    def forward(self, history_x, history_mask, key_visibility_mask=None):
         self.seen_history.append(history_x.detach().clone())
         B, _, M, _ = history_x.shape
         return self.prediction.view(1, 1, -1).expand(B, M, -1).clone()
