@@ -60,6 +60,11 @@ DIAGNOSTIC_STEPS = (1, 5, 10, 20, 30, 40, 50)
 RUNTIME_TARGET_FEATURES = ("vx", "vy", "bbox_w", "bbox_h")
 VELOCITY_TARGET_FEATURES = ("vx", "vy", "bbox_w", "bbox_h")
 POSITION_TARGET_FEATURES = ("x", "y", "bbox_w", "bbox_h")
+# bbox-less velocity targets -- only valid under literal_teacher_forcing, where bbox is never
+# predicted (it's always taken straight from ground truth, per boundary_conditioned_rollout's
+# literal_teacher_forcing branch) and there is no closed-loop physics/occupancy step that would
+# otherwise need a predicted bbox to compute the next step's occupancy features.
+VELOCITY_ONLY_TARGET_FEATURES = ("vx", "vy")
 CURVES_COLUMNS = [
     "epoch",
     "active_rollout_horizon",
@@ -191,6 +196,7 @@ def main(argv: list[str] | None = None) -> None:
     config = load_config(args.config)
     if args.smoke_test:
         apply_smoke_test_overrides(config)
+    literal_teacher_forcing = literal_teacher_forcing_enabled(config)
 
     set_random_seed(int(config["training"]["random_seed"]))
     output_dir = Path(config["training"]["output_dir"])
@@ -214,7 +220,7 @@ def main(argv: list[str] | None = None) -> None:
         target_features=tuple(config["model"]["target_features"]),
         experiment_config=config["dataset"].get("experiment_config", "configs/experiments/video_2.yml"),
     )
-    validate_feature_contract(train_ds, config)
+    validate_feature_contract(train_ds, config, literal_teacher_forcing)
     target_parameterization = target_parameterization_from_config(config)
     target_deadband = target_deadband_from_config(config)
     event_exclusion = event_exclusion_from_config(config)
@@ -312,7 +318,6 @@ def main(argv: list[str] | None = None) -> None:
             f"loss_weight={branch_decision.loss_weight} "
             f"decision_stop_gradient={getattr(model, 'decision_stop_gradient', None)}"
         )
-    literal_teacher_forcing = literal_teacher_forcing_enabled(config)
     neighbor_key_dropout_probability = neighbor_key_dropout_probability_from_config(config)
     if literal_teacher_forcing:
         print(
@@ -329,7 +334,7 @@ def main(argv: list[str] | None = None) -> None:
         print(f"neighbor_key_dropout: enabled probability={neighbor_key_dropout_probability}")
 
     initial_runtime_context = runtime_context_for_epoch(config, 1, runtime_context)
-    print(f"shape_test physics_refresh={physics_refresh_mode(initial_runtime_context)}")
+    print(f"shape_test physics_refresh={physics_refresh_mode(initial_runtime_context, literal_teacher_forcing)}")
     run_shape_test(
         model,
         train_loader,
@@ -566,13 +571,20 @@ def set_random_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def validate_feature_contract(dataset, config: dict[str, Any]) -> None:
+def validate_feature_contract(dataset, config: dict[str, Any], literal_teacher_forcing: bool = False) -> None:
     if dataset.feature_names != list(config["model"]["input_feature_names"]):
         raise ValueError("Dataset feature order does not match the physics Markovian config.")
     if len(dataset.feature_names) != int(config["model"]["input_dim"]):
         raise ValueError("Dataset feature count does not match configured input_dim.")
     target_features = tuple(config["model"]["target_features"])
-    if dataset.feature_names == FEATURE_NAMES and target_features not in {RUNTIME_TARGET_FEATURES, SPEED_ANGLE_TARGET_FEATURES, POSITION_TARGET_FEATURES}:
+    if literal_teacher_forcing:
+        if target_features not in {RUNTIME_TARGET_FEATURES, SPEED_ANGLE_TARGET_FEATURES, POSITION_TARGET_FEATURES, VELOCITY_ONLY_TARGET_FEATURES}:
+            raise ValueError(
+                f"Unsupported target_features under literal_teacher_forcing: {target_features}. Expected one of "
+                f"{RUNTIME_TARGET_FEATURES}, {SPEED_ANGLE_TARGET_FEATURES}, {POSITION_TARGET_FEATURES}, or "
+                f"{VELOCITY_ONLY_TARGET_FEATURES}."
+            )
+    elif dataset.feature_names == FEATURE_NAMES and target_features not in {RUNTIME_TARGET_FEATURES, SPEED_ANGLE_TARGET_FEATURES, POSITION_TARGET_FEATURES}:
         raise ValueError(
             "Closed-loop physics rollout requires target_features to be either "
             f"{RUNTIME_TARGET_FEATURES}, {SPEED_ANGLE_TARGET_FEATURES}, or {POSITION_TARGET_FEATURES}, got {target_features}."
@@ -592,6 +604,8 @@ def target_parameterization_from_config(config: dict[str, Any]) -> dict[str, Any
             "max_angular_correction": float(parameterization.get("max_angular_correction_radians", np.pi)),
         }
     if target_features == VELOCITY_TARGET_FEATURES:
+        return {"mode": "velocity"}
+    if target_features == VELOCITY_ONLY_TARGET_FEATURES:
         return {"mode": "velocity"}
     if target_features == POSITION_TARGET_FEATURES:
         mode = str(parameterization.get("mode", "position"))
@@ -1002,7 +1016,7 @@ def train_full(
         active_p_truth = p_truth_for_epoch(scheduled_sampling, epoch)
         print(
             f"epoch {epoch:03d} "
-            f"physics_refresh={physics_refresh_mode(active_runtime_context)} "
+            f"physics_refresh={physics_refresh_mode(active_runtime_context, literal_teacher_forcing)} "
             f"rollout_horizon={active_rollout_horizon} "
             f"p_truth={active_p_truth if active_p_truth is not None else 'n/a'}"
         )
@@ -1706,18 +1720,23 @@ def boundary_conditioned_rollout(
                     true_frames_until_commit[:, step_index, :][decision_mask].detach()
                 )
 
-        true_rollout_target_phys = true_rollout_target_for_parameterization(
-            true_step_features,
-            true_step_velocity,
-            feature_index,
-            target_parameterization,
-        )
-        target_for_rollout_phys = sample_rollout_targets(
-            pred_step_runtime_phys,
-            true_rollout_target_phys,
-            continuing_mask,
-            None if target_parameterization.get("mode") == "speed_angle_correction" else p_truth,
-        )
+        if not literal_teacher_forcing:
+            # true_rollout_target_for_parameterization hardcodes a [vx, vy, bbox_w, bbox_h] shape
+            # (assumes bbox is always part of the target), which breaks if target_features drops
+            # bbox -- safe to skip entirely here since its only consumer, target_for_rollout_phys,
+            # feeds the physics-integration path below, which literal_teacher_forcing bypasses.
+            true_rollout_target_phys = true_rollout_target_for_parameterization(
+                true_step_features,
+                true_step_velocity,
+                feature_index,
+                target_parameterization,
+            )
+            target_for_rollout_phys = sample_rollout_targets(
+                pred_step_runtime_phys,
+                true_rollout_target_phys,
+                continuing_mask,
+                None if target_parameterization.get("mode") == "speed_angle_correction" else p_truth,
+            )
 
         position_index = [feature_index["x"], feature_index["y"]]
         if literal_teacher_forcing:
@@ -2557,6 +2576,7 @@ def new_accumulator():
         "sum_sq_vx": 0.0,
         "sum_sq_vy": 0.0,
         "sum_sq_speed": 0.0,
+        "bbox_count": 0,
         "sum_sq_bbox_w": 0.0,
         "sum_sq_bbox_h": 0.0,
         "position_count": 0,
@@ -2566,7 +2586,11 @@ def new_accumulator():
 
 def update_metric_accumulators(accumulators, rollout):
     velocity_error = rollout["pred_velocity"] - rollout["true_velocity"]
-    bbox_error = rollout["pred_target"][..., 2:4] - rollout["true_target"][..., 2:4]
+    # bbox_w/bbox_h are only the last two target dims for the 4-dim target parameterizations --
+    # under VELOCITY_ONLY_TARGET_FEATURES (target_dim=2, e.g. literal_teacher_forcing configs
+    # that take bbox straight from ground truth instead of predicting it) there is no bbox slice
+    # to compute an error against at all.
+    bbox_error = rollout["pred_target"][..., 2:4] - rollout["true_target"][..., 2:4] if rollout["pred_target"].shape[-1] >= 4 else None
     speed_error = torch.sqrt(velocity_error[..., 0] ** 2 + velocity_error[..., 1] ** 2)
     position_error = rollout["pred_position"] - rollout["true_position"]
     position_error_norm = torch.sqrt(position_error[..., 0] ** 2 + position_error[..., 1] ** 2)
@@ -2584,7 +2608,7 @@ def update_metric_accumulators(accumulators, rollout):
         update_one_accumulator(
             accumulators["steps"][step_index],
             velocity_error[:, step_index, :, :],
-            bbox_error[:, step_index, :, :],
+            bbox_error[:, step_index, :, :] if bbox_error is not None else None,
             speed_error[:, step_index, :],
             rollout["supervision_mask"][:, step_index, :],
             position_error_norm[:, step_index, :],
@@ -2597,15 +2621,17 @@ def update_one_accumulator(accumulator, velocity_error, bbox_error, speed_error,
     if valid.sum().item() > 0:
         vx_error = velocity_error[..., 0][valid]
         vy_error = velocity_error[..., 1][valid]
-        bbox_w_error = bbox_error[..., 0][valid]
-        bbox_h_error = bbox_error[..., 1][valid]
         speed = speed_error[valid]
         accumulator["count"] += int(valid.sum().item())
         accumulator["sum_sq_vx"] += float((vx_error**2).sum().detach().cpu())
         accumulator["sum_sq_vy"] += float((vy_error**2).sum().detach().cpu())
         accumulator["sum_sq_speed"] += float((speed**2).sum().detach().cpu())
-        accumulator["sum_sq_bbox_w"] += float((bbox_w_error**2).sum().detach().cpu())
-        accumulator["sum_sq_bbox_h"] += float((bbox_h_error**2).sum().detach().cpu())
+        if bbox_error is not None:
+            bbox_w_error = bbox_error[..., 0][valid]
+            bbox_h_error = bbox_error[..., 1][valid]
+            accumulator["bbox_count"] += int(valid.sum().item())
+            accumulator["sum_sq_bbox_w"] += float((bbox_w_error**2).sum().detach().cpu())
+            accumulator["sum_sq_bbox_h"] += float((bbox_h_error**2).sum().detach().cpu())
     valid_position = position_mask.bool()
     if valid_position.sum().item() > 0:
         position = position_error_norm[valid_position]
@@ -2615,6 +2641,7 @@ def update_one_accumulator(accumulator, velocity_error, bbox_error, speed_error,
 
 def metrics_from_accumulator(accumulator):
     count = accumulator["count"]
+    bbox_count = accumulator["bbox_count"]
     position_count = accumulator["position_count"]
     return {
         "valid_samples": count,
@@ -2622,8 +2649,8 @@ def metrics_from_accumulator(accumulator):
         "rmse_vx": safe_rmse(accumulator["sum_sq_vx"], count),
         "rmse_vy": safe_rmse(accumulator["sum_sq_vy"], count),
         "rmse_speed": safe_rmse(accumulator["sum_sq_speed"], count),
-        "rmse_bbox_w": safe_rmse(accumulator["sum_sq_bbox_w"], count),
-        "rmse_bbox_h": safe_rmse(accumulator["sum_sq_bbox_h"], count),
+        "rmse_bbox_w": safe_rmse(accumulator["sum_sq_bbox_w"], bbox_count),
+        "rmse_bbox_h": safe_rmse(accumulator["sum_sq_bbox_h"], bbox_count),
         "rmse_position": safe_rmse(accumulator["sum_sq_position"], position_count),
     }
 
@@ -2793,7 +2820,13 @@ def move_optimizer_state_to_device(optimizer, device) -> None:
 
 
 
-def physics_refresh_mode(runtime_context) -> str:
+def physics_refresh_mode(runtime_context, literal_teacher_forcing: bool = False) -> str:
+    # literal_teacher_forcing bypasses runtime_context entirely regardless of whether an object is
+    # passed down -- a non-None runtime_context is kept alive in that mode only so
+    # should_update_best_checkpoint's "runtime_context is None -> never save best" gate still works,
+    # not because physics is actually being invoked. Report that accurately rather than "runtime".
+    if literal_teacher_forcing:
+        return "bypassed (literal_teacher_forcing)"
     return "runtime" if runtime_context is not None else "stale"
 
 

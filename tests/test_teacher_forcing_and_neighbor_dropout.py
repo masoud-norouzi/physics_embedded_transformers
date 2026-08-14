@@ -310,6 +310,68 @@ def test_literal_teacher_forcing_falls_back_to_last_frame_for_nan_non_target_fea
     assert torch.isfinite(rollout["pred_position"]).all()
 
 
+def test_target_parameterization_from_config_accepts_velocity_only_targets() -> None:
+    config = {"model": {"target_features": ["vx", "vy"]}}
+    assert trainer.target_parameterization_from_config(config) == {"mode": "velocity"}
+
+
+def test_validate_feature_contract_velocity_only_requires_literal_teacher_forcing(tmp_path: Path) -> None:
+    dataset, _ = _rollout_batch(tmp_path)  # dataset.feature_names == V2_FEATURES == FEATURE_NAMES
+    config = {
+        "model": {
+            "input_feature_names": V2_FEATURES,
+            "input_dim": len(V2_FEATURES),
+            "target_features": ["vx", "vy"],
+        }
+    }
+    # Without literal_teacher_forcing, bbox-less targets hit the "closed-loop physics rollout"
+    # contract check (that path needs a predicted bbox to compute occupancy) and must be rejected.
+    with pytest.raises(ValueError, match="Closed-loop physics rollout requires"):
+        trainer.validate_feature_contract(dataset, config, literal_teacher_forcing=False)
+    # Under literal_teacher_forcing, that contract doesn't apply -- bbox-less targets are fine.
+    trainer.validate_feature_contract(dataset, config, literal_teacher_forcing=True)
+
+    with pytest.raises(ValueError, match="Unsupported target_features under literal_teacher_forcing"):
+        trainer.validate_feature_contract(
+            dataset,
+            {"model": {**config["model"], "target_features": ["vx"]}},
+            literal_teacher_forcing=True,
+        )
+
+
+def test_boundary_conditioned_rollout_velocity_only_targets_no_bbox_crash(tmp_path: Path) -> None:
+    npz = _write_npz(tmp_path / "no_bbox_target.npz", V2_FEATURES)
+    dataset = CanonicalWindowDataset(
+        npz,
+        start_frames=[0],
+        T_history=1,
+        T_future=3,
+        max_droplets=4,
+        target_features=("vx", "vy"),
+    )
+    batch = trainer.move_batch_to_device(next(iter(DataLoader(dataset, batch_size=1))), torch.device("cpu"))
+    stats = _identity_stats(16, target_dim=2)
+    weights = trainer.rollout_weights(3, 0.0, torch.device("cpu"))
+    model = _model(seed=9, target_dim=2, bbox_stop_gradient=False)
+
+    rollout = trainer.boundary_conditioned_rollout(
+        model, batch, dataset, stats, weights, runtime_context=None, literal_teacher_forcing=True
+    )
+    assert rollout["pred_target"].shape[-1] == 2
+    assert torch.isfinite(rollout["weighted_loss_internal_only"])
+
+    # update_metric_accumulators/update_one_accumulator must not crash on a bbox-less target, and
+    # must report bbox RMSE as NaN (not 0.0, which would misleadingly imply perfect prediction)
+    # rather than silently reusing the vx/vy sample count as the bbox denominator.
+    accumulators = trainer.create_accumulators(int(weights.numel()))
+    trainer.update_metric_accumulators(accumulators, rollout)
+    metrics = trainer.metrics_from_accumulator(accumulators["overall"])
+    assert np.isnan(metrics["rmse_bbox_w"])
+    assert np.isnan(metrics["rmse_bbox_h"])
+    assert np.isfinite(metrics["rmse_vx"])
+    assert np.isfinite(metrics["rmse_vy"])
+
+
 def test_literal_teacher_forcing_skips_runtime_step_even_if_runtime_context_given(tmp_path: Path) -> None:
     dataset, batch = _rollout_batch(tmp_path)
     stats = _identity_stats(16, target_dim=4)

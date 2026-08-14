@@ -1,7 +1,7 @@
 experiment:
   id: physics_markovian_v1_teacher_forced
   description: >
-    Diagnostic-only training track, not a deployment candidate. Two changes from
+    Diagnostic-only training track, not a deployment candidate. Three changes from
     physics_markovian_v1_decision_conditioned_bbox_isolated.yml:
 
     1. training.literal_teacher_forcing.enabled=true: the next-step history frame is always the
@@ -22,6 +22,13 @@ experiment:
        neighbor's presence, and means a later leave-one-out ablation study on this checkpoint
        ablates an in-distribution input rather than an out-of-distribution one.
 
+    3. model.target_features drops bbox_w/bbox_h (now just [vx, vy], target_dim=2). Under
+       literal_teacher_forcing there is no closed-loop occupancy/physics step that ever needs a
+       *predicted* bbox to keep the rollout going (real bbox is always taken from ground truth
+       instead) -- so bbox_stop_gradient is also turned off here (it requires target_dim > 2 and
+       has nothing to isolate anymore, since bbox is not a training target at all). bbox stays in
+       input_feature_names as before -- the model still sees it, it just never has to predict it.
+
     Trained from scratch (not warm-started), since the point is to see what the model learns to
     rely on absent the rollout-error confound and neighbor-presence crutch, not to reproduce the
     closed-loop deployment model's behavior. Not meant to ever be rolled out closed-loop -- it has
@@ -37,8 +44,12 @@ model:
   target_features:
     - vx
     - vy
-    - bbox_w
-    - bbox_h
+    # bbox_w/bbox_h deliberately NOT a training target here: under literal_teacher_forcing the
+    # next-step frame is always the raw ground-truth row (bbox included), so there is no
+    # closed-loop physics/occupancy step that would need a *predicted* bbox to keep going --
+    # bbox is only ever needed as an INPUT feature (still in input_feature_names below), never as
+    # something this model has to output. See VELOCITY_ONLY_TARGET_FEATURES in
+    # train_physics_markovian.py.
   input_feature_names:
     - x
     - y
@@ -57,7 +68,7 @@ model:
     - occupancy_outlet_junction
     - occupancy_outlet_channel
   T_history: 1
-  rollout_horizon: 50
+  rollout_horizon: 40
   max_droplets: 64
   architecture:
     d_model: 128
@@ -68,7 +79,7 @@ model:
     predict_branch_decision: true
     decision_stop_gradient: true  # trunk still isolated from all decision-related gradient
     condition_velocity_on_decision: true  # Axis 1: motion_head input = concat([h_last, decision_prob])
-    bbox_stop_gradient: true  # bbox_head trains on h_last.detach() -- known-bad bbox labels can't reach the trunk
+    bbox_stop_gradient: false  # N/A here -- requires target_dim > 2, and bbox isn't a target at all in this config
 
 training:
   batch_size: 4
