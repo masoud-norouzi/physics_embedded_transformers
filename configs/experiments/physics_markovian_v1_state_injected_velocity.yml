@@ -1,0 +1,120 @@
+experiment:
+  id: physics_markovian_v1_state_injected_velocity
+  description: >
+    Diagnostic-only training track, not a deployment candidate. Replaces the earlier (now removed)
+    fully-teacher-forced track: that version injected true vx,vy every step too, which made the
+    "prediction" trivially copyable from context. This version keeps position/context grounded in
+    reality but always makes the model commit to its own velocity belief:
+
+    1. training.state_injected_rollout.enabled=true: x, y, and every non-velocity feature (CFD,
+       occupancy, superficial_velocity, left_flow_fraction) are always the raw ground-truth row
+       (get_true_future_features) at every step -- position never drifts. vx, vy are the deliberate
+       exception: for a droplet already present last step, the next-step vx,vy input is always the
+       model's OWN prediction from this step, never injected from truth. A droplet newly entering
+       the window has no prior own-prediction to reuse (and injecting its true vx,vy would leak
+       ground truth through that one remaining gap), so it's seeded from a precomputed
+       typical_inlet_velocity instead (mean vx,vy observed in the inlet channel/junction regions --
+       droplets there haven't yet diverged toward a branch and move at fairly uniform speed).
+       No geometry_constraint/hard_wall_containment/stage_handoff/rollout_horizon_schedule --
+       position never needs clamping/integration in this mode. scheduled_sampling is left disabled
+       (p_truth=None throughout) so the decision-conditioning signal also always falls back to the
+       model's own decision belief, matching "always own prediction" everywhere, not just velocity.
+       loss_alpha=0.0 (uniform step weighting) is deliberate here too: since velocity does now
+       genuinely compound step to step (unlike the fully-injected version), the point of this
+       config is to see that compounding directly, not discount it away.
+
+    2. model.input_feature_names drops bbox_w/bbox_h (16 -> 14 features, input_dim=14). bbox is not
+       fed to the model at all in this config -- validate_feature_contract allows input_feature_names
+       to be an ordered subset of the dataset's full feature set specifically under
+       state_injected_rollout; the sliced-out columns are still available internally (for ground-
+       truth injection bookkeeping) via the dataset's own full-width Z array, they're just never
+       part of what reaches the transformer. bbox is not a training target either (target_features
+       is [vx, vy] only, as it already was for the removed teacher-forced track), so
+       bbox_stop_gradient is off (nothing to isolate).
+
+    3. training.neighbor_key_dropout stays enabled (kept from the removed track, unchanged): each
+       present droplet independently has a 20% chance, drawn once per training window and held
+       constant across that window, of being hidden as an attention KEY -- still a full query,
+       still supervised normally, just invisible to other droplets' attention.
+
+    Trained from scratch (not warm-started) and never meant for closed-loop deployment -- it has
+    never been trained to correct its own compounding error via real physics/integration.
+
+dataset:
+  path: outputs/processed/2/canonical_dataset_v2/canonical_dataset_v2.npz
+  stride: 5
+
+model:
+  type: markovian
+  input_dim: 14
+  target_features:
+    - vx
+    - vy
+  input_feature_names:
+    - x
+    - y
+    - vx
+    - vy
+    # bbox_w/bbox_h deliberately dropped -- see experiment.description item 2.
+    - cfd_u_norm
+    - cfd_v_norm
+    - superficial_velocity
+    - left_flow_fraction
+    - occupancy_inlet_channel
+    - occupancy_inlet_junction
+    - occupancy_left_branch
+    - occupancy_right_branch
+    - occupancy_outlet_junction
+    - occupancy_outlet_channel
+  T_history: 1
+  rollout_horizon: 50
+  max_droplets: 64
+  architecture:
+    d_model: 128
+    n_heads: 4
+    num_layers: 4
+    dim_feedforward: 512
+    dropout: 0.1
+    predict_branch_decision: true
+    decision_stop_gradient: true  # trunk still isolated from all decision-related gradient
+    condition_velocity_on_decision: true  # Axis 1: motion_head input = concat([h_last, decision_prob])
+    bbox_stop_gradient: false  # N/A -- requires target_dim > 2, and bbox isn't a target at all in this config
+
+training:
+  batch_size: 4
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  epochs: 160
+  random_seed: 123
+  num_workers: 0
+  loss_alpha: 0.0  # uniform step weighting -- see experiment.description item 1
+  log_every_n_batches: 25
+  output_dir: outputs/models/physics_markovian_v1_state_injected_velocity
+  state_injected_rollout:
+    enabled: true
+  neighbor_key_dropout:
+    enabled: true
+    probability: 0.2
+  event_exclusion:
+    enabled: true
+    split_events_csv: outputs/evaluation/split_event_scan/split_child_track_events.csv
+    parent_pre_frames: 10
+    parent_post_frames: 25
+    nearby_radius_px: 70.0
+  decision_head:
+    enabled: true
+    loss_weight: 1.0
+    labels_path: outputs/processed/2/canonical_dataset_v2/branch_decision_labels_max20.npz
+    calibration_every_n_epochs: 5
+
+device:
+  mode: auto
+
+smoke_test:
+  train_windows: 8
+  val_windows: 4
+  batch_size: 2
+  epochs: 1
+  optimization_steps: 2
+  rollout_horizon: 3

@@ -60,9 +60,9 @@ DIAGNOSTIC_STEPS = (1, 5, 10, 20, 30, 40, 50)
 RUNTIME_TARGET_FEATURES = ("vx", "vy", "bbox_w", "bbox_h")
 VELOCITY_TARGET_FEATURES = ("vx", "vy", "bbox_w", "bbox_h")
 POSITION_TARGET_FEATURES = ("x", "y", "bbox_w", "bbox_h")
-# bbox-less velocity targets -- only valid under literal_teacher_forcing, where bbox is never
+# bbox-less velocity targets -- only valid under state_injected_rollout, where bbox is never
 # predicted (it's always taken straight from ground truth, per boundary_conditioned_rollout's
-# literal_teacher_forcing branch) and there is no closed-loop physics/occupancy step that would
+# state_injected_rollout branch) and there is no closed-loop physics/occupancy step that would
 # otherwise need a predicted bbox to compute the next step's occupancy features.
 VELOCITY_ONLY_TARGET_FEATURES = ("vx", "vy")
 CURVES_COLUMNS = [
@@ -196,7 +196,7 @@ def main(argv: list[str] | None = None) -> None:
     config = load_config(args.config)
     if args.smoke_test:
         apply_smoke_test_overrides(config)
-    literal_teacher_forcing = literal_teacher_forcing_enabled(config)
+    state_injected_rollout = state_injected_rollout_enabled(config)
 
     set_random_seed(int(config["training"]["random_seed"]))
     output_dir = Path(config["training"]["output_dir"])
@@ -220,7 +220,15 @@ def main(argv: list[str] | None = None) -> None:
         target_features=tuple(config["model"]["target_features"]),
         experiment_config=config["dataset"].get("experiment_config", "configs/experiments/video_2.yml"),
     )
-    validate_feature_contract(train_ds, config, literal_teacher_forcing)
+    validate_feature_contract(train_ds, config, state_injected_rollout)
+    configured_input_features = list(config["model"]["input_feature_names"])
+    model_input_column_indices = (
+        None
+        if configured_input_features == train_ds.feature_names
+        else torch.as_tensor(
+            [train_ds.feature_names.index(name) for name in configured_input_features], dtype=torch.long, device=device
+        )
+    )
     target_parameterization = target_parameterization_from_config(config)
     target_deadband = target_deadband_from_config(config)
     event_exclusion = event_exclusion_from_config(config)
@@ -305,7 +313,10 @@ def main(argv: list[str] | None = None) -> None:
     runtime_context = load_physics_runtime_context(
         experiment_config_path=config["dataset"].get("experiment_config", "configs/experiments/video_2.yml"),
         cfd_library_path=config["dataset"].get("cfd_library_path", "outputs/physics/full_device_cfd/library"),
-        feature_names=tuple(config["model"]["input_feature_names"]),
+        # Always the dataset's full feature set, not the (possibly reduced, under
+        # state_injected_rollout) model input -- the runtime context describes the data, not what
+        # the model happens to consume.
+        feature_names=tuple(train_ds.feature_names),
     )
     geometry_constraint = create_geometry_constraint(config, runtime_context, device)
     hard_wall_containment = create_hard_wall_containment(config, runtime_context, device)
@@ -319,22 +330,31 @@ def main(argv: list[str] | None = None) -> None:
             f"decision_stop_gradient={getattr(model, 'decision_stop_gradient', None)}"
         )
     neighbor_key_dropout_probability = neighbor_key_dropout_probability_from_config(config)
-    if literal_teacher_forcing:
-        print(
-            "literal_teacher_forcing: enabled (physics/integration bypassed -- next-step history "
-            "is always the raw ground-truth row)"
-        )
+    typical_inlet_velocity = None
+    if state_injected_rollout:
         if geometry_constraint is not None or hard_wall_containment is not None:
             raise ValueError(
-                "literal_teacher_forcing is enabled together with geometry_constraint/"
+                "state_injected_rollout is enabled together with geometry_constraint/"
                 "hard_wall_containment, which act on integrated/clamped positions that this mode "
                 "never produces -- disable both in the config."
             )
+        typical_vx, typical_vy = compute_typical_inlet_velocity(
+            train_ds, runtime_context.region_labels, train_ds.feature_indices
+        )
+        typical_inlet_velocity = torch.tensor([typical_vx, typical_vy], dtype=torch.float32, device=device)
+        print(
+            "state_injected_rollout: enabled (position/context always ground truth, vx/vy always "
+            f"the model's own prediction; typical_inlet_velocity=({typical_vx:.3f}, {typical_vy:.3f}) mm/s "
+            "used to seed newly-entering droplets)"
+        )
+        if model_input_column_indices is not None:
+            dropped = [name for name in train_ds.feature_names if name not in configured_input_features]
+            print(f"Model input reduced to {len(configured_input_features)} features (dropped: {dropped})")
     if neighbor_key_dropout_probability > 0.0:
         print(f"neighbor_key_dropout: enabled probability={neighbor_key_dropout_probability}")
 
     initial_runtime_context = runtime_context_for_epoch(config, 1, runtime_context)
-    print(f"shape_test physics_refresh={physics_refresh_mode(initial_runtime_context, literal_teacher_forcing)}")
+    print(f"shape_test physics_refresh={physics_refresh_mode(initial_runtime_context, state_injected_rollout)}")
     run_shape_test(
         model,
         train_loader,
@@ -349,7 +369,9 @@ def main(argv: list[str] | None = None) -> None:
         target_deadband,
         event_exclusion,
         branch_decision=branch_decision,
-        literal_teacher_forcing=literal_teacher_forcing,
+        state_injected_rollout=state_injected_rollout,
+        typical_inlet_velocity=typical_inlet_velocity,
+        model_input_column_indices=model_input_column_indices,
     )
 
     decision_calibration_every_n_epochs = int(
@@ -377,7 +399,9 @@ def main(argv: list[str] | None = None) -> None:
             model_config=model_config,
             output_dir=output_dir,
             branch_decision=branch_decision,
-            literal_teacher_forcing=literal_teacher_forcing,
+            state_injected_rollout=state_injected_rollout,
+            typical_inlet_velocity=typical_inlet_velocity,
+            model_input_column_indices=model_input_column_indices,
             neighbor_key_dropout_probability=neighbor_key_dropout_probability,
         )
         smoke_summary["runtime_seconds"] = time.perf_counter() - start_time
@@ -406,7 +430,9 @@ def main(argv: list[str] | None = None) -> None:
         start_epoch=start_epoch,
         branch_decision=branch_decision,
         decision_calibration_every_n_epochs=decision_calibration_every_n_epochs,
-        literal_teacher_forcing=literal_teacher_forcing,
+        state_injected_rollout=state_injected_rollout,
+        typical_inlet_velocity=typical_inlet_velocity,
+        model_input_column_indices=model_input_column_indices,
         neighbor_key_dropout_probability=neighbor_key_dropout_probability,
     )
 
@@ -571,16 +597,29 @@ def set_random_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def validate_feature_contract(dataset, config: dict[str, Any], literal_teacher_forcing: bool = False) -> None:
-    if dataset.feature_names != list(config["model"]["input_feature_names"]):
-        raise ValueError("Dataset feature order does not match the physics Markovian config.")
-    if len(dataset.feature_names) != int(config["model"]["input_dim"]):
-        raise ValueError("Dataset feature count does not match configured input_dim.")
+def is_ordered_subsequence(subset: list[str], full: list[str]) -> bool:
+    """True if every name in subset appears in full, in the same relative order (not necessarily
+    contiguous) -- e.g. dropping bbox_w/bbox_h from the middle of the canonical feature list."""
+    remaining = iter(full)
+    return all(name in remaining for name in subset)
+
+
+def validate_feature_contract(dataset, config: dict[str, Any], state_injected_rollout: bool = False) -> None:
+    configured_input_features = list(config["model"]["input_feature_names"])
+    if configured_input_features != dataset.feature_names:
+        if not (state_injected_rollout and is_ordered_subsequence(configured_input_features, dataset.feature_names)):
+            raise ValueError(
+                "Dataset feature order does not match the physics Markovian config "
+                "(state_injected_rollout allows input_feature_names to be an ordered subset of the "
+                "dataset's features -- e.g. dropping bbox_w/bbox_h -- but not otherwise)."
+            )
+    if len(configured_input_features) != int(config["model"]["input_dim"]):
+        raise ValueError("Configured input_feature_names count does not match configured input_dim.")
     target_features = tuple(config["model"]["target_features"])
-    if literal_teacher_forcing:
+    if state_injected_rollout:
         if target_features not in {RUNTIME_TARGET_FEATURES, SPEED_ANGLE_TARGET_FEATURES, POSITION_TARGET_FEATURES, VELOCITY_ONLY_TARGET_FEATURES}:
             raise ValueError(
-                f"Unsupported target_features under literal_teacher_forcing: {target_features}. Expected one of "
+                f"Unsupported target_features under state_injected_rollout: {target_features}. Expected one of "
                 f"{RUNTIME_TARGET_FEATURES}, {SPEED_ANGLE_TARGET_FEATURES}, {POSITION_TARGET_FEATURES}, or "
                 f"{VELOCITY_ONLY_TARGET_FEATURES}."
             )
@@ -804,7 +843,9 @@ def run_shape_test(
     target_deadband: dict[str, Any] | None = None,
     event_exclusion: EventExclusion | None = None,
     branch_decision: "BranchDecisionTraining | None" = None,
-    literal_teacher_forcing: bool = False,
+    state_injected_rollout: bool = False,
+    typical_inlet_velocity: torch.Tensor | None = None,
+    model_input_column_indices: torch.Tensor | None = None,
 ) -> None:
     model.eval()
     batch = move_batch_to_device(next(iter(train_loader)), device)
@@ -822,7 +863,9 @@ def run_shape_test(
             target_deadband=target_deadband,
             event_exclusion=event_exclusion,
             branch_decision=branch_decision,
-            literal_teacher_forcing=literal_teacher_forcing,
+            state_injected_rollout=state_injected_rollout,
+            typical_inlet_velocity=typical_inlet_velocity,
+            model_input_column_indices=model_input_column_indices,
         )
     print(f"history_x:       {tuple(batch['history_x'].shape)}")
     print(f"history_mask:    {tuple(batch['history_mask'].shape)}")
@@ -860,7 +903,9 @@ def run_smoke_test(
     output_dir: Path,
     branch_decision: "BranchDecisionTraining | None" = None,
     loss_key: str = "total_loss",
-    literal_teacher_forcing: bool = False,
+    state_injected_rollout: bool = False,
+    typical_inlet_velocity: torch.Tensor | None = None,
+    model_input_column_indices: torch.Tensor | None = None,
     neighbor_key_dropout_probability: float = 0.0,
 ) -> dict[str, Any]:
     scheduled_sampling = create_scheduled_sampling(config)
@@ -885,7 +930,9 @@ def run_smoke_test(
         target_parameterization=target_parameterization,
         target_deadband=target_deadband,
         event_exclusion=event_exclusion,
-        literal_teacher_forcing=literal_teacher_forcing,
+        state_injected_rollout=state_injected_rollout,
+        typical_inlet_velocity=typical_inlet_velocity,
+        model_input_column_indices=model_input_column_indices,
         neighbor_key_dropout_probability=neighbor_key_dropout_probability,
     )
     val_summary = evaluate(
@@ -905,7 +952,9 @@ def run_smoke_test(
         target_parameterization=target_parameterization,
         target_deadband=target_deadband,
         event_exclusion=event_exclusion,
-        literal_teacher_forcing=literal_teacher_forcing,
+        state_injected_rollout=state_injected_rollout,
+        typical_inlet_velocity=typical_inlet_velocity,
+        model_input_column_indices=model_input_column_indices,
     )
     checkpoint_path = output_dir / "latest_checkpoint.pt"
     checkpoint = build_checkpoint(
@@ -938,7 +987,9 @@ def run_smoke_test(
             target_parameterization=target_parameterization,
             target_deadband=target_deadband,
             event_exclusion=event_exclusion,
-            literal_teacher_forcing=literal_teacher_forcing,
+            state_injected_rollout=state_injected_rollout,
+            typical_inlet_velocity=typical_inlet_velocity,
+            model_input_column_indices=model_input_column_indices,
         )
     assert torch.isfinite(rollout["weighted_loss_internal_only"])
     assert torch.isfinite(rollout["total_loss"])
@@ -980,7 +1031,9 @@ def train_full(
     branch_decision: BranchDecisionTraining | None = None,
     loss_key: str = "total_loss",
     decision_calibration_every_n_epochs: int = 5,
-    literal_teacher_forcing: bool = False,
+    state_injected_rollout: bool = False,
+    typical_inlet_velocity: torch.Tensor | None = None,
+    model_input_column_indices: torch.Tensor | None = None,
     neighbor_key_dropout_probability: float = 0.0,
 ) -> None:
     curves_csv_path = output_dir / "training_curves.csv"
@@ -1016,7 +1069,7 @@ def train_full(
         active_p_truth = p_truth_for_epoch(scheduled_sampling, epoch)
         print(
             f"epoch {epoch:03d} "
-            f"physics_refresh={physics_refresh_mode(active_runtime_context, literal_teacher_forcing)} "
+            f"physics_refresh={physics_refresh_mode(active_runtime_context, state_injected_rollout)} "
             f"rollout_horizon={active_rollout_horizon} "
             f"p_truth={active_p_truth if active_p_truth is not None else 'n/a'}"
         )
@@ -1039,7 +1092,9 @@ def train_full(
             target_parameterization=target_parameterization,
             target_deadband=target_deadband,
             event_exclusion=event_exclusion,
-            literal_teacher_forcing=literal_teacher_forcing,
+            state_injected_rollout=state_injected_rollout,
+            typical_inlet_velocity=typical_inlet_velocity,
+            model_input_column_indices=model_input_column_indices,
             neighbor_key_dropout_probability=neighbor_key_dropout_probability,
         )
         train_summary["active_rollout_horizon"] = float(active_rollout_horizon)
@@ -1060,13 +1115,16 @@ def train_full(
             target_parameterization=target_parameterization,
             target_deadband=target_deadband,
             event_exclusion=event_exclusion,
-            literal_teacher_forcing=literal_teacher_forcing,
+            state_injected_rollout=state_injected_rollout,
+            typical_inlet_velocity=typical_inlet_velocity,
+            model_input_column_indices=model_input_column_indices,
         )
         val_summary["active_rollout_horizon"] = float(active_rollout_horizon)
-        if active_p_truth is None or literal_teacher_forcing:
-            # Under literal_teacher_forcing there is no physics/integration step for p_truth=0
-            # to diverge through, so the free-rollout diagnostic below would just reproduce
-            # val_summary -- skip the redundant extra pass over val_loader.
+        if active_p_truth is None or state_injected_rollout:
+            # Under state_injected_rollout, p_truth only ever affects the decision-conditioning
+            # signal (position is always ground truth, velocity is always the model's own
+            # prediction, regardless of p_truth) -- so the free-rollout diagnostic below would
+            # just reproduce val_summary for position/velocity metrics. Skip the redundant pass.
             val_pure_summary = dict(val_summary)
         else:
             # Free rollout (p_truth=0): the diagnostic that actually matters -- how the model
@@ -1087,7 +1145,9 @@ def train_full(
                 target_parameterization=target_parameterization,
                 target_deadband=target_deadband,
                 event_exclusion=event_exclusion,
-                literal_teacher_forcing=literal_teacher_forcing,
+                state_injected_rollout=state_injected_rollout,
+                typical_inlet_velocity=typical_inlet_velocity,
+                model_input_column_indices=model_input_column_indices,
             )
             val_pure_summary["active_rollout_horizon"] = float(active_rollout_horizon)
         val_summary["pure"] = val_pure_summary
@@ -1167,7 +1227,9 @@ def train_one_epoch(
     target_parameterization: dict[str, Any] | None = None,
     target_deadband: dict[str, Any] | None = None,
     event_exclusion: EventExclusion | None = None,
-    literal_teacher_forcing: bool = False,
+    state_injected_rollout: bool = False,
+    typical_inlet_velocity: torch.Tensor | None = None,
+    model_input_column_indices: torch.Tensor | None = None,
     neighbor_key_dropout_probability: float = 0.0,
 ) -> dict[str, float]:
     model.train()
@@ -1213,7 +1275,9 @@ def train_one_epoch(
             target_parameterization=target_parameterization,
             target_deadband=target_deadband,
             event_exclusion=event_exclusion,
-            literal_teacher_forcing=literal_teacher_forcing,
+            state_injected_rollout=state_injected_rollout,
+            typical_inlet_velocity=typical_inlet_velocity,
+            model_input_column_indices=model_input_column_indices,
             key_visibility_mask=key_visibility_mask,
         )
         loss = rollout[loss_key]
@@ -1287,7 +1351,9 @@ def evaluate(
     target_parameterization: dict[str, Any] | None = None,
     target_deadband: dict[str, Any] | None = None,
     event_exclusion: EventExclusion | None = None,
-    literal_teacher_forcing: bool = False,
+    state_injected_rollout: bool = False,
+    typical_inlet_velocity: torch.Tensor | None = None,
+    model_input_column_indices: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     model.eval()
     total_optimization_loss = 0.0
@@ -1331,7 +1397,9 @@ def evaluate(
                 target_parameterization=target_parameterization,
                 target_deadband=target_deadband,
                 event_exclusion=event_exclusion,
-                literal_teacher_forcing=literal_teacher_forcing,
+                state_injected_rollout=state_injected_rollout,
+                typical_inlet_velocity=typical_inlet_velocity,
+                model_input_column_indices=model_input_column_indices,
             )
             total_optimization_loss += float(rollout["total_loss"].detach().cpu())
             total_loss += float(rollout["weighted_loss_internal_only"].detach().cpu())
@@ -1514,12 +1582,33 @@ def scheduled_sampling_enabled(config: dict[str, Any]) -> bool:
     return bool(config.get("training", {}).get("scheduled_sampling", {}).get("enabled", False))
 
 
-def literal_teacher_forcing_enabled(config: dict[str, Any]) -> bool:
-    """True history/next-frame is always the raw ground-truth row, never the model's own
-    (integrated/physics-refreshed) prediction -- see boundary_conditioned_rollout's
-    literal_teacher_forcing param. Diagnostic-only training mode; not meant for closed-loop
-    deployment, so callers should not also enable hard_wall_containment/geometry_constraint."""
-    return bool(config.get("training", {}).get("literal_teacher_forcing", {}).get("enabled", False))
+def state_injected_rollout_enabled(config: dict[str, Any]) -> bool:
+    """True: position and every non-velocity feature are always the raw ground-truth row (never
+    the model's own integrated/physics-refreshed prediction), but vx,vy are always the model's OWN
+    prediction -- see boundary_conditioned_rollout's state_injected_rollout param. Diagnostic-only
+    training mode; not meant for closed-loop deployment, so callers should not also enable
+    hard_wall_containment/geometry_constraint."""
+    return bool(config.get("training", {}).get("state_injected_rollout", {}).get("enabled", False))
+
+
+def compute_typical_inlet_velocity(dataset, region_labels, feature_index: dict[str, int]) -> tuple[float, float]:
+    """Mean (vx, vy) in mm/s over every (track, frame) observation in the inlet channel/inlet
+    junction regions -- droplets there haven't yet diverged toward a branch and move at fairly
+    uniform speed, so this is a reasonable, non-cheating way to initialize a droplet's velocity the
+    moment it enters the tracked window under state_injected_rollout (which otherwise never injects
+    true vx,vy -- doing so at entry would leak ground truth through the one remaining gap)."""
+    from src.physics.targets.junction_decision import INLET_CHANNEL, INLET_JUNCTION, region_codes_for_points
+
+    x = dataset.Z[:, :, feature_index["x"]]
+    y = dataset.Z[:, :, feature_index["y"]]
+    vx = dataset.Z[:, :, feature_index["vx"]]
+    vy = dataset.Z[:, :, feature_index["vy"]]
+    codes = region_codes_for_points(x, y, region_labels)
+    in_inlet = np.isin(codes, [INLET_CHANNEL, INLET_JUNCTION])
+    valid = in_inlet & dataset.mask.astype(bool) & np.isfinite(vx) & np.isfinite(vy)
+    if not np.any(valid):
+        raise ValueError("No finite vx,vy observations found in the inlet channel/junction regions")
+    return float(vx[valid].mean()), float(vy[valid].mean())
 
 
 def neighbor_key_dropout_probability_from_config(config: dict[str, Any]) -> float:
@@ -1583,23 +1672,44 @@ def boundary_conditioned_rollout(
     target_parameterization: dict[str, Any] | None = None,
     target_deadband: dict[str, Any] | None = None,
     event_exclusion: EventExclusion | None = None,
-    literal_teacher_forcing: bool = False,
+    state_injected_rollout: bool = False,
+    typical_inlet_velocity: torch.Tensor | None = None,
+    model_input_column_indices: torch.Tensor | None = None,
     key_visibility_mask: torch.Tensor | None = None,
 ):
-    """literal_teacher_forcing bypasses the physics runtime/integration entirely: the next-step
-    history frame is always the raw ground-truth row (get_true_future_features), never the model's
-    own (clamped/integrated) prediction. There is then no compounding rollout error to manage, so
-    callers should pair this with geometry_constraint=None/hard_wall_containment=None.
+    """state_injected_rollout bypasses the physics runtime/integration entirely, but only for
+    POSITION and every non-velocity feature: the next-step x, y, bbox, CFD, occupancy, etc. are
+    always the raw ground-truth row (get_true_future_features), never derived from the model's own
+    prediction. vx, vy are the opposite -- always the model's OWN prediction for droplets that were
+    already present last step (never injected from truth after the very first step), so there is no
+    way for the velocity target to be trivially copied from context. A droplet newly entering the
+    window has no prior own-prediction to reuse and injecting its true vx,vy would leak ground
+    truth through the one remaining gap, so it's seeded from typical_inlet_velocity instead (a
+    precomputed representative inlet-junction velocity, required whenever state_injected_rollout is
+    True). Position itself never drifts in this mode (always literal truth), only the velocity
+    context the model conditions on is self-generated -- callers should still pair this with
+    geometry_constraint=None/hard_wall_containment=None, since there's no integrated/clamped
+    position for those to act on.
+
+    model_input_column_indices, if given, selects which of the (full, 16-feature) history columns
+    are actually fed to the model (e.g. dropping bbox_w/bbox_h from the model's input while keeping
+    them available internally for ground-truth injection) -- applied only at the model() call
+    boundary, every other tensor in this function stays full-width.
 
     key_visibility_mask, if given, is (B, M) bool (True = usable as an attention KEY), constant
     across the whole rollout window -- it does not affect which droplets are valid queries/get
     supervised, only which droplets other droplets can attend to."""
+    if state_injected_rollout and typical_inlet_velocity is None:
+        raise ValueError("state_injected_rollout requires typical_inlet_velocity to seed newly-entering droplets")
     device = batch["history_x"].device
     rollout_history = batch["history_x"].clone()
     history_mask = batch["history_mask"].clone()
     key_visibility_mask_expanded = (
         None if key_visibility_mask is None else key_visibility_mask[:, None, :].expand(-1, rollout_history.shape[1], -1)
     )
+
+    def model_input_view(history: torch.Tensor) -> torch.Tensor:
+        return history if model_input_column_indices is None else history[..., model_input_column_indices]
 
     pred_targets_norm = []
     true_targets_norm = []
@@ -1656,7 +1766,7 @@ def boundary_conditioned_rollout(
                 )
                 conditioning_gate = pre_junction_gate(last_frame, feature_index)
                 model_output = model(
-                    rollout_history,
+                    model_input_view(rollout_history),
                     history_mask,
                     return_decision=True,
                     decision_condition_signal=conditioning_signal,
@@ -1665,12 +1775,17 @@ def boundary_conditioned_rollout(
                 )
             else:
                 model_output = model(
-                    rollout_history, history_mask, return_decision=True, key_visibility_mask=key_visibility_mask_expanded
+                    model_input_view(rollout_history),
+                    history_mask,
+                    return_decision=True,
+                    key_visibility_mask=key_visibility_mask_expanded,
                 )
             pred_step_norm_raw = model_output["prediction"]
             decision_logit_step = model_output["decision_logit"]
         else:
-            pred_step_norm_raw = model(rollout_history, history_mask, key_visibility_mask=key_visibility_mask_expanded)
+            pred_step_norm_raw = model(
+                model_input_view(rollout_history), history_mask, key_visibility_mask=key_visibility_mask_expanded
+            )
             decision_logit_step = None
         pred_step_phys_raw = denormalize_targets(
             pred_step_norm_raw[:, None, :, :],
@@ -1720,11 +1835,11 @@ def boundary_conditioned_rollout(
                     true_frames_until_commit[:, step_index, :][decision_mask].detach()
                 )
 
-        if not literal_teacher_forcing:
+        if not state_injected_rollout:
             # true_rollout_target_for_parameterization hardcodes a [vx, vy, bbox_w, bbox_h] shape
             # (assumes bbox is always part of the target), which breaks if target_features drops
             # bbox -- safe to skip entirely here since its only consumer, target_for_rollout_phys,
-            # feeds the physics-integration path below, which literal_teacher_forcing bypasses.
+            # feeds the physics-integration path below, which state_injected_rollout bypasses.
             true_rollout_target_phys = true_rollout_target_for_parameterization(
                 true_step_features,
                 true_step_velocity,
@@ -1739,21 +1854,41 @@ def boundary_conditioned_rollout(
             )
 
         position_index = [feature_index["x"], feature_index["y"]]
-        if literal_teacher_forcing:
-            # No physics/integration at all -- the next-step frame is exactly the ground-truth
-            # row wherever a droplet is present this step (new_mask), zero elsewhere (consistent
-            # with the zero-padding convention new_frame_phys/rollout_history use everywhere else).
-            # new_mask (future_mask) only guarantees the TARGET dims (vx, vy, bbox_w, bbox_h) are
-            # finite -- other input columns (CFD/occupancy) can still be NaN for a present droplet,
-            # so fall back to last_frame per-feature (guaranteed finite by induction: history is
-            # always either real data or zero-padding, never NaN) rather than propagate NaN into
-            # history, exactly mirroring refresh_observed_non_target_features's stale-hold pattern.
+        if state_injected_rollout:
+            # No physics/integration at all -- x, y and every non-velocity feature are exactly the
+            # ground-truth row wherever a droplet is present this step (new_mask). new_mask
+            # (future_mask) only guarantees the TARGET dims are finite -- other input columns
+            # (CFD/occupancy) can still be NaN for a present droplet, so fall back to last_frame
+            # per-feature (guaranteed finite by induction: history is always either real data or
+            # zero-padding, never NaN) rather than propagate NaN into history, exactly mirroring
+            # refresh_observed_non_target_features's stale-hold pattern.
             true_step_features_finite_per_feature = torch.isfinite(true_step_features)
             safe_true_step_features = torch.where(
                 true_step_features_finite_per_feature, true_step_features, last_frame
             )
-            new_frame_phys = torch.where(new_mask[:, :, None], safe_true_step_features, torch.zeros_like(true_step_features))
+            # vx, vy are the deliberate exception: never injected from truth. A continuing droplet
+            # (present last step too) gets the model's OWN prediction from this step, so the
+            # velocity target can never be trivially copied from context. A newly-entering droplet
+            # has no prior own-prediction to reuse -- seeding it from its true vx,vy would leak
+            # ground truth through the one remaining gap, so it's seeded from
+            # typical_inlet_velocity (a fixed, precomputed representative value) instead.
+            vx_index, vy_index = feature_index["vx"], feature_index["vy"]
+            own_predicted_velocity = pred_step_phys_raw[..., :2]
+            new_frame_phys = safe_true_step_features.clone()
+            new_frame_phys[:, :, vx_index] = torch.where(
+                continuing_mask, own_predicted_velocity[..., 0], new_frame_phys[:, :, vx_index]
+            )
+            new_frame_phys[:, :, vy_index] = torch.where(
+                continuing_mask, own_predicted_velocity[..., 1], new_frame_phys[:, :, vy_index]
+            )
+            new_frame_phys[:, :, vx_index] = torch.where(
+                boundary_mask, typical_inlet_velocity[0], new_frame_phys[:, :, vx_index]
+            )
+            new_frame_phys[:, :, vy_index] = torch.where(
+                boundary_mask, typical_inlet_velocity[1], new_frame_phys[:, :, vy_index]
+            )
             raw_position_phys = safe_true_step_features[:, :, position_index]
+            new_frame_phys = torch.where(new_mask[:, :, None], new_frame_phys, torch.zeros_like(new_frame_phys))
         elif runtime_context is None:
             new_frame_phys, raw_position_phys = build_stale_refresh_frame(
                 last_frame,
@@ -2587,7 +2722,7 @@ def new_accumulator():
 def update_metric_accumulators(accumulators, rollout):
     velocity_error = rollout["pred_velocity"] - rollout["true_velocity"]
     # bbox_w/bbox_h are only the last two target dims for the 4-dim target parameterizations --
-    # under VELOCITY_ONLY_TARGET_FEATURES (target_dim=2, e.g. literal_teacher_forcing configs
+    # under VELOCITY_ONLY_TARGET_FEATURES (target_dim=2, e.g. state_injected_rollout configs
     # that take bbox straight from ground truth instead of predicting it) there is no bbox slice
     # to compute an error against at all.
     bbox_error = rollout["pred_target"][..., 2:4] - rollout["true_target"][..., 2:4] if rollout["pred_target"].shape[-1] >= 4 else None
@@ -2820,13 +2955,15 @@ def move_optimizer_state_to_device(optimizer, device) -> None:
 
 
 
-def physics_refresh_mode(runtime_context, literal_teacher_forcing: bool = False) -> str:
-    # literal_teacher_forcing bypasses runtime_context entirely regardless of whether an object is
+def physics_refresh_mode(runtime_context, state_injected_rollout: bool = False) -> str:
+    # state_injected_rollout bypasses runtime_context entirely regardless of whether an object is
     # passed down -- a non-None runtime_context is kept alive in that mode only so
     # should_update_best_checkpoint's "runtime_context is None -> never save best" gate still works,
-    # not because physics is actually being invoked. Report that accurately rather than "runtime".
-    if literal_teacher_forcing:
-        return "bypassed (literal_teacher_forcing)"
+    # not because physics is actually being invoked (position is ground truth, velocity is the
+    # model's own prediction -- neither goes through the numpy runtime). Report that accurately
+    # rather than "runtime".
+    if state_injected_rollout:
+        return "bypassed (state_injected_rollout)"
     return "runtime" if runtime_context is not None else "stale"
 
 
