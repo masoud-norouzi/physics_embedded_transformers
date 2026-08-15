@@ -1,0 +1,145 @@
+experiment:
+  id: physics_markovian_v1_decision_conditioned_bbox_isolated_neighbor_key_dropout
+  description: >
+    Controlled ablation, not a new recipe: identical to
+    physics_markovian_v1_decision_conditioned_bbox_isolated.yml (real closed-loop runtime physics,
+    bbox prediction, decision conditioning, bbox_stop_gradient, full curriculum) with exactly one
+    change -- training.neighbor_key_dropout enabled below. Everything else, including
+    architecture, curriculum, scheduled_sampling, and hard_wall_containment, is byte-for-byte the
+    same as that config.
+
+    Motivation: a single-droplet closed-loop isolation sanity check (no other droplets ever
+    attendable) showed physics_markovian_v1_decision_conditioned_bbox_isolated's predicted speed
+    never converges to a steady branch velocity within a 50-step rollout -- it recovers from the
+    junction slowdown, briefly plateaus, then drifts upward again through the rest of the horizon.
+    The physics_markovian_v1_state_injected_velocity checkpoint (trained with neighbor_key_dropout,
+    among other differences) does settle into a flat, stable terminal velocity on the exact same
+    scenario. That comparison confounds several simultaneous differences (neighbor_key_dropout,
+    the state-injection training mechanism itself, reduced input, no bbox_stop_gradient, different
+    horizon) -- this config isolates neighbor_key_dropout as the single variable, so a repeat of
+    the same isolation sanity check actually attributes any change to it specifically.
+
+dataset:
+  path: outputs/processed/2/canonical_dataset_v2/canonical_dataset_v2.npz
+  stride: 5
+
+model:
+  type: markovian
+  input_dim: 16
+  target_features:
+    - vx
+    - vy
+    - bbox_w
+    - bbox_h
+  input_feature_names:
+    - x
+    - y
+    - vx
+    - vy
+    - bbox_w
+    - bbox_h
+    - cfd_u_norm
+    - cfd_v_norm
+    - superficial_velocity
+    - left_flow_fraction
+    - occupancy_inlet_channel
+    - occupancy_inlet_junction
+    - occupancy_left_branch
+    - occupancy_right_branch
+    - occupancy_outlet_junction
+    - occupancy_outlet_channel
+  T_history: 1
+  rollout_horizon: 50
+  max_droplets: 64
+  architecture:
+    d_model: 128
+    n_heads: 4
+    num_layers: 4
+    dim_feedforward: 512
+    dropout: 0.1
+    predict_branch_decision: true
+    decision_stop_gradient: true  # trunk still isolated from all decision-related gradient
+    condition_velocity_on_decision: true  # Axis 1: motion_head input = concat([h_last, decision_prob])
+    bbox_stop_gradient: true  # bbox_head trains on h_last.detach() -- known-bad bbox labels can't reach the trunk
+
+training:
+  batch_size: 4
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  epochs: 160
+  random_seed: 123
+  num_workers: 0
+  loss_alpha: 2.0
+  rollout_horizon_schedule:
+    - start_epoch: 1
+      horizon: 5
+    - start_epoch: 21
+      horizon: 10
+    - start_epoch: 41
+      horizon: 15
+    - start_epoch: 61
+      horizon: 20
+    - start_epoch: 81
+      horizon: 25
+    - start_epoch: 101
+      horizon: 30
+    - start_epoch: 121
+      horizon: 35
+    - start_epoch: 131
+      horizon: 40
+    - start_epoch: 141
+      horizon: 45
+    - start_epoch: 151
+      horizon: 50
+  log_every_n_batches: 25
+  output_dir: outputs/models/physics_markovian_v1_decision_conditioned_bbox_isolated_neighbor_key_dropout
+  physics_refresh:
+    runtime_start_epoch: 2
+  geometry_constraint:
+    enabled: true
+    weight: 5.0
+    tolerance: 0.005
+    num_samples_x: 48
+    num_samples_y: 48
+  hard_wall_containment:
+    enabled: true
+  event_exclusion:
+    enabled: true
+    split_events_csv: outputs/evaluation/split_event_scan/split_child_track_events.csv
+    parent_pre_frames: 10
+    parent_post_frames: 25
+    nearby_radius_px: 70.0
+  stage_handoff:
+    enabled: true
+    metric: active_horizon_position_rmse
+  scheduled_sampling:
+    enabled: true
+    schedule:
+      - start_epoch: 1
+        p_truth: 1.0
+      - start_epoch: 20
+        p_truth: 0.5
+      - start_epoch: 60
+        p_truth: 0.2
+      - start_epoch: 120
+        p_truth: 0.05
+  decision_head:
+    enabled: true
+    loss_weight: 1.0
+    labels_path: outputs/processed/2/canonical_dataset_v2/branch_decision_labels_max20.npz
+    calibration_every_n_epochs: 5
+  neighbor_key_dropout:
+    enabled: true
+    probability: 0.2
+
+device:
+  mode: auto
+
+smoke_test:
+  train_windows: 8
+  val_windows: 4
+  batch_size: 2
+  epochs: 1
+  optimization_steps: 2
+  rollout_horizon: 3

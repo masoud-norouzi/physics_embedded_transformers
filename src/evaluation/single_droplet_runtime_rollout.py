@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
+from src.evaluation.bbox_nearest_neighbor_baseline import build_samples, fit_standardizer, predict_knn, subsample, transform
 from src.models.canonical_rollout_transformer import CanonicalRolloutTransformer
 from src.physics.runtime import load_physics_runtime_context, step as physics_runtime_step
 from src.physics.runtime.state_transition import CANONICAL_RUNTIME_FEATURE_NAMES
@@ -72,6 +73,23 @@ def main(argv: list[str] | None = None) -> None:
         feature_names=feature_names,
     )
 
+    model_input_indices = model_input_indices_for_checkpoint(feature_names, checkpoint)
+    bbox_estimator = None
+    if "bbox_w" not in target_features:
+        print(
+            "Checkpoint does not predict bbox -- fitting a k-NN(x, y, speed) bbox estimator on "
+            "the training split to supply the physics runtime step's required bbox input "
+            "(this rollout is simulated, not real, so there's no true per-frame bbox to use instead)."
+        )
+        bbox_estimator = fit_bbox_knn_estimator(
+            dataset,
+            feature_index,
+            runtime_context.region_labels,
+            stride=int(config["dataset"]["stride"]),
+            t_history=int(checkpoint["model_config"]["T_history"]),
+            t_future=int(config["model"]["rollout_horizon"]),
+        )
+
     scenarios = select_scenarios(
         dataset=dataset,
         feature_index=feature_index,
@@ -102,6 +120,8 @@ def main(argv: list[str] | None = None) -> None:
             rollout_length=int(args.rollout_length),
             scenario=scenario,
             prediction_mode=prediction_mode,
+            model_input_indices=model_input_indices,
+            bbox_estimator=bbox_estimator,
         )
         table = pd.DataFrame(rows)
         table.to_csv(scenario_dir / "trajectory.csv", index=False)
@@ -198,9 +218,9 @@ def validate_current_feature_contract(feature_names: list[str], config: dict[str
 
 
 def prediction_mode_from_targets(target_features: tuple[str, ...]) -> str:
-    if target_features == ("x", "y", "bbox_w", "bbox_h"):
+    if target_features in {("x", "y", "bbox_w", "bbox_h"), ("x", "y")}:
         return "position"
-    if target_features == ("vx", "vy", "bbox_w", "bbox_h"):
+    if target_features in {("vx", "vy", "bbox_w", "bbox_h"), ("vx", "vy")}:
         return "velocity"
     raise ValueError(f"Unsupported checkpoint target_features for single-droplet rollout: {target_features}")
 
@@ -210,6 +230,59 @@ def load_model(torch, checkpoint: dict[str, Any], device):
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     return model
+
+
+def model_input_indices_for_checkpoint(feature_names: list[str], checkpoint: dict[str, Any]) -> np.ndarray | None:
+    """None if the checkpoint's input matches the dataset's full feature set exactly (the common
+    case); otherwise the ordered column indices into feature_names that the checkpoint actually
+    consumes (e.g. a state_injected_rollout checkpoint that never sees bbox_w/bbox_h)."""
+    checkpoint_input_features = list(checkpoint.get("input_feature_names", feature_names))
+    if checkpoint_input_features == feature_names:
+        return None
+    missing = [name for name in checkpoint_input_features if name not in feature_names]
+    if missing:
+        raise KeyError(f"Checkpoint input_feature_names not found in dataset: {missing}")
+    return np.asarray([feature_names.index(name) for name in checkpoint_input_features], dtype=np.int64)
+
+
+def fit_bbox_knn_estimator(
+    dataset: dict[str, Any],
+    feature_index: dict[str, int],
+    region_labels: np.ndarray,
+    *,
+    stride: int = 5,
+    t_history: int = 1,
+    t_future: int = 50,
+    k: int = 25,
+    max_train_rows: int = 120000,
+    random_seed: int = 123,
+):
+    """Fits a k-NN(x, y, speed) -> (bbox_w, bbox_h) estimator on the TRAIN split (same split
+    boundary/features as bbox_nearest_neighbor_baseline.py's own k=25 baseline, which measured
+    rmse_bbox_w=0.554, rmse_bbox_h=0.549 -- close to the dataset's own noise floor).
+
+    Needed because a state_injected_rollout checkpoint never predicts bbox at all, and this
+    single-droplet rollout is a SIMULATED trajectory (only the initial frame is real observed
+    data) -- there is no true per-frame bbox available at any later step to fall back on, unlike
+    rollout_droplet_with_context's real multi-droplet windows. Returns a callable
+    estimate(x, y, vx, vy) -> (bbox_w, bbox_h).
+    """
+    rng = np.random.default_rng(int(random_seed))
+    samples = build_samples(dataset, feature_index, region_labels, stride=stride, t_history=t_history, t_future=t_future)
+    train = subsample(samples["train"], int(max_train_rows), rng)
+    if len(train["features"]) == 0:
+        raise RuntimeError("No training rows available to fit the bbox k-NN estimator.")
+    scaler = fit_standardizer(train["features"])
+    train_features = transform(train["features"], scaler)
+    train_targets = train["targets"]
+
+    def estimate(x: float, y: float, vx: float, vy: float) -> tuple[float, float]:
+        speed = float(np.hypot(vx, vy))
+        query = transform(np.asarray([[x, y, speed]], dtype=np.float32), scaler)
+        prediction = predict_knn(train_features=train_features, train_targets=train_targets, val_features=query, k=k, chunk_size=1)
+        return float(prediction[0, 0]), float(prediction[0, 1])
+
+    return estimate
 
 
 def checkpoint_metadata(path: Path, checkpoint: dict[str, Any]) -> dict[str, Any]:
@@ -317,7 +390,18 @@ def rollout_single_droplet(
     rollout_length: int,
     scenario: dict[str, Any],
     prediction_mode: str,
+    model_input_indices: np.ndarray | None = None,
+    bbox_estimator=None,
 ) -> list[dict[str, Any]]:
+    """model_input_indices, if given, selects which of the (full, 16-feature) state columns are
+    actually fed to the model (e.g. a state_injected_rollout checkpoint that never sees
+    bbox_w/bbox_h) -- state/history stay full-width, only the model() call is sliced.
+
+    bbox_estimator, if given, is called as estimate(x, y, vx, vy) -> (bbox_w, bbox_h) whenever the
+    model's own prediction has no bbox dims, to supply the physics runtime step's required
+    4-column (vx, vy, bbox_w, bbox_h) input. See fit_bbox_knn_estimator's docstring for why this
+    is needed (this rollout is simulated, not real, so there's no true per-frame bbox to fall
+    back on beyond the initial frame)."""
     max_droplets = int(model.max_droplets)
     feature_dim = len(runtime_context.feature_names)
     state = np.zeros((max_droplets, feature_dim), dtype=np.float32)
@@ -327,27 +411,57 @@ def rollout_single_droplet(
     history = np.repeat(state[None, :, :], int(model.T_history), axis=0)
     rows = [row_from_state(0, state[0], feature_index, scenario, runtime_context, True, "initial_observed_state")]
 
+    model_input_indices_t = (
+        None if model_input_indices is None else torch.as_tensor(model_input_indices, dtype=torch.long, device=device)
+    )
+
     for step_index in range(1, int(rollout_length) + 1):
         history_norm = normalize_state(history, normalization, torch, device)
+        model_input = history_norm if model_input_indices_t is None else history_norm[:, :, model_input_indices_t]
+        model_input_dim = model_input.shape[-1]
         history_mask = torch.as_tensor(
             np.repeat(active_mask.reshape(1, max_droplets), int(model.T_history), axis=0).reshape(1, int(model.T_history), max_droplets),
             dtype=torch.bool,
             device=device,
         )
         with torch.no_grad():
-            model_output = model(history_norm.reshape(1, int(model.T_history), max_droplets, feature_dim), history_mask)
+            model_output = model(model_input.reshape(1, int(model.T_history), max_droplets, model_input_dim), history_mask)
             # Models with condition_velocity_on_decision=True always return a dict (prediction +
             # decision_logit) even on a plain call; older checkpoints return a bare tensor.
             pred_norm = (model_output["prediction"] if isinstance(model_output, dict) else model_output)[0]
             pred_phys = denormalize_target(pred_norm, normalization, torch, device).detach().cpu().numpy().astype(np.float32)
+
+        bbox_was_estimated = False
+        if bbox_estimator is not None and pred_phys.shape[-1] < 4:
+            est_bbox_w, est_bbox_h = bbox_estimator(
+                float(state[0, feature_index["x"]]),
+                float(state[0, feature_index["y"]]),
+                float(pred_phys[0, 0]),
+                float(pred_phys[0, 1]),
+            )
+            # Only row 0 (the one active droplet) needs a real value -- the rest are inactive and
+            # never validated/used, but _prediction_matrix still requires the full (max_droplets, 4)
+            # shape, so give every row a positive placeholder.
+            runtime_pred_phys = np.ones((pred_phys.shape[0], 4), dtype=np.float32)
+            runtime_pred_phys[:, :2] = pred_phys
+            runtime_pred_phys[0, 2] = max(float(est_bbox_w), 1.0e-3)
+            runtime_pred_phys[0, 3] = max(float(est_bbox_h), 1.0e-3)
+            bbox_was_estimated = True
+        else:
+            runtime_pred_phys = pred_phys
+
         try:
-            next_state = physics_runtime_step(state, pred_phys, runtime_context, active_mask=active_mask, prediction_mode=prediction_mode)
+            next_state = physics_runtime_step(
+                state, runtime_pred_phys, runtime_context, active_mask=active_mask, prediction_mode=prediction_mode
+            )
             runtime_success = True
             source = "runtime_closed_loop"
         except Exception as exc:
-            next_state = fallback_kinematic_step(state, pred_phys, feature_index, runtime_context, prediction_mode)
+            next_state = fallback_kinematic_step(state, runtime_pred_phys, feature_index, runtime_context, prediction_mode)
             runtime_success = False
             source = f"kinematic_fallback_after_runtime_error:{type(exc).__name__}"
+        if bbox_was_estimated:
+            source = f"{source}+bbox_estimated_knn"
         state = next_state.astype(np.float32)
         history = np.concatenate([history[1:], state[None, :, :]], axis=0)
         rows.append(row_from_state(step_index, state[0], feature_index, scenario, runtime_context, runtime_success, source))
