@@ -253,7 +253,7 @@ def test_state_injected_rollout_requires_typical_inlet_velocity(tmp_path: Path) 
         )
 
 
-def test_state_injected_rollout_position_matches_true_position_exactly(tmp_path: Path) -> None:
+def test_state_injected_rollout_position_diverges_from_truth_with_garbage_model(tmp_path: Path) -> None:
     dataset, batch = _rollout_batch(tmp_path)
     stats = _identity_stats(16, target_dim=4)
     weights = trainer.rollout_weights(3, 0.0, torch.device("cpu"))
@@ -272,10 +272,58 @@ def test_state_injected_rollout_position_matches_true_position_exactly(tmp_path:
     )
 
     mask = rollout["mask"]
-    assert torch.allclose(rollout["pred_position"][mask], rollout["true_position"][mask], atol=1e-6), (
-        "position must always be driven from ground truth under state_injected_rollout, regardless "
-        "of what the (garbage, untrained) model predicted for velocity"
+    assert not torch.allclose(rollout["pred_position"][mask], rollout["true_position"][mask], atol=1e-6), (
+        "position is now integrated from the model's own (garbage, untrained) velocity prediction, "
+        "not injected from truth -- it should NOT land on the exact true position"
     )
+
+
+def test_state_injected_rollout_position_is_a_real_euler_integration(tmp_path: Path) -> None:
+    dataset, batch = _rollout_batch(tmp_path, target_features=("vx", "vy"))
+    stats = _identity_stats(16, target_dim=2)
+    weights = trainer.rollout_weights(3, 0.0, torch.device("cpu"))
+    feature_index = dataset.feature_indices
+    typical_inlet_velocity = torch.tensor([0.0, 0.0])
+
+    # A model that always predicts zero velocity: Euler integration of zero is a no-op, so
+    # position must stay exactly at its initial (true) value for every step.
+    zero_model = _EchoVelocityModel(feature_index["vx"], feature_index["vy"], scale=0.0)
+    still_rollout = trainer.boundary_conditioned_rollout(
+        zero_model,
+        batch,
+        dataset,
+        stats,
+        weights,
+        runtime_context=None,
+        state_injected_rollout=True,
+        typical_inlet_velocity=typical_inlet_velocity,
+    )
+    mask = still_rollout["mask"]
+    still_position = still_rollout["pred_position"]
+    for step in range(1, 3):
+        assert torch.allclose(
+            still_position[:, step, :, :][mask[:, step, :]], still_position[:, 0, :, :][mask[:, 0, :]], atol=1e-4
+        ), "zero predicted velocity every step must leave position unchanged (Euler integration of zero is a no-op)"
+
+    # A model that always echoes back the (nonzero) input velocity unchanged: position must move
+    # by a real, nonzero amount each step -- proof this is genuine integration, not another
+    # disguised form of injection.
+    moving_model = _EchoVelocityModel(feature_index["vx"], feature_index["vy"], scale=1.0)
+    moving_rollout = trainer.boundary_conditioned_rollout(
+        moving_model,
+        batch,
+        dataset,
+        stats,
+        weights,
+        runtime_context=None,
+        state_injected_rollout=True,
+        typical_inlet_velocity=typical_inlet_velocity,
+    )
+    mask = moving_rollout["mask"]
+    moving_position = moving_rollout["pred_position"]
+    assert not torch.allclose(
+        moving_position[:, 1, :, :][mask[:, 1, :]], moving_position[:, 0, :, :][mask[:, 0, :]], atol=1e-4
+    ), "nonzero predicted velocity must actually displace the integrated position step to step"
 
 
 class _EchoVelocityModel(torch.nn.Module):
@@ -377,6 +425,88 @@ def test_state_injected_rollout_new_entry_seeded_from_typical_inlet_velocity(tmp
     assert torch.allclose(step1_pred, torch.tensor([10.0, -10.0]), atol=1e-4), (
         f"expected step 1 prediction to reflect typical_inlet_velocity=(5,-5) seeded at entry, got {step1_pred} "
         "-- if this is (198, -198) instead, the true (leaked) vx,vy was used at entry"
+    )
+
+
+class _ConstantVelocityModel(torch.nn.Module):
+    def __init__(self, vx: float, vy: float) -> None:
+        super().__init__()
+        self.vx = vx
+        self.vy = vy
+
+    def forward(self, history_x, history_mask, key_visibility_mask=None):
+        B, T, M, _ = history_x.shape
+        return torch.tensor([self.vx, self.vy]).view(1, 1, 2).expand(B, M, 2).clone()
+
+
+def test_state_injected_rollout_hard_wall_containment_uses_true_bbox_not_predicted(tmp_path: Path) -> None:
+    # The model's predicted target is (vx, vy) only -- 2 dims, no bbox -- so
+    # build_stale_refresh_frame's ORIGINAL clamp path (which needs bbox in dims 2:4 of the
+    # prediction) could never engage. This proves the NEW clamp_bbox_phys path lets
+    # hard_wall_containment still constrain the integrated position using the droplet's real
+    # (ground-truth) bbox, without the model ever seeing or predicting it.
+    from src.physics.constraints import wall_sdf_to_torch
+    from src.physics.geometry.wall_sdf import build_wall_sdf
+
+    idx = {name: i for i, name in enumerate(V2_FEATURES)}
+    Z = np.full((1, 2, len(V2_FEATURES)), np.nan, dtype=np.float32)
+    mask = np.ones((1, 2), dtype=bool)
+    for frame in range(2):
+        Z[0, frame, idx["x"]] = 10.0
+        Z[0, frame, idx["y"]] = 10.0
+        Z[0, frame, idx["vx"]] = 1.0
+        Z[0, frame, idx["vy"]] = 0.0
+        Z[0, frame, idx["bbox_w"]] = 4.0
+        Z[0, frame, idx["bbox_h"]] = 4.0
+        Z[0, frame, idx["cfd_u_norm"]] = 0.1
+        Z[0, frame, idx["cfd_v_norm"]] = 0.2
+        Z[0, frame, idx["superficial_velocity"]] = 56.9
+        Z[0, frame, idx["left_flow_fraction"]] = 0.5
+        for name in V2_FEATURES:
+            if name.startswith("occupancy_"):
+                Z[0, frame, idx[name]] = 1.0 / 6.0
+    npz_path = tmp_path / "wall_clamp.npz"
+    np.savez(
+        npz_path,
+        Z=Z,
+        mask=mask,
+        track_ids=np.asarray([1], dtype=np.int64),
+        frames=np.arange(2, dtype=np.int64),
+        feature_names=np.asarray(V2_FEATURES),
+    )
+    dataset = CanonicalWindowDataset(
+        npz_path, start_frames=[0], T_history=1, T_future=1, max_droplets=1, target_features=("vx", "vy")
+    )
+    batch = trainer.move_batch_to_device(next(iter(DataLoader(dataset, batch_size=1))), torch.device("cpu"))
+    stats = _identity_stats(16, target_dim=2)
+    weights = trainer.rollout_weights(1, 0.0, torch.device("cpu"))
+    typical_inlet_velocity = torch.tensor([0.0, 0.0])
+
+    channel_mask = np.ones((20, 30), dtype=bool)
+    channel_mask[:, 20:] = False  # wall starts at column (x) = 20
+    sdf, grad_x, grad_y = wall_sdf_to_torch(build_wall_sdf(channel_mask))
+    hard_wall_containment = trainer.HardWallContainment(enabled=True, sdf=sdf, grad_x=grad_x, grad_y=grad_y)
+
+    model = _ConstantVelocityModel(vx=15.0, vy=0.0)  # would push x from 10 -> 25, past the wall at 20
+
+    common = dict(
+        runtime_context=None,
+        state_injected_rollout=True,
+        typical_inlet_velocity=typical_inlet_velocity,
+    )
+    clamped = trainer.boundary_conditioned_rollout(
+        model, batch, dataset, stats, weights, hard_wall_containment=hard_wall_containment, **common
+    )
+    unclamped = trainer.boundary_conditioned_rollout(
+        model, batch, dataset, stats, weights, hard_wall_containment=None, **common
+    )
+
+    clamped_x = clamped["pred_position"][0, 0, 0, 0].item()
+    unclamped_x = unclamped["pred_position"][0, 0, 0, 0].item()
+    assert unclamped_x > 20.0, f"sanity check: without containment the droplet should cross the wall, got x={unclamped_x}"
+    assert clamped_x < unclamped_x - 1.0, (
+        "hard_wall_containment should pull the integrated position back using the TRUE bbox (even "
+        f"though the model never predicts bbox) -- clamped x={clamped_x}, unclamped x={unclamped_x}"
     )
 
 

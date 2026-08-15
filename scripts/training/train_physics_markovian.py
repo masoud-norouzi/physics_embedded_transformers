@@ -332,19 +332,23 @@ def main(argv: list[str] | None = None) -> None:
     neighbor_key_dropout_probability = neighbor_key_dropout_probability_from_config(config)
     typical_inlet_velocity = None
     if state_injected_rollout:
-        if geometry_constraint is not None or hard_wall_containment is not None:
+        if geometry_constraint is not None:
             raise ValueError(
-                "state_injected_rollout is enabled together with geometry_constraint/"
-                "hard_wall_containment, which act on integrated/clamped positions that this mode "
-                "never produces -- disable both in the config."
+                "state_injected_rollout is enabled together with geometry_constraint, which "
+                "regularizes a PREDICTED bbox against overlap -- bbox is never predicted in this "
+                "mode, so there is nothing for it to check. Disable it in the config. "
+                "hard_wall_containment is fine to enable here: the clamp uses the droplet's real "
+                "(ground-truth) bbox instead of a predicted one."
             )
         typical_vx, typical_vy = compute_typical_inlet_velocity(
             train_ds, runtime_context.region_labels, train_ds.feature_indices
         )
         typical_inlet_velocity = torch.tensor([typical_vx, typical_vy], dtype=torch.float32, device=device)
+        wall_containment_note = "real (ground-truth) bbox used for the wall clamp" if hard_wall_containment is not None else "no wall containment"
         print(
-            "state_injected_rollout: enabled (position/context always ground truth, vx/vy always "
-            f"the model's own prediction; typical_inlet_velocity=({typical_vx:.3f}, {typical_vy:.3f}) mm/s "
+            "state_injected_rollout: enabled (vx/vy always the model's own prediction, x/y "
+            f"integrated from that same prediction, {wall_containment_note}; every other feature "
+            f"always ground truth; typical_inlet_velocity=({typical_vx:.3f}, {typical_vy:.3f}) mm/s "
             "used to seed newly-entering droplets)"
         )
         if model_input_column_indices is not None:
@@ -1122,8 +1126,8 @@ def train_full(
         val_summary["active_rollout_horizon"] = float(active_rollout_horizon)
         if active_p_truth is None or state_injected_rollout:
             # Under state_injected_rollout, p_truth only ever affects the decision-conditioning
-            # signal (position is always ground truth, velocity is always the model's own
-            # prediction, regardless of p_truth) -- so the free-rollout diagnostic below would
+            # signal -- velocity is always the model's own prediction and position is always
+            # integrated from it, neither depends on p_truth -- so the free-rollout diagnostic below would
             # just reproduce val_summary for position/velocity metrics. Skip the redundant pass.
             val_pure_summary = dict(val_summary)
         else:
@@ -1583,11 +1587,14 @@ def scheduled_sampling_enabled(config: dict[str, Any]) -> bool:
 
 
 def state_injected_rollout_enabled(config: dict[str, Any]) -> bool:
-    """True: position and every non-velocity feature are always the raw ground-truth row (never
-    the model's own integrated/physics-refreshed prediction), but vx,vy are always the model's OWN
-    prediction -- see boundary_conditioned_rollout's state_injected_rollout param. Diagnostic-only
-    training mode; not meant for closed-loop deployment, so callers should not also enable
-    hard_wall_containment/geometry_constraint."""
+    """True: vx,vy are always the model's OWN prediction (never injected from truth after the
+    first step), and x,y are integrated from that same prediction (simple Euler step) -- neither
+    is ever taken from ground truth. Every non-position/velocity feature (CFD, occupancy,
+    superficial_velocity, left_flow_fraction) IS still always the raw ground-truth row. See
+    boundary_conditioned_rollout's state_injected_rollout param. Diagnostic-only training mode;
+    not meant for closed-loop deployment (no wall-containment safety net for the integrated
+    position, since that needs a predicted bbox this mode deliberately doesn't have), so callers
+    should not also enable hard_wall_containment/geometry_constraint."""
     return bool(config.get("training", {}).get("state_injected_rollout", {}).get("enabled", False))
 
 
@@ -1677,19 +1684,22 @@ def boundary_conditioned_rollout(
     model_input_column_indices: torch.Tensor | None = None,
     key_visibility_mask: torch.Tensor | None = None,
 ):
-    """state_injected_rollout bypasses the physics runtime/integration entirely, but only for
-    POSITION and every non-velocity feature: the next-step x, y, bbox, CFD, occupancy, etc. are
-    always the raw ground-truth row (get_true_future_features), never derived from the model's own
-    prediction. vx, vy are the opposite -- always the model's OWN prediction for droplets that were
-    already present last step (never injected from truth after the very first step), so there is no
-    way for the velocity target to be trivially copied from context. A droplet newly entering the
-    window has no prior own-prediction to reuse and injecting its true vx,vy would leak ground
-    truth through the one remaining gap, so it's seeded from typical_inlet_velocity instead (a
-    precomputed representative inlet-junction velocity, required whenever state_injected_rollout is
-    True). Position itself never drifts in this mode (always literal truth), only the velocity
-    context the model conditions on is self-generated -- callers should still pair this with
-    geometry_constraint=None/hard_wall_containment=None, since there's no integrated/clamped
-    position for those to act on.
+    """state_injected_rollout bypasses the physics RUNTIME (numpy CFD simulator) entirely, but not
+    integration itself: vx, vy are always the model's OWN prediction for droplets that were already
+    present last step (never injected from truth after the very first step), and x, y are
+    integrated from that same prediction via a simple Euler step (build_stale_refresh_frame) --
+    neither is ever taken from ground truth, so neither can be trivially copied from context. Every
+    OTHER feature (bbox, CFD, occupancy, superficial_velocity, left_flow_fraction) IS always the
+    raw ground-truth row (get_true_future_features), refreshed every step regardless of what the
+    model predicted. A droplet newly entering the window has no prior own-prediction to reuse, and
+    injecting its true vx,vy would leak ground truth through the one remaining gap, so it's seeded
+    from typical_inlet_velocity instead (a precomputed representative inlet-junction velocity,
+    required whenever state_injected_rollout is True) -- its position at entry is still taken from
+    truth, same as every other rollout mode does for a droplet it's never seen before. Callers
+    should still pair this with geometry_constraint=None (bbox isn't predicted, so there's nothing
+    for it to check) -- hard_wall_containment is also structurally inert here regardless of what's
+    passed, since its ellipse-aware clamp needs a predicted bbox this mode doesn't have, which
+    means there is currently no containment safety net for the integrated position.
 
     model_input_column_indices, if given, selects which of the (full, 16-feature) history columns
     are actually fed to the model (e.g. dropping bbox_w/bbox_h from the model's input while keeping
@@ -1855,40 +1865,51 @@ def boundary_conditioned_rollout(
 
         position_index = [feature_index["x"], feature_index["y"]]
         if state_injected_rollout:
-            # No physics/integration at all -- x, y and every non-velocity feature are exactly the
-            # ground-truth row wherever a droplet is present this step (new_mask). new_mask
-            # (future_mask) only guarantees the TARGET dims are finite -- other input columns
-            # (CFD/occupancy) can still be NaN for a present droplet, so fall back to last_frame
-            # per-feature (guaranteed finite by induction: history is always either real data or
-            # zero-padding, never NaN) rather than propagate NaN into history, exactly mirroring
-            # refresh_observed_non_target_features's stale-hold pattern.
-            true_step_features_finite_per_feature = torch.isfinite(true_step_features)
-            safe_true_step_features = torch.where(
-                true_step_features_finite_per_feature, true_step_features, last_frame
-            )
-            # vx, vy are the deliberate exception: never injected from truth. A continuing droplet
-            # (present last step too) gets the model's OWN prediction from this step, so the
-            # velocity target can never be trivially copied from context. A newly-entering droplet
-            # has no prior own-prediction to reuse -- seeding it from its true vx,vy would leak
-            # ground truth through the one remaining gap, so it's seeded from
-            # typical_inlet_velocity (a fixed, precomputed representative value) instead.
-            vx_index, vy_index = feature_index["vx"], feature_index["vy"]
+            # Position is no longer injected either -- it's integrated from the model's OWN
+            # predicted velocity (simple Euler step), reusing build_stale_refresh_frame exactly as
+            # the runtime_context-is-None path below does. That function already: (a) integrates
+            # x,y from pred_step_phys_raw's velocity, (b) sets vx,vy to that same raw prediction,
+            # (c) refreshes every OTHER feature (CFD, occupancy, superficial_velocity,
+            # left_flow_fraction) from true_step_features wherever finite, holding the previous
+            # value otherwise (refresh_observed_non_target_features's own NaN guard -- no need to
+            # hand-roll one here), and (d) unconditionally seeds newly-entering droplets
+            # (boundary_mask) with their full true row. bbox is never predicted (pred_step_phys_raw
+            # only has 2 dims, vx/vy) and never fed to the model either, but it's still available
+            # from the dataset's own full-width Z array -- clamp_bbox_phys passes the droplet's
+            # REAL bbox in for the wall clamp's ellipse-aware SDF check, so hard_wall_containment
+            # still works as a genuine safety net on the integrated position without the model ever
+            # needing to see or predict bbox itself.
             own_predicted_velocity = pred_step_phys_raw[..., :2]
-            new_frame_phys = safe_true_step_features.clone()
-            new_frame_phys[:, :, vx_index] = torch.where(
-                continuing_mask, own_predicted_velocity[..., 0], new_frame_phys[:, :, vx_index]
+            bbox_index = [feature_index["bbox_w"], feature_index["bbox_h"]]
+            true_bbox_finite = torch.isfinite(true_step_features[:, :, bbox_index])
+            clamp_bbox_phys = torch.where(
+                true_bbox_finite, true_step_features[:, :, bbox_index], last_frame[:, :, bbox_index]
             )
-            new_frame_phys[:, :, vy_index] = torch.where(
-                continuing_mask, own_predicted_velocity[..., 1], new_frame_phys[:, :, vy_index]
+            new_frame_phys, raw_position_phys = build_stale_refresh_frame(
+                last_frame,
+                own_predicted_velocity,
+                true_step_features,
+                new_mask,
+                boundary_mask,
+                feature_index,
+                dataset,
+                device,
+                target_parameterization={"mode": "velocity"},
+                refresh_observed_non_target=True,
+                hard_wall_containment=hard_wall_containment,
+                clamp_bbox_phys=clamp_bbox_phys,
             )
+            # build_stale_refresh_frame seeds newly-entering droplets (boundary_mask) with their
+            # FULL true row, including true vx,vy -- override velocity specifically (position at
+            # entry is still fine to take from truth, same as every other rollout mode already
+            # does for a droplet it's never seen before) so entry doesn't leak true velocity.
+            vx_index, vy_index = feature_index["vx"], feature_index["vy"]
             new_frame_phys[:, :, vx_index] = torch.where(
                 boundary_mask, typical_inlet_velocity[0], new_frame_phys[:, :, vx_index]
             )
             new_frame_phys[:, :, vy_index] = torch.where(
                 boundary_mask, typical_inlet_velocity[1], new_frame_phys[:, :, vy_index]
             )
-            raw_position_phys = safe_true_step_features[:, :, position_index]
-            new_frame_phys = torch.where(new_mask[:, :, None], new_frame_phys, torch.zeros_like(new_frame_phys))
         elif runtime_context is None:
             new_frame_phys, raw_position_phys = build_stale_refresh_frame(
                 last_frame,
@@ -2432,7 +2453,12 @@ def build_stale_refresh_frame(
     target_parameterization: dict[str, Any] | None = None,
     refresh_observed_non_target: bool = True,
     hard_wall_containment: "HardWallContainment | None" = None,
+    clamp_bbox_phys: torch.Tensor | None = None,
 ):
+    """clamp_bbox_phys, if given, is (B, M, 2) bbox_w/bbox_h used for the wall-clamp's
+    ellipse-aware SDF check instead of requiring bbox to be part of pred_step_phys_raw (dims 2:4)
+    -- lets a caller enforce real wall containment using the droplet's true physical size even when
+    the model never predicts (or even sees) bbox at all, e.g. state_injected_rollout."""
     mode = (target_parameterization or {"mode": "velocity"}).get("mode")
     position_index = [feature_index["x"], feature_index["y"]]
 
@@ -2450,16 +2476,19 @@ def build_stale_refresh_frame(
         y_next = last_frame[:, :, feature_index["y"]] + pred_step_phys_raw[:, :, 1] * velocity_to_px_frame
         raw_position = torch.stack([x_next, y_next], dim=-1)
         contained_position = raw_position
+        bbox_for_clamp = clamp_bbox_phys
+        if bbox_for_clamp is None and pred_step_phys_raw.shape[-1] >= 4:
+            bbox_for_clamp = pred_step_phys_raw[:, :, 2:4]
         if (
             hard_wall_containment is not None
             and hard_wall_containment.enabled
-            and pred_step_phys_raw.shape[-1] >= 4
+            and bbox_for_clamp is not None
             and "bbox_w" in feature_index
             and "bbox_h" in feature_index
         ):
             contained_position = clamp_to_channel_torch(
                 raw_position,
-                pred_step_phys_raw[:, :, 2:4],
+                bbox_for_clamp,
                 hard_wall_containment.sdf,
                 hard_wall_containment.grad_x,
                 hard_wall_containment.grad_y,
@@ -2959,9 +2988,9 @@ def physics_refresh_mode(runtime_context, state_injected_rollout: bool = False) 
     # state_injected_rollout bypasses runtime_context entirely regardless of whether an object is
     # passed down -- a non-None runtime_context is kept alive in that mode only so
     # should_update_best_checkpoint's "runtime_context is None -> never save best" gate still works,
-    # not because physics is actually being invoked (position is ground truth, velocity is the
-    # model's own prediction -- neither goes through the numpy runtime). Report that accurately
-    # rather than "runtime".
+    # not because physics is actually being invoked (velocity is the model's own prediction and
+    # position is a simple Euler integration of it -- neither goes through the numpy CFD runtime
+    # simulator). Report that accurately rather than "runtime".
     if state_injected_rollout:
         return "bypassed (state_injected_rollout)"
     return "runtime" if runtime_context is not None else "stale"

@@ -6,22 +6,35 @@ experiment:
     "prediction" trivially copyable from context. This version keeps position/context grounded in
     reality but always makes the model commit to its own velocity belief:
 
-    1. training.state_injected_rollout.enabled=true: x, y, and every non-velocity feature (CFD,
-       occupancy, superficial_velocity, left_flow_fraction) are always the raw ground-truth row
-       (get_true_future_features) at every step -- position never drifts. vx, vy are the deliberate
-       exception: for a droplet already present last step, the next-step vx,vy input is always the
-       model's OWN prediction from this step, never injected from truth. A droplet newly entering
-       the window has no prior own-prediction to reuse (and injecting its true vx,vy would leak
-       ground truth through that one remaining gap), so it's seeded from a precomputed
-       typical_inlet_velocity instead (mean vx,vy observed in the inlet channel/junction regions --
-       droplets there haven't yet diverged toward a branch and move at fairly uniform speed).
-       No geometry_constraint/hard_wall_containment/stage_handoff/rollout_horizon_schedule --
-       position never needs clamping/integration in this mode. scheduled_sampling is left disabled
+    1. training.state_injected_rollout.enabled=true: vx, vy are always the model's OWN prediction
+       (for a droplet already present last step, never injected from truth after the very first
+       step), and x, y are integrated from that same prediction via a simple Euler step
+       (build_stale_refresh_frame) -- neither is ever taken from ground truth, so neither can be
+       trivially copied from context. Every OTHER feature (CFD, occupancy, superficial_velocity,
+       left_flow_fraction) IS still always the raw ground-truth row (get_true_future_features),
+       refreshed every step regardless of what the model predicted -- occupancy in particular is
+       still a real leakage risk for the decision head (it's position-derived and always reflects
+       the droplet's TRUE region, even though position itself is now only integrated/predicted;
+       worth checking the frames-until-commit calibration plot with that in mind, not just the
+       aggregate accuracy_near_commitment number). A droplet newly entering the window has no
+       prior own-prediction to reuse (and injecting its true vx,vy would leak ground truth through
+       that one remaining gap), so it's seeded from a precomputed typical_inlet_velocity instead
+       (mean vx,vy observed in the inlet channel/junction regions -- droplets there haven't yet
+       diverged toward a branch and move at fairly uniform speed); its position at entry is still
+       taken from truth, same as every other rollout mode does for a droplet it's never seen
+       before. No geometry_constraint (it regularizes a PREDICTED bbox against overlap; bbox is
+       never predicted here, so there's nothing for it to check). hard_wall_containment IS enabled
+       -- its ellipse-aware clamp normally needs a predicted bbox (dims 2:4 of the model's raw
+       target), which this config doesn't have, but build_stale_refresh_frame's new
+       clamp_bbox_phys param lets the clamp use the droplet's REAL (ground-truth) bbox instead, so
+       the integrated position still gets a genuine wall-containment safety net without the model
+       ever needing to see or predict bbox. No stage_handoff/rollout_horizon_schedule -- position and velocity now both genuinely
+       compound step to step, and the point of this config is to observe that directly rather than
+       curriculum it away, at least for a first look. scheduled_sampling is left disabled
        (p_truth=None throughout) so the decision-conditioning signal also always falls back to the
        model's own decision belief, matching "always own prediction" everywhere, not just velocity.
-       loss_alpha=0.0 (uniform step weighting) is deliberate here too: since velocity does now
-       genuinely compound step to step (unlike the fully-injected version), the point of this
-       config is to see that compounding directly, not discount it away.
+       loss_alpha=0.0 (uniform step weighting) is deliberate for the same reason -- no discounting
+       away the compounding this config exists to reveal.
 
     2. model.input_feature_names drops bbox_w/bbox_h (16 -> 14 features, input_dim=14). bbox is not
        fed to the model at all in this config -- validate_feature_contract allows input_feature_names
@@ -93,6 +106,8 @@ training:
   output_dir: outputs/models/physics_markovian_v1_state_injected_velocity
   state_injected_rollout:
     enabled: true
+  hard_wall_containment:
+    enabled: true  # clamp uses the droplet's REAL bbox (see experiment.description item 1) -- the model never sees or predicts it
   neighbor_key_dropout:
     enabled: true
     probability: 0.2
